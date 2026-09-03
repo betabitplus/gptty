@@ -91,6 +91,9 @@ def render_live_event(event: Any) -> str | None:
     tool_name = event.get("tool_name")
     if event_type == "activity_started" and isinstance(tool_name, str) and tool_name:
         return f"[tool] {tool_name}"
+    if event_type == "activity_started" and event.get("activity_kind") == "reasoning":
+        label = event.get("label")
+        return f"[thinking] {label}" if isinstance(label, str) and label.strip() else "[thinking] Thinking…"
     if event_type == "activity_completed" and isinstance(tool_name, str) and tool_name:
         return f"[tool done] {tool_name}"
     if event_type in {"activity_text_snapshot", "activity_text_delta", "activity_text_revision"}:

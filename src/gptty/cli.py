@@ -9,6 +9,9 @@ from .io import StdinReadError, read_stdin_text
 from .profiles import ProfileError, resolve_auth_path, resolve_session_paths
 
 
+DEFAULT_TURN_TIMEOUT_SECONDS = 600
+
+
 def _add_profile_option(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
     default = argparse.SUPPRESS if suppress_default else None
     parser.add_argument(
@@ -209,7 +212,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument(
         "--timeout",
         type=int,
-        default=90,
+        default=DEFAULT_TURN_TIMEOUT_SECONDS,
         help="Request timeout in seconds.",
     )
 
@@ -236,6 +239,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_stdin_options(send_parser)
     _add_image_options(send_parser)
     _add_session_options(send_parser)
+    send_parser.set_defaults(timeout=DEFAULT_TURN_TIMEOUT_SECONDS)
     _add_output_format_option(send_parser)
     _add_lock_options(send_parser)
     send_parser.add_argument(
@@ -282,7 +286,7 @@ def _build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument(
         "--timeout",
         type=int,
-        default=90,
+        default=DEFAULT_TURN_TIMEOUT_SECONDS,
         help="Request timeout in seconds.",
     )
     _add_lock_options(chat_parser)

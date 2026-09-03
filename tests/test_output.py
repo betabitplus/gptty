@@ -7,6 +7,7 @@ from gptty.output import (
     normalize_messages,
     normalize_response,
     normalize_status,
+    render_live_event,
     render_messages,
     render_response,
     render_status,
@@ -104,6 +105,11 @@ def test_render_response_plain_json_and_markdown() -> None:
     assert render_response(response, "plain") == "reply"
     assert json.loads(render_response(response, "json")) == response
     assert render_response(response, "markdown") == "reply"
+
+
+def test_render_live_reasoning_start_and_summary() -> None:
+    assert render_live_event({"type": "activity_started", "activity_kind": "reasoning", "label": "Thinking…"}) == "[thinking] Thinking…"
+    assert render_live_event({"type": "activity_text_snapshot", "text": "Worked for 12s"}) == "[thinking] Worked for 12s"
 
 
 def test_normalize_response_from_shapes() -> None:
