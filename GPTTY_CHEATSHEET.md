@@ -75,13 +75,12 @@ gptty chat --no-stream
 gptty send --timeout 20000 "..."
 ```
 
-Если внезапно появляется:
+Если появляется `CHATGPT_TURN_HTTP_STATUS:403`, перезапусти отдельный CWA Chrome:
 
-```text
-CHATGPT_TURN_HTTP_STATUS:403
+```bash
+pkill -f 'chatgpt-web-adapter/browser-profile'
+open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome for Testing.app' --args --user-data-dir='/Users/stas/Library/Application Support/chatgpt-web-adapter/browser-profile' --remote-debugging-port=9333 --load-extension='/Users/stas/.local/share/uv/tools/chatgpt-web-adapter/lib/python3.10/site-packages/chatgpt_web_adapter/browser_native_extension' https://chatgpt.com/
 ```
-
-при живом bridge — обычно зависла browser-side сессия отдельного CWA Chrome; помогает перезапуск именно CWA Chrome for Testing.
 
 Важно:
 
