@@ -65,9 +65,18 @@ def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     assert code == 0
     assert stdout.getvalue() == "reply\n"
     assert client.calls == [
-        ("send", ("hello",), {"stream": True, "on_token": client.calls[0][2]["on_token"]}),
+        (
+            "send",
+            ("hello",),
+            {
+                "stream": True,
+                "on_token": client.calls[0][2]["on_token"],
+                "on_event": client.calls[0][2]["on_event"],
+            },
+        ),
     ]
     assert callable(client.calls[0][2]["on_token"])
+    assert callable(client.calls[0][2]["on_event"])
     assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "conv-1"
 
 

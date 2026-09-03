@@ -84,6 +84,22 @@ def render_response(response: dict[str, Any], output_format: OutputFormat = "pla
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
+def render_live_event(event: Any) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    tool_name = event.get("tool_name")
+    if event_type == "activity_started" and isinstance(tool_name, str) and tool_name:
+        return f"[tool] {tool_name}"
+    if event_type == "activity_completed" and isinstance(tool_name, str) and tool_name:
+        return f"[tool done] {tool_name}"
+    if event_type in {"activity_text_snapshot", "activity_text_delta", "activity_text_revision"}:
+        text = event.get("text") or event.get("delta")
+        if isinstance(text, str) and text.strip():
+            return f"[thinking] {text.strip()}"
+    return None
+
+
 def _extract_raw_messages(response: Any) -> list[Any]:
     messages = _field(response, "messages")
     if isinstance(messages, list):

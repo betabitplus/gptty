@@ -15,7 +15,7 @@ from ..locks import (
     render_stale_lock_recovered,
 )
 from ..media import MediaInputError, collect_media_inputs
-from ..output import OutputFormat, normalize_response, render_response
+from ..output import OutputFormat, normalize_response, render_live_event, render_response
 from ..prompt import build_prompt
 from ..required_action import maybe_render_required_action
 from ..runs import RunRecorder, start_run
@@ -94,6 +94,11 @@ def run_send(
             recorder.event("token_delta", text=token)
         print(token, end="", file=stdout, flush=True)
 
+    def on_event(event: dict[str, Any]) -> None:
+        rendered = render_live_event(event)
+        if rendered:
+            print(rendered, file=stderr, flush=True)
+
     options: dict[str, Any] = {"stream": stream}
     model = getattr(args, "model", None)
     if model:
@@ -102,6 +107,7 @@ def run_send(
         options["media"] = media
     if stream:
         options["on_token"] = on_token
+        options["on_event"] = on_event
 
     lock = None
     if conversation_ref:

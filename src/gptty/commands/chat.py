@@ -14,6 +14,7 @@ from ..locks import (
     render_lock_timeout,
     render_stale_lock_recovered,
 )
+from ..output import render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
@@ -196,11 +197,17 @@ def _send_chat_prompt(
             recorder.event("token_delta", text=token)
         print(token, end="", file=stdout, flush=True)
 
+    def on_event(event: dict[str, Any]) -> None:
+        rendered = render_live_event(event)
+        if rendered:
+            print(rendered, file=stderr, flush=True)
+
     options: dict[str, Any] = {"stream": stream}
     if model:
         options["model"] = model
     if stream:
         options["on_token"] = on_token
+        options["on_event"] = on_event
 
     lock = None
     if state.current_conversation:
