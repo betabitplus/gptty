@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -25,6 +26,86 @@ class ChatGPTWebClientProtocol(Protocol):
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any: ...
 
 
+class _ProductRuntimeClient:
+    """Compatibility adapter from gptty's CLI-shaped SDK surface to CWA 0.3."""
+
+    def __init__(
+        self,
+        *,
+        auth_file: str | Path,
+        timeout: int,
+        runtime: Any | None = None,
+    ) -> None:
+        self.auth_file = Path(auth_file)
+        self.timeout = int(timeout)
+        self.runtime = runtime or self._build_runtime()
+
+    def _build_runtime(self) -> Any:
+        from chatgpt_web_adapter import assemble_product_runtime
+
+        return assemble_product_runtime(
+            transport="browser-owned",
+            auth_file=self.auth_file,
+            client_timeout=self.timeout,
+        )
+
+    def send(self, prompt: str, **options: Any) -> Any:
+        runtime_options = _runtime_send_options(options)
+        timeout = float(runtime_options.pop("timeout", self.timeout))
+        return self.runtime.send(prompt, timeout=timeout, **runtime_options)
+
+    def send_to_conversation(
+        self,
+        url_or_id: Any,
+        prompt: str,
+        **options: Any,
+    ) -> Any:
+        runtime_options = _runtime_send_options(options)
+        timeout = float(runtime_options.pop("timeout", self.timeout))
+        return self.runtime.send(
+            prompt,
+            conversation=url_or_id,
+            timeout=timeout,
+            **runtime_options,
+        )
+
+    def attach_conversation(self, url_or_id: Any, **options: Any) -> Any:
+        return self.runtime.attach_conversation(url_or_id, **options)
+
+    def get_messages(self, url_or_id: Any, **options: Any) -> Any:
+        return self.runtime.get_messages(url_or_id, **options)
+
+    def get_required_action(self, url_or_id: Any, **options: Any) -> Any:
+        canonical = getattr(self.runtime, "canonical", None)
+        helper = getattr(canonical, "get_required_action", None)
+        if not callable(helper):
+            return None
+        return helper(url_or_id, **options)
+
+    def get_status(self, url_or_id: Any, **options: Any) -> Any:
+        return self.runtime.get_status(url_or_id, **options)
+
+    def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
+        timeout = float(options.pop("timeout", self.timeout))
+        poll_interval = float(options.pop("poll_interval", 0.5))
+        if options:
+            unexpected = ", ".join(sorted(options))
+            raise TypeError(f"unsupported wait options: {unexpected}")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.runtime.get_status(url_or_id)
+            if getattr(status, "status", None) == "completed":
+                return status
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"conversation did not complete within {timeout:g}s")
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+
 class GpttyClient:
     """Thin boundary between gptty commands and chatgpt-web-adapter.
 
@@ -44,9 +125,7 @@ class GpttyClient:
         self._client = sdk_client or self._build_sdk_client()
 
     def _build_sdk_client(self) -> ChatGPTWebClientProtocol:
-        from chatgpt_web_adapter import ChatGPTWebClient
-
-        return ChatGPTWebClient(auth_file=self.auth_file, timeout=self.timeout)
+        return _ProductRuntimeClient(auth_file=self.auth_file, timeout=self.timeout)
 
     def send(self, prompt: str, **options: Any) -> Any:
         return self._client.send(prompt, **_sdk_send_options(options))
@@ -86,3 +165,31 @@ def _sdk_send_options(options: dict[str, Any]) -> dict[str, Any]:
     sdk_options = dict(options)
     sdk_options.pop("stream", None)
     return sdk_options
+
+
+def _runtime_send_options(options: dict[str, Any]) -> dict[str, Any]:
+    runtime_options = dict(options)
+    runtime_options.pop("stream", None)
+    model = runtime_options.pop("model", None)
+    if model:
+        runtime_options["model_profile"] = _runtime_model_profile(model)
+    return runtime_options
+
+
+def _runtime_model_profile(model: Any) -> str:
+    normalized = str(model).strip().upper()
+    mapping = {
+        "FAST": "FAST",
+        "INSTANT": "FAST",
+        "BALANCED": "BALANCED",
+        "MEDIUM": "BALANCED",
+        "DEEP": "DEEP",
+        "HIGH": "DEEP",
+    }
+    try:
+        return mapping[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "browser-owned gptty supports --model as an effort profile only: "
+            "fast/instant, balanced/medium, or deep/high"
+        ) from exc

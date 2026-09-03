@@ -28,7 +28,7 @@ classifiers = [
   "Topic :: Utilities",
 ]
 dependencies = [
-  "chatgpt-web-adapter>=0.1.5,<0.2.0",
+  "chatgpt-web-adapter>=0.3.0,<0.4.0",
 ]
 
 [project.optional-dependencies]
