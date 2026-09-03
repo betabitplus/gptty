@@ -189,7 +189,7 @@ def test_chat_routes_to_sdk_chat_with_new_state_default(monkeypatch: pytest.Monk
         "auth": "auth_data.json",
         "model": None,
         "no_stream": False,
-        "timeout": 600,
+        "timeout": 7200,
     }
 
 

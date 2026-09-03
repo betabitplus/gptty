@@ -9,7 +9,7 @@ from .io import StdinReadError, read_stdin_text
 from .profiles import ProfileError, resolve_auth_path, resolve_session_paths
 
 
-DEFAULT_TURN_TIMEOUT_SECONDS = 600
+DEFAULT_TURN_TIMEOUT_SECONDS = 7200
 
 
 def _add_profile_option(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
