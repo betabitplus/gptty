@@ -48,7 +48,7 @@ gptty send --new --image ./image.png "что на картинке?"
 gptty status
 ```
 
-Live-режим включён по умолчанию. После safe-detach `gptty` примерно каждые ~5 секунд читает один canonical snapshot и сразу печатает новые user-visible thinking-параграфы и краткие tool-call строки:
+Live-режим включён по умолчанию. После safe-detach CWA пассивно читает копию того же response/SSE stream, который ChatGPT Web уже получает для своего UI. Дополнительных HTTP poll-запросов ради live нет: новые законченные user-visible thinking-параграфы и краткие tool-call строки приходят сразу из browser stream.
 
 ```text
 [thinking]
@@ -58,7 +58,7 @@ Live-режим включён по умолчанию. После safe-detach `
 [tool call] api_tool.call_tool Reading README.md...
 ```
 
-Tool arguments/results не печатаются. Пустой `Thinking…` тоже не печатается. Показываются короткие thinking/preamble paragraphs и reasoning recap/title, которые реально присутствуют в ChatGPT conversation/Web UI; raw/private hidden `thoughts` не выводятся. Canonical snapshot одновременно используется и для live-блоков, и для финального readback: отдельных частых запросов ради live нет. `429` получает 15-секундный backoff.
+Tool arguments/results не печатаются. Пустой `Thinking…` тоже не печатается. Показываются короткие thinking/preamble paragraphs и reasoning recap/title, которые реально присутствуют в ChatGPT conversation/Web UI; raw/private hidden `thoughts` не выводятся. После настоящего terminal/end-turn CWA делает canonical reconcile финального ответа; если canonical plane ещё не успел materialize финал, retry идёт редко и с backoff. Polling остаётся только аварийным fallback, если passive observer не смог подняться.
 
 Отключить live:
 
