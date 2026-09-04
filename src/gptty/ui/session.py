@@ -11,15 +11,9 @@ from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.shortcuts import choice, prompt
+from prompt_toolkit.shortcuts import choice
 
-from .state import (
-    UISettings,
-    UIStateError,
-    load_ui_settings,
-    save_ui_settings,
-    ui_settings_path,
-)
+from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
 
 
 @dataclass(frozen=True)
@@ -30,16 +24,10 @@ class CommandSpec:
 
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("new", "Start a new ChatGPT conversation"),
-    CommandSpec("switch", "Switch to a recent local conversation"),
-    CommandSpec("attach", "Attach by ChatGPT URL or conversation ID"),
-    CommandSpec("model", "Change the effort/model profile"),
-    CommandSpec("messages", "Show recent messages"),
-    CommandSpec("status", "Show conversation status"),
-    CommandSpec("export", "Export the current conversation"),
-    CommandSpec("profile", "Choose the active gptty profile"),
-    CommandSpec("auth", "Inspect or refresh web-session auth"),
-    CommandSpec("settings", "Change interactive UI settings"),
-    CommandSpec("help", "Show all interactive commands"),
+    CommandSpec("resume", "Resume a real ChatGPT conversation"),
+    CommandSpec("detach", "Detach locally from the current conversation"),
+    CommandSpec("model", "Choose a real ChatGPT model"),
+    CommandSpec("help", "Show interactive commands"),
     CommandSpec("exit", "Exit gptty chat"),
 )
 
@@ -124,59 +112,54 @@ class InteractiveSession:
         except (KeyboardInterrupt, EOFError):
             return None
 
-    def ask(self, message: str, *, default: str = "") -> str | None:
+    def choose_searchable(
+        self,
+        message: str,
+        options: list[tuple[Any, str]],
+        *,
+        default: Any | None = None,
+    ) -> Any | None:
+        if not options:
+            return None
+        labels: list[str] = []
+        values_by_label: dict[str, Any] = {}
+        default_label = ""
+        for value, raw_label in options:
+            label = str(raw_label).strip() or str(value)
+            if label in values_by_label:
+                label = f"{label}  [{value}]"
+            labels.append(label)
+            values_by_label[label] = value
+            if default is not None and value == default:
+                default_label = label
+
+        kwargs: dict[str, Any] = {
+            "completer": FuzzyCompleter(WordCompleter(labels, sentence=True), enable_fuzzy=True),
+            "complete_while_typing": True,
+            "bottom_toolbar": "type to filter · ↑↓ choose · Enter confirm · Ctrl-C cancel",
+        }
+        if self._prompt_input is not None:
+            kwargs["input"] = self._prompt_input
+        if self._prompt_output is not None:
+            kwargs["output"] = self._prompt_output
+        picker = PromptSession(**kwargs)
         try:
-            value = prompt(f"{message}: ", default=default)
+            selected = picker.prompt(f"{message}: ", default=default_label).strip()
         except (KeyboardInterrupt, EOFError):
             return None
-        return value.strip()
-
-    def edit_settings(self) -> bool:
-        changed = False
-        while True:
-            action = self.choose(
-                "Settings",
-                [
-                    ("pretty", f"Pretty UI              {self.settings.pretty}"),
-                    ("markdown", f"Markdown rendering     {'on' if self.settings.markdown else 'off'}"),
-                    ("thinking", f"Thinking blocks        {'show' if self.settings.thinking else 'hide'}"),
-                    ("tools", f"Tool activity          {self.settings.tools}"),
-                    ("editor", f"Input mode             {self.settings.editor}"),
-                    ("done", "Done"),
-                ],
-                default="done",
-            )
-            if action in {None, "done"}:
-                break
-            if action == "pretty":
-                selected = self.choose("Pretty UI", [(v, v) for v in ("auto", "on", "off")], default=self.settings.pretty)
-                if selected:
-                    self.settings.pretty = str(selected)
-                    changed = True
-            elif action == "markdown":
-                selected = self.choose("Markdown rendering", [(True, "On"), (False, "Off")], default=self.settings.markdown)
-                if selected is not None:
-                    self.settings.markdown = bool(selected)
-                    changed = True
-            elif action == "thinking":
-                selected = self.choose("Thinking blocks", [(True, "Show"), (False, "Hide")], default=self.settings.thinking)
-                if selected is not None:
-                    self.settings.thinking = bool(selected)
-                    changed = True
-            elif action == "tools":
-                selected = self.choose("Tool activity", [("compact", "Compact"), ("hidden", "Hidden")], default=self.settings.tools)
-                if selected:
-                    self.settings.tools = str(selected)
-                    changed = True
-            elif action == "editor":
-                selected = self.choose("Input mode", [("emacs", "Emacs"), ("vi", "Vi")], default=self.settings.editor)
-                if selected:
-                    self.settings.editor = str(selected)
-                    changed = True
-                    self._build_session()
-        if changed:
-            save_ui_settings(self.settings_file, self.settings)
-        return changed
+        if not selected:
+            return None
+        if selected in values_by_label:
+            return values_by_label[selected]
+        for value, _label in options:
+            if str(value) == selected:
+                return value
+        matches = [
+            value
+            for label, value in values_by_label.items()
+            if selected.casefold() in label.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
 
 def should_use_enhanced_ui(
     *,

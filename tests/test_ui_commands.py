@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-from argparse import Namespace
-from io import StringIO
+from types import SimpleNamespace
 
 from gptty.state import ChatState, StateError, load_chat_state
 from gptty.ui.commands import InteractiveCommands
-from gptty.ui.state import RecentStore
 
 
 class FakeUI:
-    def __init__(self, *, choices=None, answers=None) -> None:
+    def __init__(self, *, choices=None) -> None:
         self.choices = list(choices or [])
-        self.answers = list(answers or [])
-        self.settings = object()
 
-    def choose(self, message, options, *, default=None):
+    def choose_searchable(self, message, options, *, default=None):
         return self.choices.pop(0) if self.choices else default
-
-    def ask(self, message, *, default=""):
-        return self.answers.pop(0) if self.answers else default
-
-    def edit_settings(self) -> bool:
-        return False
 
 
 class FakeRenderer:
@@ -40,19 +30,50 @@ class FakeRenderer:
     def messages(self, messages):
         self.events.append(("messages", messages))
 
-    def mapping(self, mapping):
-        self.events.append(("mapping", mapping))
-
 
 class FakeClient:
-    def attach_conversation(self, ref):
-        return {"conversation_id": f"attached-{ref}"}
+    def __init__(self, *, snapshots=None) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.snapshots = list(
+            snapshots
+            or [
+                {
+                    "status": SimpleNamespace(status="completed"),
+                    "messages": [
+                        {"message_id": "u1", "role": "user", "text": "question"},
+                        {"message_id": "t1", "role": "tool", "text": "raw tool result"},
+                        {
+                            "message_id": "call1",
+                            "role": "assistant",
+                            "recipient": "api_tool.call_tool",
+                            "text": "raw tool call",
+                        },
+                        {"message_id": "a1", "role": "assistant", "text": "answer"},
+                    ],
+                }
+            ]
+        )
 
-    def get_messages(self, ref, **options):
-        return {"messages": [{"role": "assistant", "text": "hello"}]}
+    def list_conversations(self):
+        self.calls.append(("list_conversations", None))
+        return [
+            {"id": "conv-2", "title": "Second chat", "update_time": 2.0},
+            {"id": "conv-1", "title": "First chat", "update_time": 1.0},
+        ]
 
-    def get_status(self, ref):
-        return {"status": "completed"}
+    def conversation_snapshot(self, ref, **options):
+        self.calls.append(("snapshot", ref))
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+    def list_models(self):
+        self.calls.append(("list_models", None))
+        return [
+            {"slug": "gpt-real-a", "title": "Real A"},
+            {"slug": "gpt-real-b", "title": "Real B"},
+            {"slug": "disabled", "title": "Disabled", "is_disabled": True},
+        ]
 
 
 def make_commands(tmp_path, *, state=None, ui=None, client=None):
@@ -61,70 +82,113 @@ def make_commands(tmp_path, *, state=None, ui=None, client=None):
     client = client or FakeClient()
     renderer = FakeRenderer()
     state_path = tmp_path / "gptty_state.json"
-    recent = RecentStore(tmp_path / "recent.json")
     commands = InteractiveCommands(
-        args=Namespace(auth=str(tmp_path / "auth.json")),
         state=state,
         state_path=state_path,
         get_client=lambda: client,
-        reset_client=lambda: None,
         ui=ui,
         renderer=renderer,
-        recent=recent,
-        stdout=StringIO(),
-        stderr=StringIO(),
     )
-    return commands, renderer, recent, state_path
+    return commands, renderer, client, state_path
 
 
-def test_attach_updates_state_and_recent_index(tmp_path) -> None:
-    commands, renderer, recent, state_path = make_commands(tmp_path)
-
-    assert commands.handle("/attach abc") is None
-
-    assert load_chat_state(state_path).current_conversation == "attached-abc"
-    assert recent.list()[0].ref == "attached-abc"
-    assert renderer.events[-1] == ("info", "Attached: attached-abc")
-
-
-def test_switch_uses_local_recent_without_client_call(tmp_path) -> None:
-    recent = RecentStore(tmp_path / "recent.json")
-    recent.remember("conv-1", label="First")
-    recent.remember("conv-2", label="Second")
-    state = ChatState(current_conversation="conv-1")
+def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> None:
     ui = FakeUI(choices=["conv-2"])
-    renderer = FakeRenderer()
-    state_path = tmp_path / "gptty_state.json"
+    commands, renderer, client, state_path = make_commands(tmp_path, ui=ui)
 
-    commands = InteractiveCommands(
-        args=Namespace(auth=str(tmp_path / "auth.json")),
+    assert commands.handle("/resume") is None
+
+    assert client.calls[:2] == [
+        ("list_conversations", None),
+        ("snapshot", "conv-2"),
+    ]
+    assert load_chat_state(state_path).current_conversation == "conv-2"
+    rendered = [event for event in renderer.events if event[0] == "messages"][-1][1]
+    assert [message.text for message in rendered] == ["question", "answer"]
+
+
+def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
+    commands, _, client, _ = make_commands(tmp_path)
+
+    commands.handle("/resume https://chatgpt.com/c/direct")
+
+    assert ("list_conversations", None) not in client.calls
+    assert client.calls[0] == ("snapshot", "https://chatgpt.com/c/direct")
+
+
+def test_detach_is_local_only(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, client, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/detach")
+
+    assert state.current_conversation is None
+    assert load_chat_state(state_path).current_conversation is None
+    assert client.calls == []
+    assert "not changed" in renderer.events[-1][1]
+
+
+def test_model_uses_live_catalog_slug(tmp_path) -> None:
+    state = ChatState(model="old")
+    commands, renderer, client, state_path = make_commands(
+        tmp_path,
         state=state,
-        state_path=state_path,
-        get_client=lambda: (_ for _ in ()).throw(AssertionError("network client must not be used")),
-        reset_client=lambda: None,
-        ui=ui,
-        renderer=renderer,
-        recent=recent,
-        stdout=StringIO(),
-        stderr=StringIO(),
+        ui=FakeUI(choices=["gpt-real-b"]),
     )
 
-    assert commands.handle("/switch") is None
-    assert state.current_conversation == "conv-2"
-    assert load_chat_state(state_path).current_conversation == "conv-2"
+    commands.handle("/model")
+
+    assert client.calls == [("list_models", None)]
+    assert state.model == "gpt-real-b"
+    assert load_chat_state(state_path).model == "gpt-real-b"
+    assert renderer.events[-1] == ("info", "Model: gpt-real-b")
 
 
-def test_messages_and_status_reuse_current_client(tmp_path) -> None:
-    state = ChatState(current_conversation="conv-1")
-    commands, renderer, _, _ = make_commands(tmp_path, state=state, ui=FakeUI(answers=["5"]))
+def test_model_default_is_local_only(tmp_path) -> None:
+    state = ChatState(model="gpt-real-a")
+    commands, renderer, client, state_path = make_commands(tmp_path, state=state)
 
-    commands.handle("/messages")
-    commands.handle("/status")
+    commands.handle("/model default")
 
-    assert renderer.events[0][0] == "messages"
-    assert renderer.events[0][1][0].text == "hello"
-    assert renderer.events[1][0] == "mapping"
-    assert renderer.events[1][1]["status"] == "completed"
+    assert client.calls == []
+    assert state.model is None
+    assert load_chat_state(state_path).model is None
+    assert renderer.events[-1] == ("info", "Model: default")
+
+
+def test_model_rejects_slug_not_in_live_catalog(tmp_path) -> None:
+    state = ChatState(model="gpt-real-a")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle("/model invented")
+
+    assert state.model == "gpt-real-a"
+    assert renderer.events[-1][0] == "warning"
+    assert "live ChatGPT list" in renderer.events[-1][1]
+
+
+def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> None:
+    running = {
+        "status": SimpleNamespace(status="running"),
+        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
+    }
+    completed = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "finished"},
+        ],
+    }
+    client = FakeClient(snapshots=[running, completed])
+    commands, renderer, _, _ = make_commands(tmp_path, client=client)
+    monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
+
+    commands.handle("/resume conv-1")
+
+    message_events = [event for event in renderer.events if event[0] == "messages"]
+    assert len(message_events) == 2
+    assert message_events[-1][1][0].text == "finished"
+    assert [call[0] for call in client.calls].count("snapshot") == 2
 
 
 def test_new_clears_current_conversation(tmp_path) -> None:
@@ -135,25 +199,6 @@ def test_new_clears_current_conversation(tmp_path) -> None:
 
     assert state.current_conversation is None
     assert load_chat_state(state_path).current_conversation is None
-
-
-def test_model_cancel_keeps_existing_value(tmp_path) -> None:
-    state = ChatState(model="deep")
-    commands, _, _, _ = make_commands(tmp_path, state=state, ui=FakeUI(choices=[None]))
-
-    commands.handle("/model")
-
-    assert state.model == "deep"
-
-
-def test_model_rejects_unknown_manual_value(tmp_path) -> None:
-    state = ChatState(model="balanced")
-    commands, renderer, _, _ = make_commands(tmp_path, state=state)
-
-    commands.handle("/model nonsense")
-
-    assert state.model == "balanced"
-    assert renderer.events[-1] == ("warning", "Usage: /model [default|fast|balanced|deep]")
 
 
 def test_state_save_failure_rolls_back_interactive_change(tmp_path, monkeypatch) -> None:

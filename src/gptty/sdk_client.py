@@ -4,7 +4,6 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
-
 _CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS = 15.0
 
 
@@ -27,6 +26,12 @@ class ChatGPTWebClientProtocol(Protocol):
     def get_status(self, url_or_id: Any, **options: Any) -> Any: ...
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any: ...
+
+    def list_conversations(self) -> Any: ...
+
+    def list_models(self) -> Any: ...
+
+    def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any: ...
 
 
 class _ProductRuntimeClient:
@@ -87,6 +92,15 @@ class _ProductRuntimeClient:
 
     def get_status(self, url_or_id: Any, **options: Any) -> Any:
         return self.runtime.get_status(url_or_id, **options)
+
+    def list_conversations(self) -> Any:
+        return self.runtime.list_conversations()
+
+    def list_models(self) -> Any:
+        return self.runtime.list_models()
+
+    def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
+        return self.runtime.conversation_snapshot(url_or_id, **options)
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         timeout = float(options.pop("timeout", self.timeout))
@@ -163,6 +177,15 @@ class GpttyClient:
     def get_status(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.get_status(url_or_id, **options)
 
+    def list_conversations(self) -> Any:
+        return self._client.list_conversations()
+
+    def list_models(self) -> Any:
+        return self._client.list_models()
+
+    def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
+        return self._client.conversation_snapshot(url_or_id, **options)
+
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.wait_until_completed(url_or_id, **options)
 
@@ -176,26 +199,4 @@ def _sdk_send_options(options: dict[str, Any]) -> dict[str, Any]:
 def _runtime_send_options(options: dict[str, Any]) -> dict[str, Any]:
     runtime_options = dict(options)
     runtime_options.pop("stream", None)
-    model = runtime_options.pop("model", None)
-    if model:
-        runtime_options["model_profile"] = _runtime_model_profile(model)
     return runtime_options
-
-
-def _runtime_model_profile(model: Any) -> str:
-    normalized = str(model).strip().upper()
-    mapping = {
-        "FAST": "FAST",
-        "INSTANT": "FAST",
-        "BALANCED": "BALANCED",
-        "MEDIUM": "BALANCED",
-        "DEEP": "DEEP",
-        "HIGH": "DEEP",
-    }
-    try:
-        return mapping[normalized]
-    except KeyError as exc:
-        raise ValueError(
-            "browser-owned gptty supports --model as an effort profile only: "
-            "fast/instant, balanced/medium, or deep/high"
-        ) from exc

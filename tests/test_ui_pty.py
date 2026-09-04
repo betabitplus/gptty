@@ -56,9 +56,10 @@ def test_real_pty_help_and_exit(tmp_path) -> None:
         assert b"ChatGPT" in startup
 
         os.write(master, b"/help\r")
-        help_output = _read_until(master, b"/settings", timeout=5.0)
-        assert b"/switch" in help_output
-        assert b"/export" in help_output
+        help_output = _read_until(master, b"/exit", timeout=5.0)
+        assert b"/resume" in help_output
+        assert b"/detach" in help_output
+        assert b"/model" in help_output
 
         os.write(master, b"/\r")
         menu = _read_until(master, b"Actions", timeout=5.0)
@@ -66,13 +67,6 @@ def test_real_pty_help_and_exit(tmp_path) -> None:
         os.write(master, b"\x1b")
         cancelled = _read_until(master, "❯".encode(), timeout=5.0)
         assert "❯".encode() in cancelled
-
-        os.write(master, b"/\r")
-        menu = _read_until(master, b"Actions", timeout=5.0)
-        assert b"Actions" in menu
-        os.write(master, b"\x1b[B\r")
-        switched = _read_until(master, b"No local recent conversations yet.", timeout=5.0)
-        assert b"No local recent conversations yet." in switched
 
         os.write(master, b"/\r")
         menu = _read_until(master, b"Actions", timeout=5.0)

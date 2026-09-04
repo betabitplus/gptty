@@ -88,6 +88,22 @@ def test_alt_enter_inserts_newline_before_submit(tmp_path) -> None:
         assert session.read_prompt() == "first\nsecond"
 
 
-def test_command_registry_exposes_core_actions() -> None:
+def test_searchable_picker_accepts_unique_fuzzy_text(tmp_path) -> None:
+    with create_pipe_input() as pipe:
+        session = InteractiveSession(
+            history_file=tmp_path / "history",
+            settings_file=tmp_path / "ui.json",
+            prompt_input=pipe,
+            prompt_output=DummyOutput(),
+        )
+        pipe.send_text("Second\r")
+
+        assert session.choose_searchable(
+            "Resume",
+            [("conv-1", "First chat"), ("conv-2", "Second chat")],
+        ) == "conv-2"
+
+
+def test_command_registry_exposes_session_actions() -> None:
     names = {name for name, _ in command_help()}
-    assert {"new", "switch", "attach", "messages", "status", "export", "settings", "exit"} <= names
+    assert names == {"new", "resume", "detach", "model", "help", "exit"}

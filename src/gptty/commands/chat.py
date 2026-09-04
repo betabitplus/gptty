@@ -21,13 +21,7 @@ from ..state import ChatState, StateError, load_chat_state, save_chat_state
 from ..ui.commands import InteractiveCommands
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
-from ..ui.state import (
-    RecentStore,
-    UIStateError,
-    history_path,
-    recent_path,
-    ui_settings_path,
-)
+from ..ui.state import history_path, ui_settings_path
 
 CHAT_HELP = """Commands:
   /help        Show this help
@@ -116,13 +110,8 @@ def run_chat(
             )
         return client
 
-    def reset_client() -> None:
-        nonlocal client
-        client = None
-
     ui: InteractiveSession | None = None
     renderer: PrettyRenderer | None = None
-    recent: RecentStore | None = None
     interactive_commands: InteractiveCommands | None = None
     if enhanced:
         ui = InteractiveSession(
@@ -131,18 +120,12 @@ def run_chat(
             settings=ui_settings,
         )
         renderer = PrettyRenderer(stdout, ui_settings)
-        recent = RecentStore(recent_path(state_path))
         interactive_commands = InteractiveCommands(
-            args=args,
             state=state,
             state_path=state_path,
             get_client=get_client,
-            reset_client=reset_client,
             ui=ui,
             renderer=renderer,
-            recent=recent,
-            stdout=stdout,
-            stderr=stderr,
         )
         renderer.header(profile=getattr(args, "profile", None), conversation=state.current_conversation)
 
@@ -204,12 +187,6 @@ def run_chat(
         )
         if code != 0:
             return code
-        if recent is not None and state.current_conversation:
-            try:
-                recent.remember(state.current_conversation, label=_prompt_label(prompt))
-            except UIStateError as exc:
-                if renderer is not None:
-                    renderer.warning(str(exc))
 
 
 def _handle_chat_command(
@@ -375,10 +352,3 @@ def _is_interactive(input_stream: TextIO) -> bool:
         return input_stream.isatty()
     except OSError:
         return False
-
-
-def _prompt_label(prompt: str, *, max_length: int = 72) -> str:
-    compact = " ".join(prompt.split())
-    if len(compact) <= max_length:
-        return compact
-    return compact[: max_length - 1].rstrip() + "…"

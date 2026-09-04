@@ -14,7 +14,7 @@ Ctrl-R       поиск по истории prompts
 Alt-Enter    новая строка внутри prompt
 ```
 
-Основные действия (`new`, `switch`, `attach`, `messages`, `status`, `export`, `profile`, `auth`, `settings`) доступны из `/`-меню. `/switch` использует только локальную историю уже открытых через gptty разговоров и не запрашивает список чатов у ChatGPT.
+Основные действия доступны из `/`-меню: `new`, `resume`, `detach`, `model`, `help`, `exit`. `/resume` читает реальный список ChatGPT-чатов через CWA, даёт fuzzy-поиск, показывает полную user-visible текущую ветку истории и после выбора продолжает именно этот conversation. `/resume URL_OR_ID` подключает чат напрямую без списка. `/detach` только локально снимает привязку и ничего не меняет в ChatGPT. `/model` показывает реальный текущий model catalog ChatGPT и сохраняет выбранный product slug без собственных алиасов gptty.
 
 Отключить enhanced UI и вернуть простой line-oriented режим:
 
@@ -104,7 +104,8 @@ open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome
 Важно:
 
 - в отдельном CWA Chrome нормальное состояние — 2 managed same-origin вкладки: runtime ChatGPT + лёгкая canonical-read `robots.txt`; обычные turns переиспользуют их;
-- `/switch` показывает локальный recent index gptty; полного серверного списка всех ChatGPT-чатов по-прежнему нет;
-- passive live-view turn, запущенного вручную в ChatGPT Web, нет;
+- `/resume` запрашивает полный ChatGPT catalog только по явной команде; фонового listing/polling в idle нет;
+- если выбранный через `/resume` чат уже активен, gptty делает один canonical snapshot раз в 15 секунд только до terminal status (максимум 2 часа); Ctrl-C прекращает follow, но оставляет чат подключённым;
+- `/model` использует product slug из живого `/backend-api/models`; ChatGPT может внутри выбранного product option маршрутизировать ответ на конкретный serving variant, поэтому canonical `model_slug` ответа не обязан буквально совпадать с route slug;
 - image continuation в существующий чат CWA 0.3 официально не поддерживает; `--image --new` работает;
 - CodexPro вызывается самим ChatGPT внутри native connector/tool loop.
