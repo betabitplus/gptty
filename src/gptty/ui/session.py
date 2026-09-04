@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.shortcuts import choice
+from prompt_toolkit.shortcuts import CompleteStyle, choice
 
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
 
@@ -133,10 +134,29 @@ class InteractiveSession:
             if default is not None and value == default:
                 default_label = label
 
+        picker_bindings = KeyBindings()
+
+        @picker_bindings.add("escape")
+        def _cancel_picker(event: Any) -> None:
+            event.app.exit(exception=KeyboardInterrupt())
+
+        @picker_bindings.add("enter")
+        def _accept_picker(event: Any) -> None:
+            buffer = event.current_buffer
+            state = buffer.complete_state
+            completion = state.current_completion if state is not None else None
+            if completion is not None:
+                buffer.apply_completion(completion)
+                event.app.exit(result=buffer.text)
+                return
+            buffer.validate_and_handle()
+
         kwargs: dict[str, Any] = {
             "completer": FuzzyCompleter(WordCompleter(labels, sentence=True), enable_fuzzy=True),
             "complete_while_typing": True,
-            "bottom_toolbar": "type to filter · ↑↓ choose · Enter confirm · Ctrl-C cancel",
+            "complete_style": CompleteStyle.COLUMN,
+            "key_bindings": picker_bindings,
+            "bottom_toolbar": "↑↓ browse · type to filter · Enter resume · Esc/Ctrl-C cancel",
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
@@ -144,7 +164,11 @@ class InteractiveSession:
             kwargs["output"] = self._prompt_output
         picker = PromptSession(**kwargs)
         try:
-            selected = picker.prompt(f"{message}: ", default=default_label).strip()
+            selected = picker.prompt(
+                f"{message}: ",
+                default=default_label,
+                pre_run=lambda: get_app().current_buffer.start_completion(select_first=False),
+            ).strip()
         except (KeyboardInterrupt, EOFError):
             return None
         if not selected:
