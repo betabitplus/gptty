@@ -107,9 +107,46 @@ def test_render_response_plain_json_and_markdown() -> None:
     assert render_response(response, "markdown") == "reply"
 
 
-def test_render_live_reasoning_start_and_summary() -> None:
-    assert render_live_event({"type": "activity_started", "activity_kind": "reasoning", "label": "Thinking…"}) == "[thinking] Thinking…"
-    assert render_live_event({"type": "activity_text_snapshot", "text": "Worked for 12s"}) == "[thinking] Worked for 12s"
+def test_legacy_activity_placeholders_are_not_rendered() -> None:
+    assert render_live_event({"type": "activity_started", "activity_kind": "reasoning", "label": "Thinking…"}) is None
+    assert render_live_event({"type": "activity_text_snapshot", "text": "Worked for 12s"}) is None
+    assert render_live_event({"type": "activity_started", "tool_name": "api_tool.call_tool"}) is None
+
+
+def test_render_canonical_intermediate_blocks() -> None:
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "assistant_progress",
+            "text": "Reading files…",
+        }
+    ) == "[thinking]\nReading files…"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Reading README…",
+            "text": '{"path":"README.md"}',
+        }
+    ) == '[tool call] api_tool.call_tool Reading README…'
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "label": "README read",
+            "text": "first three lines",
+        }
+    ) is None
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "reasoning",
+            "label": "Checking context",
+            "text": "",
+        }
+    ) == "[thinking]\nChecking context"
 
 
 def test_normalize_response_from_shapes() -> None:

@@ -89,17 +89,30 @@ def render_live_event(event: Any) -> str | None:
         return None
     event_type = event.get("type")
     tool_name = event.get("tool_name")
-    if event_type == "activity_started" and isinstance(tool_name, str) and tool_name:
-        return f"[tool] {tool_name}"
-    if event_type == "activity_started" and event.get("activity_kind") == "reasoning":
+    if event_type == "canonical_intermediate_message":
+        kind = event.get("message_kind")
+        text = event.get("text")
+        text = text.strip() if isinstance(text, str) else ""
         label = event.get("label")
-        return f"[thinking] {label}" if isinstance(label, str) and label.strip() else "[thinking] Thinking…"
-    if event_type == "activity_completed" and isinstance(tool_name, str) and tool_name:
-        return f"[tool done] {tool_name}"
-    if event_type in {"activity_text_snapshot", "activity_text_delta", "activity_text_revision"}:
-        text = event.get("text") or event.get("delta")
-        if isinstance(text, str) and text.strip():
-            return f"[thinking] {text.strip()}"
+        label = label.strip() if isinstance(label, str) else ""
+        tool = tool_name.strip() if isinstance(tool_name, str) else ""
+        if kind == "assistant_progress" and text:
+            return f"[thinking]\n{text}"
+        if kind == "reasoning":
+            rendered = text or label
+            return f"[thinking]\n{rendered}" if rendered else None
+        if kind == "tool_call":
+            suffix = f" {label}" if label else ""
+            return f"[tool call] {tool or 'tool'}{suffix}"
+        if kind == "tool_result":
+            return None
+        if kind == "activity":
+            return f"[activity] {text or label}" if text or label else None
+        return None
+    # The early debugger-backed activity stream is intentionally not rendered here.
+    # After safe detach, canonical history is the single live source so callers see
+    # contextual, completed blocks without duplicate placeholder events such as
+    # `[tool] api_tool.call_tool` or `[thinking] Thinking…`.
     return None
 
 

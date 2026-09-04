@@ -48,16 +48,17 @@ gptty send --new --image ./image.png "что на картинке?"
 gptty status
 ```
 
-Live-режим включён по умолчанию. На коротком turn могут быть видны ранние события примерно так:
+Live-режим включён по умолчанию. После safe-detach `gptty` примерно каждые ~5 секунд читает один canonical snapshot и сразу печатает новые user-visible thinking-параграфы и краткие tool-call строки:
 
 ```text
-[tool] ...
-[tool done] ...
-[thinking] Thinking…
-[thinking] ...
+[thinking]
+Первый файл большой, поэтому читаю его диапазонами...
+
+[tool call] api_tool.call_tool Reading git status...
+[tool call] api_tool.call_tool Reading README.md...
 ```
 
-Для длинного обычного text-turn CWA теперь безопасно отпускает browser debugger сразу после подтверждённого submit. Поэтому после этой границы terminal может не показывать дальнейшие `[tool]` / `[thinking]` события до финального ответа. Это специально сделано, чтобы `gptty` не подвешивал живой ChatGPT Web turn; passive live-observer после detach пока не реализован.
+Tool arguments/results не печатаются. Пустой `Thinking…` тоже не печатается. Показываются короткие thinking/preamble paragraphs и reasoning recap/title, которые реально присутствуют в ChatGPT conversation/Web UI; raw/private hidden `thoughts` не выводятся. Canonical snapshot одновременно используется и для live-блоков, и для финального readback: отдельных частых запросов ради live нет. `429` получает 15-секундный backoff.
 
 Отключить live:
 
@@ -86,6 +87,7 @@ open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome
 
 Важно:
 
+- в отдельном CWA Chrome нормальное состояние — 2 managed ChatGPT-вкладки: runtime + canonical-read; обычные `gptty send --new` переиспользуют их, а не создают новую вкладку на каждый turn;
 - списка всех ChatGPT-чатов в `gptty` сейчас нет;
 - passive live-view turn, запущенного вручную в ChatGPT Web, нет;
 - image continuation в существующий чат CWA 0.3 официально не поддерживает; `--image --new` работает;
