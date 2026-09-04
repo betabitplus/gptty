@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+_CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS = 15.0
+
+
 class ChatGPTWebClientProtocol(Protocol):
     def send(self, prompt: str, **options: Any) -> Any: ...
 
@@ -87,7 +90,10 @@ class _ProductRuntimeClient:
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         timeout = float(options.pop("timeout", self.timeout))
-        poll_interval = float(options.pop("poll_interval", 0.5))
+        poll_interval = max(
+            _CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS,
+            float(options.pop("poll_interval", _CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS)),
+        )
         if options:
             unexpected = ", ".join(sorted(options))
             raise TypeError(f"unsupported wait options: {unexpected}")

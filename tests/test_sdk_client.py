@@ -191,15 +191,18 @@ def test_product_runtime_client_rejects_unknown_model_name() -> None:
     assert runtime.calls == []
 
 
-def test_product_runtime_client_delegates_read_surface_and_waits() -> None:
+def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) -> None:
     runtime = FakeProductRuntime()
     client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
+    sleeps: list[float] = []
+    monkeypatch.setattr("gptty.sdk_client.time.sleep", sleeps.append)
 
     assert client.attach_conversation("c1") == "runtime-attach-result"
     assert client.get_messages("c1", limit=4) == "runtime-messages-result"
     status = client.wait_until_completed("c1", timeout=1, poll_interval=0.001)
 
     assert status.status == "completed"
+    assert len(sleeps) == 1 and sleeps[0] > 0.9
     assert runtime.calls[0] == ("attach_conversation", ("c1",), {})
     assert runtime.calls[1] == ("get_messages", ("c1",), {"limit": 4})
     assert runtime.calls[2:] == [

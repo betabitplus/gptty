@@ -29,7 +29,7 @@ Then run a real `gptty send --new ...` smoke before considering browser-facing c
 
 `gptty` is a thin terminal client. Keep ChatGPT Web transport, browser extension/native host behavior, passive stream observation, session handling, retries, and finality in `chatgpt-web-adapter`.
 
-Use this repository only for terminal commands, local state/locks, rendering, concise live-output formatting, and CLI ergonomics. Do not duplicate CWA browser logic here.
+Use this repository only for terminal commands, local state/locks, rendering, concise live-output formatting, and CLI ergonomics. Do not duplicate CWA browser logic here. Compatibility-only canonical status waits must stay low-frequency; the adapter clamps them to a 15-second minimum poll interval instead of repeatedly hitting ChatGPT.
 
 ## Adding features
 
