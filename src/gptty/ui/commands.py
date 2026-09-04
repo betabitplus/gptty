@@ -5,11 +5,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ..output import normalize_messages
 from ..state import ChatState, StateError, save_chat_state
 from .renderer import PrettyRenderer
-from .session import InteractiveSession, command_help
+from .session import InteractiveSession
 
 FOLLOW_INTERVAL_SECONDS = 15.0
 FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -56,9 +57,6 @@ class InteractiveCommands:
     def _cmd_exit(self, argv: list[str]) -> int:
         return 0
 
-    def _cmd_help(self, argv: list[str]) -> None:
-        self.renderer.commands(command_help())
-
     def _cmd_new(self, argv: list[str]) -> None:
         previous = self.state.current_conversation
         self.state.current_conversation = None
@@ -84,7 +82,7 @@ class InteractiveCommands:
         if not ref:
             return
 
-        attached_ref = str(ref)
+        attached_ref = _canonical_conversation_ref(str(ref))
         try:
             snapshot = client.conversation_snapshot(attached_ref)
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
@@ -108,8 +106,15 @@ class InteractiveCommands:
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Conversation list failed: {exc}")
             return None
+        current_ref = _canonical_conversation_ref(self.state.current_conversation or "")
         options = [
-            (conversation_id, _conversation_label(item))
+            (
+                conversation_id,
+                _conversation_label(
+                    item,
+                    current=conversation_id == current_ref,
+                ),
+            )
             for item in conversations
             if (conversation_id := _catalog_conversation_id(item)) is not None
         ]
@@ -119,7 +124,6 @@ class InteractiveCommands:
         selected = self.ui.choose_searchable(
             "Resume conversation",
             options,
-            default=self.state.current_conversation,
         )
         return str(selected) if selected else None
 
@@ -149,9 +153,21 @@ class InteractiveCommands:
                 self.renderer.warning("Unknown model slug. Run /model and choose from the live ChatGPT list.")
                 return
         else:
-            options: list[tuple[Any, str]] = [("", "Default · use ChatGPT conversation/default model")]
-            options.extend((slug, _model_label(model)) for slug, model in by_slug.items())
-            value = self.ui.choose_searchable("ChatGPT model", options, default=self.state.model or "")
+            options: list[tuple[Any, str]] = [
+                (
+                    "",
+                    "Default · use ChatGPT conversation/default model"
+                    + (" · current" if self.state.model is None else ""),
+                )
+            ]
+            options.extend(
+                (
+                    slug,
+                    _model_label(model, current=slug == self.state.model),
+                )
+                for slug, model in by_slug.items()
+            )
+            value = self.ui.choose_searchable("ChatGPT model", options)
             if value is None:
                 return
             selected = str(value)
@@ -219,6 +235,19 @@ class InteractiveCommands:
         return True
 
 
+def _canonical_conversation_ref(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return raw
+    parsed = urlparse(raw)
+    supported_hosts = {"chatgpt.com", "www.chatgpt.com", "chat.openai.com"}
+    if parsed.scheme in {"http", "https"} and parsed.hostname in supported_hosts:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "c":
+            return parts[1]
+    return raw
+
+
 def _catalog_conversation_id(item: Any) -> str | None:
     value = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
     if not isinstance(value, str) or not value.strip():
@@ -226,14 +255,15 @@ def _catalog_conversation_id(item: Any) -> str | None:
     return value.strip()
 
 
-def _conversation_label(item: Any) -> str:
+def _conversation_label(item: Any, *, current: bool = False) -> str:
     conversation_id = _catalog_conversation_id(item) or "unknown"
     title = _field_text(item, "title") or "Untitled"
     updated = _format_update_time(_field(item, "update_time"))
     starred = "★ " if _field(item, "is_starred") is True else ""
     archived = " · archived" if _field(item, "is_archived") is True else ""
     updated_part = f" · {updated}" if updated else ""
-    return f"{starred}{title}{updated_part}{archived} · {_short_ref(conversation_id, max_len=18)}"
+    current_part = " · current" if current else ""
+    return f"{starred}{title}{updated_part}{archived}{current_part} · {_short_ref(conversation_id, max_len=18)}"
 
 
 def _format_update_time(value: Any) -> str:
@@ -260,7 +290,7 @@ def _model_available(model: Any) -> bool:
     return _field(model, "is_disabled") is not True
 
 
-def _model_label(model: Any) -> str:
+def _model_label(model: Any, *, current: bool = False) -> str:
     slug = _model_slug(model) or "unknown"
     title = (
         _field_text(model, "title")
@@ -268,7 +298,8 @@ def _model_label(model: Any) -> str:
         or _field_text(model, "name")
         or slug
     )
-    return title if title == slug else f"{title} · {slug}"
+    label = title if title == slug else f"{title} · {slug}"
+    return f"{label} · current" if current else label
 
 
 def _snapshot_status(snapshot: Any) -> str:

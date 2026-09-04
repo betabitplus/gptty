@@ -130,18 +130,6 @@ class PrettyRenderer:
                 self.console.print(message.text)
         self.state.last_block = "messages"
 
-    def mapping(self, data: dict[str, Any]) -> None:
-        self._gap_before("mapping")
-        for key, value in data.items():
-            self.console.print(Text.assemble((f"{key}: ", "bold"), str(value)))
-        self.state.last_block = "mapping"
-
-    def commands(self, commands: list[tuple[str, str]]) -> None:
-        self._gap_before("help")
-        for name, description in commands:
-            self.console.print(Text.assemble((f"/{name:<10}", "bold"), description))
-        self.state.last_block = "help"
-
     def _gap_before(self, block: str) -> None:
         previous = self.state.last_block
         if previous is None or previous == "boundary":

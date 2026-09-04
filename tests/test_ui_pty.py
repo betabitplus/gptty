@@ -26,7 +26,7 @@ def _read_until(fd: int, needle: bytes, *, timeout: float = 5.0) -> bytes:
     return bytes(data)
 
 
-def test_real_pty_help_and_exit(tmp_path) -> None:
+def test_real_pty_action_menu_and_exit(tmp_path) -> None:
     master, slave = pty.openpty()
     env = os.environ.copy()
     env.pop("NO_COLOR", None)
@@ -55,15 +55,13 @@ def test_real_pty_help_and_exit(tmp_path) -> None:
         startup = _read_until(master, "❯ ".encode(), timeout=5.0)
         assert b"ChatGPT" in startup
 
-        os.write(master, b"/help\r")
-        help_output = _read_until(master, b"/exit", timeout=5.0)
-        assert b"/resume" in help_output
-        assert b"/detach" in help_output
-        assert b"/model" in help_output
-
         os.write(master, b"/\r")
-        menu = _read_until(master, b"Actions", timeout=5.0)
+        menu = _read_until(master, b"/exit", timeout=5.0)
         assert b"Actions" in menu
+        assert b"/resume" in menu
+        assert b"/detach" in menu
+        assert b"/model" in menu
+        assert b"/help" not in menu
         os.write(master, b"\x1b")
         cancelled = _read_until(master, "❯".encode(), timeout=5.0)
         assert "❯".encode() in cancelled

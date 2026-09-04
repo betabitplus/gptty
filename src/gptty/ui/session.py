@@ -28,7 +28,6 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("resume", "Resume a real ChatGPT conversation"),
     CommandSpec("detach", "Detach locally from the current conversation"),
     CommandSpec("model", "Choose a real ChatGPT model"),
-    CommandSpec("help", "Show interactive commands"),
     CommandSpec("exit", "Exit gptty chat"),
 )
 
@@ -117,22 +116,17 @@ class InteractiveSession:
         self,
         message: str,
         options: list[tuple[Any, str]],
-        *,
-        default: Any | None = None,
     ) -> Any | None:
         if not options:
             return None
         labels: list[str] = []
         values_by_label: dict[str, Any] = {}
-        default_label = ""
         for value, raw_label in options:
             label = str(raw_label).strip() or str(value)
             if label in values_by_label:
                 label = f"{label}  [{value}]"
             labels.append(label)
             values_by_label[label] = value
-            if default is not None and value == default:
-                default_label = label
 
         picker_bindings = KeyBindings()
 
@@ -166,7 +160,6 @@ class InteractiveSession:
         try:
             selected = picker.prompt(
                 f"{message}: ",
-                default=default_label,
                 pre_run=lambda: get_app().current_buffer.start_completion(select_first=False),
             ).strip()
         except (KeyboardInterrupt, EOFError):
@@ -204,10 +197,6 @@ def should_use_enhanced_ui(
     if settings.pretty == "off":
         return False, settings
     return True, settings
-
-
-def command_help() -> list[tuple[str, str]]:
-    return [(spec.name, spec.description) for spec in COMMANDS]
 
 
 def _isatty(stream: TextIO) -> bool:

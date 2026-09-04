@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from argparse import Namespace
 from io import StringIO
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, ClassVar
 
 from gptty.commands.chat import extract_conversation_ref, run_chat
 from gptty.state import ChatState, load_chat_state, save_chat_state
@@ -15,7 +16,7 @@ class Response:
 
 
 class FakeGpttyClient:
-    instances: list["FakeGpttyClient"] = []
+    instances: ClassVar[list[FakeGpttyClient]] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.auth_file = auth_file
@@ -170,9 +171,11 @@ def test_no_stream_passes_stream_false_and_prints_response_text(tmp_path) -> Non
     assert load_chat_state(tmp_path / "gptty_state.json").model == "gpt-4o"
 
 
-def test_extract_conversation_ref_reads_dict_and_attributes() -> None:
+def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation() -> None:
     assert extract_conversation_ref({"conversation_url": "https://chatgpt.com/c/abc"}) == (
         "https://chatgpt.com/c/abc"
     )
     assert extract_conversation_ref(Response(conversation_id="abc")) == "abc"
+    assert extract_conversation_ref(SimpleNamespace(conversation=SimpleNamespace(conversation_id="nested"))) == "nested"
+    assert extract_conversation_ref({"conversation": {"conversation_id": "nested-dict"}}) == "nested-dict"
     assert extract_conversation_ref(object()) is None

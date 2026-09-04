@@ -40,16 +40,22 @@ CONVERSATION_REF_FIELDS = (
 
 
 def extract_conversation_ref(response: Any) -> str | None:
-    if isinstance(response, dict):
+    candidates = [response]
+    nested = response.get("conversation") if isinstance(response, dict) else getattr(response, "conversation", None)
+    if nested is not None:
+        candidates.append(nested)
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            for field in CONVERSATION_REF_FIELDS:
+                value = candidate.get(field)
+                if value:
+                    return str(value)
+            continue
         for field in CONVERSATION_REF_FIELDS:
-            value = response.get(field)
+            value = getattr(candidate, field, None)
             if value:
                 return str(value)
-
-    for field in CONVERSATION_REF_FIELDS:
-        value = getattr(response, field, None)
-        if value:
-            return str(value)
 
     return None
 

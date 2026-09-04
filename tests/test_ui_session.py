@@ -5,7 +5,7 @@ from io import StringIO
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from gptty.ui.session import InteractiveSession, command_help, should_use_enhanced_ui
+from gptty.ui.session import COMMANDS, InteractiveSession, should_use_enhanced_ui
 from gptty.ui.state import UISettings, save_ui_settings, ui_settings_path
 
 
@@ -137,5 +137,5 @@ def test_searchable_picker_escape_cancels(tmp_path) -> None:
 
 
 def test_command_registry_exposes_session_actions() -> None:
-    names = {name for name, _ in command_help()}
-    assert names == {"new", "resume", "detach", "model", "help", "exit"}
+    names = {spec.name for spec in COMMANDS}
+    assert names == {"new", "resume", "detach", "model", "exit"}

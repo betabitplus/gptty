@@ -24,9 +24,6 @@ class FakeRenderer:
     def warning(self, text):
         self.events.append(("warning", text))
 
-    def commands(self, commands):
-        self.events.append(("commands", commands))
-
     def messages(self, messages):
         self.events.append(("messages", messages))
 
@@ -107,13 +104,31 @@ def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> N
     assert [message.text for message in rendered] == ["question", "answer"]
 
 
+def test_resume_switches_while_already_attached_without_detach(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, _, client, state_path = make_commands(
+        tmp_path,
+        state=state,
+        ui=FakeUI(choices=["conv-2"]),
+    )
+
+    commands.handle("/resume")
+
+    assert client.calls[:2] == [
+        ("list_conversations", None),
+        ("snapshot", "conv-2"),
+    ]
+    assert load_chat_state(state_path).current_conversation == "conv-2"
+
+
 def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
-    commands, _, client, _ = make_commands(tmp_path)
+    commands, _, client, state_path = make_commands(tmp_path)
 
     commands.handle("/resume https://chatgpt.com/c/direct")
 
     assert ("list_conversations", None) not in client.calls
-    assert client.calls[0] == ("snapshot", "https://chatgpt.com/c/direct")
+    assert client.calls[0] == ("snapshot", "direct")
+    assert load_chat_state(state_path).current_conversation == "direct"
 
 
 def test_detach_is_local_only(tmp_path) -> None:
@@ -142,6 +157,22 @@ def test_model_uses_live_catalog_slug(tmp_path) -> None:
     assert state.model == "gpt-real-b"
     assert load_chat_state(state_path).model == "gpt-real-b"
     assert renderer.events[-1] == ("info", "Model: gpt-real-b")
+
+
+def test_model_picker_can_reset_to_default(tmp_path) -> None:
+    state = ChatState(model="gpt-real-a")
+    commands, renderer, client, state_path = make_commands(
+        tmp_path,
+        state=state,
+        ui=FakeUI(choices=[""]),
+    )
+
+    commands.handle("/model")
+
+    assert client.calls == [("list_models", None)]
+    assert state.model is None
+    assert load_chat_state(state_path).model is None
+    assert renderer.events[-1] == ("info", "Model: default")
 
 
 def test_model_default_is_local_only(tmp_path) -> None:
