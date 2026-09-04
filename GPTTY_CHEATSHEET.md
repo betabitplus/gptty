@@ -6,6 +6,22 @@
 gptty chat
 ```
 
+В интерактивном режиме команды помнить не нужно:
+
+```text
+/            открыть меню действий
+Ctrl-R       поиск по истории prompts
+Alt-Enter    новая строка внутри prompt
+```
+
+Основные действия (`new`, `switch`, `attach`, `messages`, `status`, `export`, `profile`, `auth`, `settings`) доступны из `/`-меню. `/switch` использует только локальную историю уже открытых через gptty разговоров и не запрашивает список чатов у ChatGPT.
+
+Отключить enhanced UI и вернуть простой line-oriented режим:
+
+```bash
+gptty chat --plain
+```
+
 Прикрепить существующий ChatGPT-чат:
 
 ```bash
@@ -87,8 +103,8 @@ open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome
 
 Важно:
 
-- в отдельном CWA Chrome нормальное состояние — 2 managed ChatGPT-вкладки: runtime + canonical-read; обычные `gptty send --new` переиспользуют их, а не создают новую вкладку на каждый turn;
-- списка всех ChatGPT-чатов в `gptty` сейчас нет;
+- в отдельном CWA Chrome нормальное состояние — 2 managed same-origin вкладки: runtime ChatGPT + лёгкая canonical-read `robots.txt`; обычные turns переиспользуют их;
+- `/switch` показывает локальный recent index gptty; полного серверного списка всех ChatGPT-чатов по-прежнему нет;
 - passive live-view turn, запущенного вручную в ChatGPT Web, нет;
 - image continuation в существующий чат CWA 0.3 официально не поддерживает; `--image --new` работает;
 - CodexPro вызывается самим ChatGPT внутри native connector/tool loop.

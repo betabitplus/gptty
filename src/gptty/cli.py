@@ -8,7 +8,6 @@ from . import __version__
 from .io import StdinReadError, read_stdin_text
 from .profiles import ProfileError, resolve_auth_path, resolve_session_paths
 
-
 DEFAULT_TURN_TIMEOUT_SECONDS = 7200
 
 
@@ -282,6 +281,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-stream",
         action="store_true",
         help="Wait for each full response before printing output.",
+    )
+    chat_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable the enhanced interactive UI and use the legacy line-oriented output.",
     )
     chat_parser.add_argument(
         "--timeout",

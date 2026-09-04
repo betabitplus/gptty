@@ -29,6 +29,8 @@ classifiers = [
 ]
 dependencies = [
   "chatgpt-web-adapter>=0.3.0,<0.4.0",
+  "prompt-toolkit>=3.0.52,<4",
+  "rich>=15,<16",
 ]
 
 [project.optional-dependencies]
@@ -49,9 +51,10 @@ Changelog = "https://github.com/kymuco/gptty/blob/main/CHANGELOG.md"
 gptty = "gptty.cli:main"
 
 [tool.setuptools]
-packages = ["gptty", "gptty.commands"]
+packages = ["gptty", "gptty.commands", "gptty.ui"]
 py-modules = ["main", "auth_fetcher", "auth_fetcher_wait"]
 
 [tool.setuptools.package-dir]
 gptty = "src/gptty"
 "gptty.commands" = "src/gptty/commands"
+"gptty.ui" = "src/gptty/ui"

@@ -18,6 +18,16 @@ from ..output import render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
+from ..ui.commands import InteractiveCommands
+from ..ui.renderer import PrettyRenderer
+from ..ui.session import InteractiveSession, should_use_enhanced_ui
+from ..ui.state import (
+    RecentStore,
+    UIStateError,
+    history_path,
+    recent_path,
+    ui_settings_path,
+)
 
 CHAT_HELP = """Commands:
   /help        Show this help
@@ -90,18 +100,69 @@ def run_chat(
 
     client: Any | None = None
     interactive = _is_interactive(input_stream)
+    enhanced, ui_settings = should_use_enhanced_ui(
+        input_stream=input_stream,
+        output_stream=stdout,
+        state_path=state_path,
+        force_plain=bool(getattr(args, "plain", False)),
+    )
+
+    def get_client() -> Any:
+        nonlocal client
+        if client is None:
+            client = client_factory(
+                auth_file=getattr(args, "auth", "auth_data.json"),
+                timeout=getattr(args, "timeout", 90),
+            )
+        return client
+
+    def reset_client() -> None:
+        nonlocal client
+        client = None
+
+    ui: InteractiveSession | None = None
+    renderer: PrettyRenderer | None = None
+    recent: RecentStore | None = None
+    interactive_commands: InteractiveCommands | None = None
+    if enhanced:
+        ui = InteractiveSession(
+            history_file=history_path(state_path),
+            settings_file=ui_settings_path(state_path),
+            settings=ui_settings,
+        )
+        renderer = PrettyRenderer(stdout, ui_settings)
+        recent = RecentStore(recent_path(state_path))
+        interactive_commands = InteractiveCommands(
+            args=args,
+            state=state,
+            state_path=state_path,
+            get_client=get_client,
+            reset_client=reset_client,
+            ui=ui,
+            renderer=renderer,
+            recent=recent,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        renderer.header(profile=getattr(args, "profile", None), conversation=state.current_conversation)
 
     while True:
-        if interactive:
+        if interactive and not enhanced:
             print("> ", end="", file=stdout, flush=True)
 
         try:
-            line = input_stream.readline()
+            if ui is not None:
+                line = ui.read_prompt()
+            else:
+                line = input_stream.readline()
         except KeyboardInterrupt:
             print(file=stdout)
             return 130
+        except EOFError:
+            print(file=stdout)
+            return 0
 
-        if line == "":
+        if ui is None and line == "":
             if interactive:
                 print(file=stdout)
             return 0
@@ -110,19 +171,25 @@ def run_chat(
         if not prompt:
             continue
 
+        if prompt == "/" and ui is not None:
+            selected = ui.choose_command()
+            if not selected:
+                continue
+            prompt = selected
+
         if prompt.startswith("/"):
-            result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
+            if interactive_commands is not None:
+                result = interactive_commands.handle(prompt)
+            else:
+                result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
             if result is not None:
                 return result
             continue
 
-        if client is None:
-            client = client_factory(
-                auth_file=getattr(args, "auth", "auth_data.json"),
-                timeout=getattr(args, "timeout", 90),
-            )
+        if renderer is not None:
+            renderer.turn_start()
         code = _send_chat_prompt(
-            client,
+            get_client(),
             state=state,
             state_path=state_path,
             profile=getattr(args, "profile", None),
@@ -133,9 +200,16 @@ def run_chat(
             explicit_lock_wait=bool(getattr(args, "wait_lock", False)) or getattr(args, "lock_timeout", None) is not None,
             stdout=stdout,
             stderr=stderr,
+            renderer=renderer,
         )
         if code != 0:
             return code
+        if recent is not None and state.current_conversation:
+            try:
+                recent.remember(state.current_conversation, label=_prompt_label(prompt))
+            except UIStateError as exc:
+                if renderer is not None:
+                    renderer.warning(str(exc))
 
 
 def _handle_chat_command(
@@ -178,8 +252,10 @@ def _send_chat_prompt(
     explicit_lock_wait: bool = False,
     stdout: TextIO,
     stderr: TextIO,
+    renderer: PrettyRenderer | None = None,
 ) -> int:
     saw_stream_token = False
+    stream_tokens: list[str] = []
     recorder: RunRecorder | None = None
     if state.current_conversation:
         recorder = start_run(
@@ -193,11 +269,16 @@ def _send_chat_prompt(
     def on_token(token: str) -> None:
         nonlocal saw_stream_token
         saw_stream_token = True
+        stream_tokens.append(token)
         if recorder is not None:
             recorder.event("token_delta", text=token)
-        print(token, end="", file=stdout, flush=True)
+        if renderer is None:
+            print(token, end="", file=stdout, flush=True)
 
     def on_event(event: dict[str, Any]) -> None:
+        if renderer is not None:
+            renderer.live_event(event)
+            return
         rendered = render_live_event(event)
         if rendered:
             print(rendered, file=stderr, flush=True)
@@ -247,7 +328,9 @@ def _send_chat_prompt(
             return 1
 
         text = response_text(response)
-        if stream:
+        if renderer is not None:
+            renderer.answer(text or "".join(stream_tokens))
+        elif stream:
             if saw_stream_token:
                 print(file=stdout)
             else:
@@ -292,3 +375,10 @@ def _is_interactive(input_stream: TextIO) -> bool:
         return input_stream.isatty()
     except OSError:
         return False
+
+
+def _prompt_label(prompt: str, *, max_length: int = 72) -> str:
+    compact = " ".join(prompt.split())
+    if len(compact) <= max_length:
+        return compact
+    return compact[: max_length - 1].rstrip() + "…"
