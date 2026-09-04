@@ -19,8 +19,8 @@ git push origin main
 After CWA changes, reinstall the local pair used for live testing:
 
 ```bash
-uv tool install --force ../chatgpt-web-adapter-cwa
-uv tool install --force . --with ../chatgpt-web-adapter-cwa
+uv tool install --force ../chatgpt-web-adapter
+uv tool install --force . --with ../chatgpt-web-adapter
 ```
 
 Then run a real `gptty send --new ...` smoke before considering browser-facing changes done.
