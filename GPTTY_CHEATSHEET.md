@@ -48,7 +48,7 @@ gptty send --new --image ./image.png "что на картинке?"
 gptty status
 ```
 
-Live-режим включён по умолчанию. Для turn, отправленного через `gptty`, по ходу работы видно примерно:
+Live-режим включён по умолчанию. На коротком turn могут быть видны ранние события примерно так:
 
 ```text
 [tool] ...
@@ -56,6 +56,8 @@ Live-режим включён по умолчанию. Для turn, отпра�
 [thinking] Thinking…
 [thinking] ...
 ```
+
+Для длинного обычного text-turn CWA теперь безопасно отпускает browser debugger сразу после подтверждённого submit. Поэтому после этой границы terminal может не показывать дальнейшие `[tool]` / `[thinking]` события до финального ответа. Это специально сделано, чтобы `gptty` не подвешивал живой ChatGPT Web turn; passive live-observer после detach пока не реализован.
 
 Отключить live:
 
@@ -79,7 +81,7 @@ gptty send --timeout 20000 "..."
 
 ```bash
 pkill -f 'chatgpt-web-adapter/browser-profile'
-open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome for Testing.app' --args --user-data-dir='/Users/stas/Library/Application Support/chatgpt-web-adapter/browser-profile' --remote-debugging-port=9333 --load-extension='/Users/stas/.local/share/uv/tools/chatgpt-web-adapter/lib/python3.10/site-packages/chatgpt_web_adapter/browser_native_extension' https://chatgpt.com/
+open -na '/Users/stas/.agent-browser/browsers/chrome-151.0.7922.34/Google Chrome for Testing.app' --args --user-data-dir='/Users/stas/Library/Application Support/chatgpt-web-adapter/browser-profile' --remote-debugging-port=9333 --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --load-extension='/Users/stas/.local/share/uv/tools/chatgpt-web-adapter/lib/python3.10/site-packages/chatgpt_web_adapter/browser_native_extension' https://chatgpt.com/
 ```
 
 Важно:
