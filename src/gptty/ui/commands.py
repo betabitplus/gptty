@@ -63,6 +63,7 @@ class InteractiveCommands:
         if not self._save_state():
             self.state.current_conversation = previous
             return
+        self.renderer.clear_context()
         self.renderer.info("Started a new conversation.")
 
     def _cmd_detach(self, argv: list[str]) -> None:
@@ -74,6 +75,7 @@ class InteractiveCommands:
         if not self._save_state():
             self.state.current_conversation = previous
             return
+        self.renderer.clear_context()
         self.renderer.info("Detached locally. The ChatGPT conversation was not changed.")
 
     def _cmd_resume(self, argv: list[str]) -> None:
@@ -95,6 +97,7 @@ class InteractiveCommands:
             self.state.current_conversation = previous
             return
 
+        self.renderer.clear_context()
         self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
@@ -134,7 +137,7 @@ class InteractiveCommands:
             if not self._save_state():
                 self.state.model = previous
                 return
-            self.renderer.info("Model: default")
+            self.renderer.info("Model: latest frontier · High")
             return
 
         try:
@@ -156,7 +159,7 @@ class InteractiveCommands:
             options: list[tuple[Any, str]] = [
                 (
                     "",
-                    "Default · use ChatGPT conversation/default model"
+                    "Default · latest frontier · High"
                     + (" · current" if self.state.model is None else ""),
                 )
             ]
@@ -177,7 +180,7 @@ class InteractiveCommands:
         if not self._save_state():
             self.state.model = previous
             return
-        self.renderer.info(f"Model: {self.state.model or 'default'}")
+        self.renderer.info(f"Model: {self.state.model or 'latest frontier · High'}")
 
     def _follow_if_active(
         self,

@@ -133,7 +133,11 @@ def run_chat(
             ui=ui,
             renderer=renderer,
         )
-        renderer.header(profile=getattr(args, "profile", None), conversation=state.current_conversation)
+        renderer.header(
+            profile=getattr(args, "profile", None),
+            conversation=state.current_conversation,
+            model=state.model or "latest frontier · High",
+        )
 
     while True:
         if interactive and not enhanced:

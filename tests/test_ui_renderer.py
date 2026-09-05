@@ -26,6 +26,20 @@ def test_renderer_separates_thinking_and_groups_tools() -> None:
     assert text.rstrip().endswith("Final answer")
 
 
+def test_renderer_clear_context_resets_spacing() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+    cleared: list[bool] = []
+    renderer.console.clear = lambda: cleared.append(True)
+
+    renderer.info("old")
+    renderer.clear_context()
+    renderer.info("new")
+
+    assert cleared == [True]
+    assert out.getvalue() == "old\nnew\n"
+
+
 def test_renderer_can_hide_thinking_and_tools() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False, thinking=False, tools="hidden"))

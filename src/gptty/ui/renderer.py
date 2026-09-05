@@ -27,16 +27,28 @@ class PrettyRenderer:
         self.console = Console(file=stdout, highlight=False, soft_wrap=False)
         self.state = RenderState()
 
-    def header(self, *, profile: str | None = None, conversation: str | None = None) -> None:
+    def header(
+        self,
+        *,
+        profile: str | None = None,
+        conversation: str | None = None,
+        model: str | None = None,
+    ) -> None:
         self.console.print(Rule("ChatGPT", style="dim"))
         details: list[str] = []
         if profile:
             details.append(f"profile: {profile}")
         if conversation:
             details.append(f"conversation: {_short_ref(conversation)}")
+        if model:
+            details.append(f"model: {model}")
         if details:
             self.console.print(" · ".join(details), style="dim")
             self.console.print()
+
+    def clear_context(self) -> None:
+        self.console.clear()
+        self.state = RenderState()
 
     def turn_start(self) -> None:
         if self.state.turn_active:

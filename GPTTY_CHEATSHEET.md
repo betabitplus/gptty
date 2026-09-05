@@ -14,7 +14,7 @@ Ctrl-R       поиск по истории prompts
 Alt-Enter    новая строка внутри prompt
 ```
 
-Основные действия доступны из `/`-меню: `new`, `resume`, `detach`, `model`, `exit`. `/resume` читает реальный список ChatGPT-чатов через CWA, даёт fuzzy-поиск, показывает полную user-visible текущую ветку истории и после выбора продолжает именно этот conversation. `/resume URL_OR_ID` подключает чат напрямую без списка. `/detach` только локально снимает привязку и ничего не меняет в ChatGPT. `/model` показывает реальный текущий normal-chat model catalog ChatGPT и сохраняет выбранный product slug без собственных алиасов gptty; Work-mode backend entries и Deep Research mode в обычный model picker не попадают.
+Основные действия доступны из `/`-меню: `new`, `resume`, `detach`, `model`, `exit`. `/resume` читает реальный список ChatGPT-чатов через CWA, даёт fuzzy-поиск, показывает полную user-visible текущую ветку истории и после выбора продолжает именно этот conversation. `/resume URL_OR_ID` подключает чат напрямую без списка. `/detach` только локально снимает привязку и ничего не меняет в ChatGPT. Успешные `/new`, `/resume` и `/detach` очищают только текущий viewport перед новым состоянием; terminal scrollback не стирается. Дефолтная модель — `latest frontier · High`: gptty передаёт нативный product profile `DEEP/HIGH`, поэтому сейчас это GPT-5.6 Sol High, а при смене frontier ChatGPT сам подхватит более новую доступную тарифу модель. `/model` показывает реальный текущий normal-chat model catalog и позволяет сделать явный override; `/model default` возвращает `latest frontier · High`. Work-mode backend entries и Deep Research mode в обычный model picker не попадают.
 
 Отключить enhanced UI и вернуть простой line-oriented режим:
 

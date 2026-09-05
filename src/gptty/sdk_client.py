@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 _CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS = 15.0
+DEFAULT_MODEL_PROFILE = "DEEP"
 
 
 class ChatGPTWebClientProtocol(Protocol):
@@ -193,6 +194,8 @@ class GpttyClient:
 def _sdk_send_options(options: dict[str, Any]) -> dict[str, Any]:
     sdk_options = dict(options)
     sdk_options.pop("stream", None)
+    if not sdk_options.get("model") and not sdk_options.get("model_profile"):
+        sdk_options["model_profile"] = DEFAULT_MODEL_PROFILE
     return sdk_options
 
 

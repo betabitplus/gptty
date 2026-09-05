@@ -20,6 +20,9 @@ class FakeRenderer:
     def __init__(self) -> None:
         self.events: list[tuple[str, object]] = []
 
+    def clear_context(self):
+        self.events.append(("clear_context", None))
+
     def info(self, text):
         self.events.append(("info", text))
 
@@ -104,6 +107,7 @@ def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> N
         ("snapshot", "conv-2"),
     ]
     assert load_chat_state(state_path).current_conversation == "conv-2"
+    assert renderer.events[0] == ("clear_context", None)
     rendered = [event for event in renderer.events if event[0] == "messages"][-1][1]
     assert [message.text for message in rendered] == ["question", "answer"]
 
@@ -144,6 +148,7 @@ def test_detach_is_local_only(tmp_path) -> None:
     assert state.current_conversation is None
     assert load_chat_state(state_path).current_conversation is None
     assert client.calls == []
+    assert renderer.events[0] == ("clear_context", None)
     assert "not changed" in renderer.events[-1][1]
 
 
@@ -172,6 +177,7 @@ def test_model_picker_excludes_non_chat_modes(tmp_path) -> None:
     assert client.calls == [("list_models", None)]
     _message, options = ui.seen[-1]
     values = [value for value, _label in options]
+    assert options[0][1].startswith("Default · latest frontier · High")
     assert "gpt-real-a" in values
     assert "gpt-real-b" in values
     assert "disabled" not in values
@@ -192,7 +198,7 @@ def test_model_picker_can_reset_to_default(tmp_path) -> None:
     assert client.calls == [("list_models", None)]
     assert state.model is None
     assert load_chat_state(state_path).model is None
-    assert renderer.events[-1] == ("info", "Model: default")
+    assert renderer.events[-1] == ("info", "Model: latest frontier · High")
 
 
 def test_model_default_is_local_only(tmp_path) -> None:
@@ -204,7 +210,7 @@ def test_model_default_is_local_only(tmp_path) -> None:
     assert client.calls == []
     assert state.model is None
     assert load_chat_state(state_path).model is None
-    assert renderer.events[-1] == ("info", "Model: default")
+    assert renderer.events[-1] == ("info", "Model: latest frontier · High")
 
 
 def test_model_rejects_slug_not_in_live_catalog(tmp_path) -> None:
@@ -244,12 +250,13 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
 
 def test_new_clears_current_conversation(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
-    commands, _, _, state_path = make_commands(tmp_path, state=state)
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
 
     commands.handle("/new")
 
     assert state.current_conversation is None
     assert load_chat_state(state_path).current_conversation is None
+    assert renderer.events[0] == ("clear_context", None)
 
 
 def test_state_save_failure_rolls_back_interactive_change(tmp_path, monkeypatch) -> None:

@@ -127,6 +127,15 @@ def test_send_delegates_to_sdk_client_without_cli_stream_option() -> None:
     ]
 
 
+def test_send_defaults_to_latest_frontier_high_profile() -> None:
+    sdk = FakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    assert client.send("hello") == "send-result"
+
+    assert sdk.calls == [("send", ("hello",), {"model_profile": "DEEP"})]
+
+
 def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
     sdk = FakeSdkClient()
     client = GpttyClient(sdk_client=sdk)
@@ -143,7 +152,7 @@ def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
         (
             "send_to_conversation",
             ("abc", "continue"),
-            {"media": ["image.png"]},
+            {"media": ["image.png"], "model_profile": "DEEP"},
         )
     ]
 

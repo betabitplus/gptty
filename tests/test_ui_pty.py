@@ -71,6 +71,8 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"Actions" in menu
         os.write(master, b"\r")
         selected = _read_until(master, b"Started a new conversation.", timeout=5.0)
+        assert b"\x1b[2J" in selected
+        assert b"\x1b[H" in selected
         assert b"Started a new conversation." in selected
 
         os.write(master, b"/exit\r")

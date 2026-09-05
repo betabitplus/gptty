@@ -231,7 +231,7 @@ In a TTY, press `/` and Enter to open the lightweight action menu. It contains o
 /exit
 ```
 
-`/resume` opens the real ChatGPT conversation catalog, supports fuzzy filtering, renders the selected conversation's user-visible history, and continues that same conversation. `/resume <URL-or-ID>` skips the picker. `/model` opens the live normal-chat model catalog returned by ChatGPT; gptty does not invent model aliases. `/detach` only clears the local attachment and does not modify the ChatGPT chat.
+`/resume` opens the real ChatGPT conversation catalog, supports fuzzy filtering, renders the selected conversation's user-visible history, and continues that same conversation. `/resume <URL-or-ID>` skips the picker. Successful `/new`, `/resume`, and `/detach` clear only the current viewport before rendering the new context; terminal scrollback remains available. The default model policy is `latest frontier · High`: gptty uses ChatGPT's native `DEEP/HIGH` product profile, which currently resolves to GPT-5.6 Sol High and automatically follows a newer frontier model when the product/account exposes one. `/model` opens the live normal-chat model catalog for explicit overrides, and `/model default` returns to `latest frontier · High`. `/detach` only clears the local attachment and does not modify the ChatGPT chat.
 
 Use `Ctrl-R` for prompt history and `Alt-Enter` for a newline. `gptty chat --plain` keeps the older line-oriented fallback without the enhanced action menu.
 
