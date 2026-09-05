@@ -102,10 +102,10 @@ def render_live_event(event: Any) -> str | None:
             rendered = text or label
             return f"[thinking]\n{rendered}" if rendered else None
         if kind == "tool_call":
-            suffix = f" {label}" if label else ""
-            return f"[tool call] {tool or 'tool'}{suffix}"
+            return _render_tool_call(tool=tool, text=text, label=label)
         if kind == "tool_result":
-            return None
+            error = _tool_result_error(text)
+            return f"[tool error] {tool or 'tool'} · {error}" if error else None
         if kind == "activity":
             return f"[activity] {text or label}" if text or label else None
         return None
@@ -114,6 +114,105 @@ def render_live_event(event: Any) -> str | None:
     # contextual, completed blocks without duplicate placeholder events such as
     # `[tool] api_tool.call_tool` or `[thinking] Thinking…`.
     return None
+
+
+def _render_tool_call(*, tool: str, text: str, label: str) -> str:
+    payload = _json_mapping(text)
+
+    if tool == "api_tool.call_tool":
+        action = _api_tool_action(payload)
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        if action:
+            return _tool_line(action, _api_tool_detail(action, args))
+        return _tool_line("call_tool", _clean_tool_detail(label))
+
+    if tool == "api_tool.list_resources":
+        detail = ""
+        query = payload.get("query")
+        if isinstance(query, str) and query.strip():
+            detail = query
+        else:
+            paths = payload.get("paths")
+            if isinstance(paths, list) and paths and isinstance(paths[0], str):
+                detail = paths[0]
+        return _tool_line("list_resources", detail or _clean_tool_detail(label))
+
+    return _tool_line(tool or "tool", _clean_tool_detail(label))
+
+
+def _api_tool_action(payload: dict[str, Any]) -> str:
+    path = payload.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    return path.rstrip("/").rsplit("/", 1)[-1].strip()
+
+
+def _api_tool_detail(action: str, args: dict[str, Any]) -> str:
+    if action in {"read", "tree"}:
+        return _clean_tool_detail(args.get("path"))
+    if action == "search":
+        return _clean_tool_detail(args.get("query"))
+    if action == "bash":
+        return _clean_tool_detail(args.get("command"))
+    if action == "open_workspace":
+        return _clean_tool_detail(args.get("root") or args.get("path"))
+    return ""
+
+
+def _tool_line(name: str, detail: str) -> str:
+    return f"[tool] {name} · {detail}" if detail else f"[tool] {name}"
+
+
+def _clean_tool_detail(value: Any, *, max_chars: int = 160) -> str:
+    if not isinstance(value, str):
+        return ""
+    detail = " ".join(value.split()).strip()
+    while detail.endswith("...") or detail.endswith("…"):
+        detail = detail[:-3].rstrip() if detail.endswith("...") else detail[:-1].rstrip()
+    if len(detail) <= max_chars:
+        return detail
+    return detail[: max_chars - 1].rstrip() + "…"
+
+
+def _json_mapping(text: str) -> dict[str, Any]:
+    if not text or text[:1] != "{":
+        return {}
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _tool_result_error(text: str) -> str:
+    payload = _json_mapping(text)
+    if not payload:
+        return ""
+
+    failed = payload.get("is_error") is True or payload.get("ok") is False or payload.get("success") is False
+    status = payload.get("status")
+    if isinstance(status, str) and status.lower() in {"error", "failed", "failure"}:
+        failed = True
+    exit_code = payload.get("exitCode", payload.get("returncode"))
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        failed = True
+    if not failed:
+        return ""
+
+    for key in ("error", "message", "detail", "stderr"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clean_tool_detail(value)
+        if isinstance(value, dict):
+            for nested_key in ("message", "detail", "code"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str) and nested.strip():
+                    return _clean_tool_detail(nested)
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return f"exit {exit_code}"
+    if isinstance(status, str) and status.strip():
+        return _clean_tool_detail(status)
+    return "failed"
 
 
 def _extract_raw_messages(response: Any) -> list[Any]:

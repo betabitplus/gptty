@@ -127,16 +127,16 @@ def test_render_canonical_intermediate_blocks() -> None:
             "message_kind": "tool_call",
             "tool_name": "api_tool.call_tool",
             "label": "Reading README…",
-            "text": '{"path":"README.md"}',
+            "text": '{"path":"/CodexTool/link/read","args":{"path":"README.md"}}',
         }
-    ) == '[tool call] api_tool.call_tool Reading README…'
+    ) == "[tool] read · README.md"
     assert render_live_event(
         {
             "type": "canonical_intermediate_message",
             "message_kind": "tool_result",
             "tool_name": "api_tool.call_tool",
             "label": "README read",
-            "text": "first three lines",
+            "text": '{"ok":true}',
         }
     ) is None
     assert render_live_event(
@@ -147,6 +147,81 @@ def test_render_canonical_intermediate_blocks() -> None:
             "text": "",
         }
     ) == "[thinking]\nChecking context"
+
+
+def test_render_tool_calls_use_compact_useful_details() -> None:
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Searching workspace...",
+            "text": '{"path":"/CodexTool/link/search","args":{"query":"goal mode"}}',
+        }
+    ) == "[tool] search · goal mode"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Running command...",
+            "text": '{"path":"/CodexTool/link/bash","args":{"command":"pytest -q"}}',
+        }
+    ) == "[tool] bash · pytest -q"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Reviewing changes...",
+            "text": '{"path":"/CodexTool/link/show_changes","args":{}}',
+        }
+    ) == "[tool] show_changes"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.list_resources",
+            "label": "Discovering tools...",
+            "text": '{"paths":["CodexTool"],"query":"read"}',
+        }
+    ) == "[tool] list_resources · read"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "web.run",
+            "label": "Searching the web...",
+            "text": "",
+        }
+    ) == "[tool] web.run · Searching the web"
+
+
+def test_render_tool_results_only_surfaces_errors() -> None:
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "text": '{"ok":true,"message":"done"}',
+        }
+    ) is None
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "text": '{"ok":false,"error":"Workspace not found"}',
+        }
+    ) == "[tool error] api_tool.call_tool · Workspace not found"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "text": '{"exitCode":2,"stderr":"pytest: bad option\\nmore noise"}',
+        }
+    ) == "[tool error] api_tool.call_tool · pytest: bad option more noise"
 
 
 def test_normalize_response_from_shapes() -> None:
