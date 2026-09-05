@@ -555,7 +555,10 @@ def _send_chat_prompt(
         if renderer is not None:
             renderer.turn_abort()
             if completed_successfully and not stopped_by_user:
-                notify_response_complete(chat_title=response_title(response), prompt=prompt)
+                notify_response_complete(
+                    chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
+                    final_response=rendered_text,
+                )
 
 
 def _stopped_snapshot_response(snapshot: Any, *, conversation_ref: str) -> dict[str, str]:

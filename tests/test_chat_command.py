@@ -246,7 +246,7 @@ def test_no_stream_passes_stream_false_and_prints_response_text(tmp_path) -> Non
     assert load_chat_state(tmp_path / "gptty_state.json").model == "gpt-4o"
 
 
-def test_completed_enhanced_turn_notifies_with_chat_and_prompt(tmp_path, monkeypatch) -> None:
+def test_completed_enhanced_turn_notifies_with_chat_and_final_response(tmp_path, monkeypatch) -> None:
     class FakeRenderer:
         def answer(self, _text: str) -> None:
             pass
@@ -283,7 +283,7 @@ def test_completed_enhanced_turn_notifies_with_chat_and_prompt(tmp_path, monkeyp
     assert notified == [
         {
             "chat_title": "Test Chat",
-            "prompt": "Which screenshot is this?",
+            "final_response": "reply",
         }
     ]
 

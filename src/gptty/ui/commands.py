@@ -474,7 +474,7 @@ class InteractiveCommands:
                     if not stopped_by_user:
                         notify_response_complete(
                             chat_title=chat_title,
-                            prompt=_last_user_message_text(current),
+                            final_response=_last_assistant_message_text(current),
                         )
                     return False
                 if status == "awaiting_tool_approval":
@@ -622,6 +622,13 @@ def _message_text(message: Any) -> str:
 def _last_user_message_text(messages: list[Any]) -> str:
     for message in reversed(messages):
         if _field_text(message, "role") == "user":
+            return _message_text(message)
+    return ""
+
+
+def _last_assistant_message_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        if _field_text(message, "role") == "assistant":
             return _message_text(message)
     return ""
 

@@ -12,13 +12,13 @@ end run
 '''.strip()
 
 
-def notify_response_complete(*, chat_title: str | None = None, prompt: str | None = None) -> bool:
+def notify_response_complete(*, chat_title: str | None = None, final_response: str | None = None) -> bool:
     """Show a best-effort native notification after a complete interactive reply."""
     if sys.platform != "darwin":
         return False
 
-    title = _notification_title(chat_title, prompt)
-    body = _notification_prompt(prompt)
+    title = _notification_title(chat_title)
+    body = _notification_response(final_response)
 
     try:
         result = subprocess.run(
@@ -40,21 +40,25 @@ def notify_response_complete(*, chat_title: str | None = None, prompt: str | Non
     return result.returncode == 0
 
 
-def _notification_title(chat_title: str | None, prompt: str | None, *, max_chars: int = 72) -> str:
-    text = " ".join(str(chat_title or "").split())
-    if not text:
-        text = " ".join(str(prompt or "").split()) or "ChatGPT"
-    if len(text) <= max_chars:
-        return text
-    return f"{text[: max_chars - 1].rstrip()}…"
+def _notification_title(chat_title: str | None, *, max_chars: int = 64) -> str:
+    text = " ".join(str(chat_title or "").split()) or "ChatGPT"
+    return _bounded_preview(text, max_chars=max_chars)
 
 
-def _notification_prompt(prompt: str | None, *, max_chars: int = 180) -> str:
-    if not prompt:
-        return "ChatGPT response is ready."
-    text = " ".join(str(prompt).split())
+def _notification_response(final_response: str | None, *, max_chars: int = 160) -> str:
+    if not final_response:
+        return "Response complete."
+    text = " ".join(str(final_response).split())
     if not text:
-        return "ChatGPT response is ready."
+        return "Response complete."
+    return _bounded_preview(text, max_chars=max_chars)
+
+
+def _bounded_preview(text: str, *, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    return f"{text[: max_chars - 1].rstrip()}…"
+    clipped = text[: max_chars - 1].rstrip()
+    word_boundary = clipped.rfind(" ")
+    if word_boundary >= max_chars // 2:
+        clipped = clipped[:word_boundary].rstrip()
+    return f"{clipped}…"

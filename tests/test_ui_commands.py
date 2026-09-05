@@ -433,7 +433,7 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
     assert any(event[0] == "start_elapsed" for event in renderer.events)
     assert ("finish_elapsed", None) in renderer.events
     assert ("chat_link", "conv-1") in renderer.events
-    assert notified == [{"chat_title": "First chat", "prompt": "question"}]
+    assert notified == [{"chat_title": "First chat", "final_response": "finished"}]
     assert [call[0] for call in client.calls].count("snapshot") == 2
 
 
