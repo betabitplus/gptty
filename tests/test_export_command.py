@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from gptty.commands.export import run_export
+from gptty.commands.export import run_export, save_markdown_export
+from gptty.output import OutputMessage
 from gptty.state import ChatState, save_chat_state
 
 
@@ -211,3 +213,39 @@ def test_export_returns_1_on_file_write_error(tmp_path: Path) -> None:
 
     assert result == 1
     assert "failed to write export" in stderr.getvalue()
+
+
+def test_save_markdown_export_creates_timestamped_readable_file(tmp_path: Path) -> None:
+    path = save_markdown_export(
+        [
+            OutputMessage(role="user", text="hello"),
+            OutputMessage(role="assistant", text="hi"),
+        ],
+        directory=tmp_path,
+        title='My / unsafe: chat?',
+        now=datetime(2026, 9, 5, 19, 20, 30, tzinfo=timezone.utc),
+    )
+
+    assert path == (tmp_path / "2026-09-05_19-20-30 - My - unsafe- chat.md").resolve()
+    assert path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
+
+
+def test_save_markdown_export_never_overwrites_previous_export(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 5, 19, 20, 30, tzinfo=timezone.utc)
+    first = save_markdown_export(
+        [OutputMessage(role="user", text="first")],
+        directory=tmp_path,
+        title="Same chat",
+        now=now,
+    )
+    second = save_markdown_export(
+        [OutputMessage(role="user", text="second")],
+        directory=tmp_path,
+        title="Same chat",
+        now=now,
+    )
+
+    assert first.name == "2026-09-05_19-20-30 - Same chat.md"
+    assert second.name == "2026-09-05_19-20-30 - Same chat (2).md"
+    assert "first" in first.read_text(encoding="utf-8")
+    assert "second" in second.read_text(encoding="utf-8")

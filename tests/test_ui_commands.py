@@ -94,6 +94,21 @@ class FakeClient:
         self.calls.append(("stop_generation", (ref, options)))
         return {"ok": True, "stopped": True, "conversationId": ref}
 
+    def get_messages(self, ref):
+        self.calls.append(("get_messages", ref))
+        return [
+            {"role": "user", "text": "question"},
+            {"role": "assistant", "text": "answer"},
+        ]
+
+    def temporary_lifecycle_snapshot(self):
+        self.calls.append(("temporary_lifecycle_snapshot", None))
+        return {"state": "LIVE", "conversation_id": "temp-1"}
+
+    def end_temporary_chat(self):
+        self.calls.append(("end_temporary_chat", None))
+        return True
+
     def list_models(self):
         self.calls.append(("list_models", None))
         return [
@@ -187,6 +202,79 @@ def test_stop_command_stops_current_chat_without_detaching(tmp_path) -> None:
     assert ("stop_generation", ("conv-1", {"timeout": 30.0})) in client.calls
     assert ("turn_abort", None) in renderer.events
     assert ("info", "Stop requested.") in renderer.events
+
+
+def test_temporary_command_clears_persistent_attachment_without_persisting_temp_id(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/temporary")
+
+    assert commands.conversation_mode == "temporary"
+    assert commands.conversation_ref is None
+    assert state.current_conversation is None
+    assert load_chat_state(state_path).current_conversation is None
+    assert any(event == ("header", {"model": "latest frontier · High", "temporary": True}) for event in renderer.events)
+
+
+def test_temporary_export_uses_live_transcript_and_prints_exact_path(tmp_path, monkeypatch) -> None:
+    commands, renderer, client, _ = make_commands(tmp_path)
+    exported: list[tuple[list[object], str | None]] = []
+    export_path = tmp_path / "temporary.md"
+
+    def fake_export(messages, *, title=None):
+        exported.append((list(messages), title))
+        return export_path
+
+    monkeypatch.setattr("gptty.ui.commands.save_markdown_export", fake_export)
+    commands.handle("/temporary")
+    commands.record_temporary_turn(
+        prompt="hello",
+        answer="hi",
+        conversation_ref="temp-1",
+        title="Temporary title",
+    )
+    commands.handle("/export")
+
+    assert [message.role for message in exported[0][0]] == ["user", "assistant"]
+    assert [message.text for message in exported[0][0]] == ["hello", "hi"]
+    assert exported[0][1] == "Temporary title"
+    assert ("get_messages", "temp-1") not in client.calls
+    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+
+
+def test_normal_export_reads_complete_attached_history_from_cwa(tmp_path, monkeypatch) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, client, _ = make_commands(tmp_path, state=state)
+    exported: list[list[object]] = []
+    export_path = tmp_path / "normal.md"
+
+    monkeypatch.setattr(
+        "gptty.ui.commands.save_markdown_export",
+        lambda messages, *, title=None: exported.append(list(messages)) or export_path,
+    )
+    commands.handle("/export")
+
+    assert ("get_messages", "conv-1") in client.calls
+    assert [message.text for message in exported[0]] == ["question", "answer"]
+    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+
+
+def test_new_ends_live_temporary_lifecycle(tmp_path) -> None:
+    commands, _, client, _ = make_commands(tmp_path)
+    commands.handle("/temporary")
+    commands.record_temporary_turn(
+        prompt="hello",
+        answer="hi",
+        conversation_ref="temp-1",
+        title=None,
+    )
+
+    commands.handle("/new")
+
+    assert commands.conversation_mode == "normal"
+    assert ("temporary_lifecycle_snapshot", None) in client.calls
+    assert ("end_temporary_chat", None) in client.calls
 
 
 def test_image_command_queues_real_file_for_next_prompt(tmp_path) -> None:

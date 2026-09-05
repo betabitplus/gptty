@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..commands.export import save_markdown_export
 from ..media import MediaInputError, normalize_media_input
-from ..output import normalize_messages
+from ..output import OutputMessage, normalize_messages
 from ..state import ChatState, StateError, save_chat_state
 from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
@@ -48,6 +49,10 @@ class InteractiveCommands:
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
         self._conversation_titles: dict[str, str] = {}
+        self._conversation_mode = "normal"
+        self._temporary_conversation: str | None = None
+        self._temporary_messages: list[OutputMessage] = []
+        self._temporary_title: str | None = None
 
     def handle(self, raw: str) -> int | None:
         try:
@@ -65,12 +70,40 @@ class InteractiveCommands:
         return method(parts[1:])
 
     @property
+    def conversation_mode(self) -> str:
+        return self._conversation_mode
+
+    @property
+    def conversation_ref(self) -> str | None:
+        if self._conversation_mode == "temporary":
+            return self._temporary_conversation
+        return self.state.current_conversation
+
+    @property
     def pending_media(self) -> list[str]:
         return list(self._pending_media)
 
     @property
     def pending_media_count(self) -> int:
         return len(self._pending_media)
+
+    def record_temporary_turn(
+        self,
+        *,
+        prompt: str,
+        answer: str,
+        conversation_ref: str | None,
+        title: str | None,
+    ) -> None:
+        if self._conversation_mode != "temporary":
+            return
+        if conversation_ref:
+            self._temporary_conversation = conversation_ref
+        if title:
+            self._temporary_title = title
+        self._temporary_messages.append(OutputMessage(role="user", text=prompt))
+        if answer:
+            self._temporary_messages.append(OutputMessage(role="assistant", text=answer))
 
     def clear_pending_media(self) -> None:
         self._pending_media.clear()
@@ -84,11 +117,31 @@ class InteractiveCommands:
     def close(self) -> None:
         self.clear_pending_media()
 
+    def _reset_temporary_context(self) -> None:
+        self._temporary_conversation = None
+        self._temporary_messages.clear()
+        self._temporary_title = None
+
+    def _leave_temporary_mode(self) -> None:
+        if self._conversation_mode != "temporary":
+            return
+        try:
+            client = self.get_client()
+            snapshot = client.temporary_lifecycle_snapshot()
+            if snapshot.get("state") == "LIVE":
+                client.end_temporary_chat()
+        except Exception as exc:  # noqa: BLE001 - context switch must remain usable.
+            self.renderer.warning(f"Temporary chat cleanup failed: {exc}")
+        self._conversation_mode = "normal"
+        self._reset_temporary_context()
+
     def _cmd_exit(self, argv: list[str]) -> int:
+        self._leave_temporary_mode()
         self.close()
         return 0
 
     def _cmd_new(self, argv: list[str]) -> None:
+        self._leave_temporary_mode()
         previous = self.state.current_conversation
         self.state.current_conversation = None
         if not self._save_state():
@@ -99,7 +152,34 @@ class InteractiveCommands:
         self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Started a new conversation.")
 
+    def _cmd_temporary(self, argv: list[str]) -> None:
+        if argv:
+            self.renderer.warning("/temporary takes no arguments.")
+            return
+        self._leave_temporary_mode()
+        previous = self.state.current_conversation
+        self.state.current_conversation = None
+        if not self._save_state():
+            self.state.current_conversation = previous
+            return
+        self._conversation_mode = "temporary"
+        self._reset_temporary_context()
+        self.clear_pending_media()
+        self.renderer.clear_context()
+        self.renderer.header(model=self.state.model or "latest frontier · High", temporary=True)
+        self.renderer.info("Started a new Temporary ChatGPT conversation.")
+
+    def _cmd_temp(self, argv: list[str]) -> None:
+        self._cmd_temporary(argv)
+
     def _cmd_detach(self, argv: list[str]) -> None:
+        if self._conversation_mode == "temporary":
+            self._leave_temporary_mode()
+            self.clear_pending_media()
+            self.renderer.clear_context()
+            self.renderer.header(model=self.state.model or "latest frontier · High")
+            self.renderer.info("Detached from the Temporary ChatGPT conversation.")
+            return
         if not self.state.current_conversation:
             self.renderer.info("No conversation is attached.")
             return
@@ -117,7 +197,7 @@ class InteractiveCommands:
         if argv:
             self.renderer.warning("/stop takes no arguments.")
             return
-        ref = self.state.current_conversation
+        ref = self.conversation_ref
         if not ref:
             self.renderer.info("No conversation is attached.")
             return
@@ -125,6 +205,26 @@ class InteractiveCommands:
         if self._request_stop_generation(client, ref):
             self.renderer.turn_abort()
             self.renderer.info("Stop requested.")
+
+    def _cmd_export(self, argv: list[str]) -> None:
+        if argv:
+            self.renderer.warning("/export takes no arguments.")
+            return
+        ref = self.conversation_ref
+        if not ref:
+            self.renderer.info("No conversation is attached.")
+            return
+        title = self._temporary_title if self._conversation_mode == "temporary" else self._conversation_titles.get(ref)
+        try:
+            if self._conversation_mode == "temporary":
+                messages = list(self._temporary_messages)
+            else:
+                messages = normalize_messages(self.get_client().get_messages(ref))
+            path = save_markdown_export(messages, title=title)
+        except Exception as exc:  # noqa: BLE001 - interactive export boundary.
+            self.renderer.warning(f"Export failed: {exc}")
+            return
+        self.renderer.info(f"Exported Markdown: {path}")
 
     def _request_stop_generation(self, client: Any, ref: str) -> bool:
         try:
@@ -190,6 +290,7 @@ class InteractiveCommands:
             return
 
         attached_ref = _canonical_conversation_ref(str(ref))
+        self._leave_temporary_mode()
         try:
             snapshot = client.conversation_snapshot(attached_ref)
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.

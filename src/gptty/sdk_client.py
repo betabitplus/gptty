@@ -37,6 +37,12 @@ class ChatGPTWebClientProtocol(Protocol):
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any: ...
 
+    def send_temporary(self, prompt: str, **options: Any) -> Any: ...
+
+    def end_temporary_chat(self) -> bool: ...
+
+    def temporary_lifecycle_snapshot(self) -> dict[str, Any]: ...
+
 
 class _ProductRuntimeClient:
     """Compatibility adapter from gptty's CLI-shaped SDK surface to CWA 0.3."""
@@ -65,6 +71,16 @@ class _ProductRuntimeClient:
         runtime_options = _runtime_send_options(options)
         timeout = float(runtime_options.pop("timeout", self.timeout))
         return self.runtime.send(prompt, timeout=timeout, **runtime_options)
+
+    def send_temporary(self, prompt: str, **options: Any) -> Any:
+        runtime_options = _runtime_send_options(options)
+        timeout = float(runtime_options.pop("timeout", self.timeout))
+        return self.runtime.send(
+            prompt,
+            timeout=timeout,
+            conversation_mode="temporary",
+            **runtime_options,
+        )
 
     def send_to_conversation(
         self,
@@ -108,6 +124,12 @@ class _ProductRuntimeClient:
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
         return self.runtime.stop_generation(url_or_id, **options)
+
+    def end_temporary_chat(self) -> bool:
+        return bool(self.runtime.end_temporary_chat())
+
+    def temporary_lifecycle_snapshot(self) -> dict[str, Any]:
+        return dict(self.runtime.temporary_lifecycle_snapshot())
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         timeout = float(options.pop("timeout", self.timeout))
@@ -158,6 +180,9 @@ class GpttyClient:
     def send(self, prompt: str, **options: Any) -> Any:
         return self._client.send(prompt, **self._prepare_send_options(options))
 
+    def send_temporary(self, prompt: str, **options: Any) -> Any:
+        return self._client.send_temporary(prompt, **self._prepare_send_options(options))
+
     def send_to_conversation(
         self,
         url_or_id: Any,
@@ -206,6 +231,12 @@ class GpttyClient:
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
         return self._client.stop_generation(url_or_id, **options)
+
+    def end_temporary_chat(self) -> bool:
+        return bool(self._client.end_temporary_chat())
+
+    def temporary_lifecycle_snapshot(self) -> dict[str, Any]:
+        return dict(self._client.temporary_lifecycle_snapshot())
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.wait_until_completed(url_or_id, **options)

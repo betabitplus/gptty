@@ -50,6 +50,13 @@ class FakeGpttyClient:
             on_token("continued")
         return Response(text="continued", conversation_id=conversation_ref)
 
+    def send_temporary(self, prompt: str, **options: Any) -> Response:
+        self.calls.append(("send_temporary", (prompt,), options))
+        on_token = options.get("on_token")
+        if on_token is not None:
+            on_token("temporary reply")
+        return Response(text="temporary reply", conversation_id="temp-1", title="Temporary Chat")
+
 
 def make_args(tmp_path, **overrides: Any) -> Namespace:
     values = {
@@ -130,6 +137,41 @@ def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
     assert client.calls[0][0] == "send_to_conversation"
     assert client.calls[0][1] == ("conv-1", "continue")
     assert client.calls[0][2]["stream"] is True
+
+
+def test_temporary_turn_uses_session_scoped_send_and_never_persists_temp_id(tmp_path) -> None:
+    client = FakeGpttyClient()
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(state_path, ChatState())
+    recorded: list[dict[str, object]] = []
+
+    code = _send_chat_prompt(
+        client,
+        state=ChatState(),
+        state_path=state_path,
+        profile=None,
+        prompt="ephemeral",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        conversation_mode="temporary",
+        attached_ref=None,
+        temporary_turn_recorder=lambda **kwargs: recorded.append(kwargs),
+    )
+
+    assert code == 0
+    assert client.calls == [("send_temporary", ("ephemeral",), {"stream": False})]
+    assert load_chat_state(state_path).current_conversation is None
+    assert recorded == [
+        {
+            "prompt": "ephemeral",
+            "answer": "temporary reply",
+            "conversation_ref": "temp-1",
+            "title": "Temporary Chat",
+        }
+    ]
 
 
 def test_new_command_clears_conversation_without_sdk_init(tmp_path) -> None:

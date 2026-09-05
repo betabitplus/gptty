@@ -203,6 +203,8 @@ def run_chat(
             continue
 
         media = interactive_commands.pending_media if interactive_commands is not None else None
+        conversation_mode = interactive_commands.conversation_mode if interactive_commands is not None else "normal"
+        attached_ref = interactive_commands.conversation_ref if interactive_commands is not None else state.current_conversation
         turn_client = get_client()
         with turn_control_signals(enabled=renderer is not None) as turn_controls:
             if renderer is not None:
@@ -222,6 +224,13 @@ def run_chat(
                 stderr=stderr,
                 renderer=renderer,
                 turn_controls=turn_controls,
+                conversation_mode=conversation_mode,
+                attached_ref=attached_ref,
+                temporary_turn_recorder=(
+                    interactive_commands.record_temporary_turn
+                    if interactive_commands is not None and conversation_mode == "temporary"
+                    else None
+                ),
             )
         if code == LOCAL_QUIT_CODE:
             if interactive_commands is not None:
@@ -278,6 +287,9 @@ def _send_chat_prompt(
     stderr: TextIO,
     renderer: PrettyRenderer | None = None,
     turn_controls: TurnControlSignals | None = None,
+    conversation_mode: str = "normal",
+    attached_ref: str | None = None,
+    temporary_turn_recorder: Callable[..., None] | None = None,
 ) -> int:
     saw_stream_token = False
     stream_tokens: list[str] = []
@@ -287,12 +299,16 @@ def _send_chat_prompt(
     local_quit_requested = False
     write_committed = threading.Event()
     controls = turn_controls or TurnControlSignals()
-    if state.current_conversation:
+    if conversation_mode not in {"normal", "temporary"}:
+        raise ValueError(f"unsupported conversation mode: {conversation_mode}")
+    is_temporary = conversation_mode == "temporary"
+    active_ref = attached_ref if is_temporary else state.current_conversation
+    if active_ref and not is_temporary:
         recorder = start_run(
             profile=profile,
             state_path=state_path,
             command="chat",
-            conversation_ref=state.current_conversation,
+            conversation_ref=active_ref,
         )
         recorder.event("prompt_sent")
 
@@ -355,9 +371,11 @@ def _send_chat_prompt(
     try:
         if recorder is not None:
             recorder.event("waiting_for_reply")
-        send_conversation_ref = state.current_conversation
+        send_conversation_ref = active_ref
 
         def perform_send() -> Any:
+            if is_temporary:
+                return client.send_temporary(prompt, **options)
             if send_conversation_ref:
                 return client.send_to_conversation(send_conversation_ref, prompt, **options)
             return client.send(prompt, **options)
@@ -400,7 +418,7 @@ def _send_chat_prompt(
                     continue
                 renderer.info("Stopping ChatGPT…")
                 try:
-                    stop_result = client.stop_generation(state.current_conversation, timeout=30.0)
+                    stop_result = client.stop_generation(active_ref, timeout=30.0)
                 except Exception as exc:  # noqa: BLE001 - interactive stop is best-effort at this boundary.
                     renderer.warning(f"Stop failed: {exc}")
                     continue
@@ -421,16 +439,17 @@ def _send_chat_prompt(
                     else getattr(stop_result, "conversation_id", None)
                 )
                 if (
-                    not state.current_conversation
-                    and isinstance(stop_ref, str)
+                    isinstance(stop_ref, str)
                     and stop_ref.strip()
                     and not stop_ref.strip().startswith("WEB:")
                 ):
-                    state.current_conversation = stop_ref.strip()
-                    try:
-                        save_chat_state(state_path, state)
-                    except StateError as exc:
-                        renderer.warning(str(exc))
+                    active_ref = stop_ref.strip()
+                    if not is_temporary and not state.current_conversation:
+                        state.current_conversation = active_ref
+                        try:
+                            save_chat_state(state_path, state)
+                        except StateError as exc:
+                            renderer.warning(str(exc))
                 renderer.turn_abort()
                 renderer.info("Stop requested; waiting for ChatGPT to save the partial response…")
 
@@ -443,7 +462,12 @@ def _send_chat_prompt(
             response: Any = None
             error = outcome.get("error")
             if error is not None and stopped_by_user:
-                if state.current_conversation:
+                if is_temporary:
+                    response = {
+                        "text": "".join(stream_tokens),
+                        "conversation_id": active_ref,
+                    }
+                elif state.current_conversation:
                     try:
                         snapshot = client.conversation_snapshot(state.current_conversation)
                         response = _stopped_snapshot_response(
@@ -480,8 +504,9 @@ def _send_chat_prompt(
                 response = None
 
         text = response_text(response)
+        rendered_text = text or "".join(stream_tokens)
         if renderer is not None:
-            renderer.answer(text or "".join(stream_tokens))
+            renderer.answer(rendered_text)
             if stopped_by_user:
                 renderer.info("Stopped by user.")
         elif stream:
@@ -496,8 +521,16 @@ def _send_chat_prompt(
                 recorder.event("token_delta", text=text)
             print(text, file=stdout)
 
-        conversation_ref = extract_conversation_ref(response)
-        if conversation_ref and conversation_ref != state.current_conversation:
+        conversation_ref = extract_conversation_ref(response) or active_ref
+        if is_temporary:
+            if temporary_turn_recorder is not None:
+                temporary_turn_recorder(
+                    prompt=prompt,
+                    answer=rendered_text,
+                    conversation_ref=conversation_ref,
+                    title=response_title(response),
+                )
+        elif conversation_ref and conversation_ref != state.current_conversation:
             state.current_conversation = conversation_ref
             try:
                 save_chat_state(state_path, state)
@@ -507,7 +540,7 @@ def _send_chat_prompt(
                 print(f"gptty: {exc}", file=stderr)
                 return 1
 
-        if renderer is not None and state.current_conversation:
+        if renderer is not None and not is_temporary and state.current_conversation:
             renderer.chat_link(state.current_conversation)
 
         if recorder is not None:

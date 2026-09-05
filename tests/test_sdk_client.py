@@ -59,6 +59,18 @@ class FakeSdkClient:
         self.calls.append(("stop_generation", (url_or_id,), options))
         return {"ok": True, "stopped": True, "conversationId": url_or_id}
 
+    def send_temporary(self, prompt: str, **options: object) -> str:
+        self.calls.append(("send_temporary", (prompt,), options))
+        return "temporary-result"
+
+    def end_temporary_chat(self) -> bool:
+        self.calls.append(("end_temporary_chat", (), {}))
+        return True
+
+    def temporary_lifecycle_snapshot(self) -> dict[str, object]:
+        self.calls.append(("temporary_lifecycle_snapshot", (), {}))
+        return {"state": "LIVE", "conversation_id": "temp-1"}
+
 
 class FrontierFakeSdkClient(FakeSdkClient):
     def list_models(self):
@@ -117,6 +129,14 @@ class FakeProductRuntime:
         self.calls.append(("stop_generation", (url_or_id,), options))
         return {"ok": True, "stopped": True, "conversationId": url_or_id}
 
+    def end_temporary_chat(self) -> bool:
+        self.calls.append(("end_temporary_chat", (), {}))
+        return True
+
+    def temporary_lifecycle_snapshot(self) -> dict[str, object]:
+        self.calls.append(("temporary_lifecycle_snapshot", (), {}))
+        return {"state": "LIVE", "conversation_id": "temp-runtime"}
+
 
 def test_gptty_client_keeps_auth_and_timeout() -> None:
     sdk = FakeSdkClient()
@@ -155,6 +175,15 @@ def test_send_defaults_to_latest_frontier_high_profile() -> None:
     assert client.send("hello") == "send-result"
 
     assert sdk.calls == [("send", ("hello",), {"model_profile": "DEEP"})]
+
+
+def test_temporary_send_uses_same_model_policy_without_public_conversation_id() -> None:
+    sdk = FakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    assert client.send_temporary("hello") == "temporary-result"
+
+    assert sdk.calls == [("send_temporary", ("hello",), {"model_profile": "DEEP"})]
 
 
 def test_media_defaults_to_latest_normal_thinking_frontier_and_caches_catalog() -> None:
@@ -209,6 +238,8 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
     assert client.list_models() == "models-result"
     assert client.conversation_snapshot("abc", limit=10) == "snapshot-result"
     assert client.stop_generation("abc", timeout=3)["stopped"] is True
+    assert client.temporary_lifecycle_snapshot()["state"] == "LIVE"
+    assert client.end_temporary_chat() is True
     assert client.wait_until_completed("abc", timeout=30) == "wait-result"
 
     assert sdk.calls == [
@@ -220,6 +251,8 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
         ("list_models", (), {}),
         ("conversation_snapshot", ("abc",), {"limit": 10}),
         ("stop_generation", ("abc",), {"timeout": 3}),
+        ("temporary_lifecycle_snapshot", (), {}),
+        ("end_temporary_chat", (), {}),
         ("wait_until_completed", ("abc",), {"timeout": 30}),
     ]
 
@@ -236,8 +269,9 @@ def test_product_runtime_client_maps_cli_send_surface() -> None:
 
     assert client.send("hello", model="high", media=["image.png"], on_token="token-cb") == "runtime-send-result"
     assert client.send_to_conversation("c1", "continue", model="instant") == "runtime-send-result"
+    assert client.send_temporary("ephemeral") == "runtime-send-result"
 
-    assert runtime.calls[:2] == [
+    assert runtime.calls[:3] == [
         (
             "send",
             ("hello",),
@@ -255,6 +289,14 @@ def test_product_runtime_client_maps_cli_send_surface() -> None:
                 "conversation": "c1",
                 "timeout": 17.0,
                 "model": "instant",
+            },
+        ),
+        (
+            "send",
+            ("ephemeral",),
+            {
+                "timeout": 17.0,
+                "conversation_mode": "temporary",
             },
         ),
     ]

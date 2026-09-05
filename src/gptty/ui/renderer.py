@@ -52,6 +52,7 @@ class PrettyRenderer:
         profile: str | None = None,
         conversation: str | None = None,
         model: str | None = None,
+        temporary: bool = False,
     ) -> None:
         self.console.print(Rule("ChatGPT", style="dim"))
         details: list[str] = []
@@ -59,6 +60,8 @@ class PrettyRenderer:
             details.append(f"profile: {profile}")
         if model:
             details.append(f"model: {model}")
+        if temporary:
+            details.append("temporary chat")
         if details:
             self.console.print(" · ".join(details), style="dim")
         if conversation:
