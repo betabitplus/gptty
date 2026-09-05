@@ -9,8 +9,10 @@ from gptty.ui.commands import InteractiveCommands
 class FakeUI:
     def __init__(self, *, choices=None) -> None:
         self.choices = list(choices or [])
+        self.seen: list[tuple[str, list[tuple[object, str]]]] = []
 
     def choose_searchable(self, message, options, *, default=None):
+        self.seen.append((message, list(options)))
         return self.choices.pop(0) if self.choices else default
 
 
@@ -70,6 +72,8 @@ class FakeClient:
             {"slug": "gpt-real-a", "title": "Real A"},
             {"slug": "gpt-real-b", "title": "Real B"},
             {"slug": "disabled", "title": "Disabled", "is_disabled": True},
+            {"slug": "work-mode", "title": "Work Mode", "is_work_mode_model": True},
+            {"slug": "research", "title": "Deep Research"},
         ]
 
 
@@ -157,6 +161,22 @@ def test_model_uses_live_catalog_slug(tmp_path) -> None:
     assert state.model == "gpt-real-b"
     assert load_chat_state(state_path).model == "gpt-real-b"
     assert renderer.events[-1] == ("info", "Model: gpt-real-b")
+
+
+def test_model_picker_excludes_non_chat_modes(tmp_path) -> None:
+    ui = FakeUI(choices=[None])
+    commands, _, client, _ = make_commands(tmp_path, ui=ui)
+
+    commands.handle("/model")
+
+    assert client.calls == [("list_models", None)]
+    _message, options = ui.seen[-1]
+    values = [value for value, _label in options]
+    assert "gpt-real-a" in values
+    assert "gpt-real-b" in values
+    assert "disabled" not in values
+    assert "work-mode" not in values
+    assert "research" not in values
 
 
 def test_model_picker_can_reset_to_default(tmp_path) -> None:

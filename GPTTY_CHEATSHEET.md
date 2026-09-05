@@ -14,7 +14,7 @@ Ctrl-R       поиск по истории prompts
 Alt-Enter    новая строка внутри prompt
 ```
 
-Основные действия доступны из `/`-меню: `new`, `resume`, `detach`, `model`, `exit`. `/resume` читает реальный список ChatGPT-чатов через CWA, даёт fuzzy-поиск, показывает полную user-visible текущую ветку истории и после выбора продолжает именно этот conversation. `/resume URL_OR_ID` подключает чат напрямую без списка. `/detach` только локально снимает привязку и ничего не меняет в ChatGPT. `/model` показывает реальный текущий model catalog ChatGPT и сохраняет выбранный product slug без собственных алиасов gptty.
+Основные действия доступны из `/`-меню: `new`, `resume`, `detach`, `model`, `exit`. `/resume` читает реальный список ChatGPT-чатов через CWA, даёт fuzzy-поиск, показывает полную user-visible текущую ветку истории и после выбора продолжает именно этот conversation. `/resume URL_OR_ID` подключает чат напрямую без списка. `/detach` только локально снимает привязку и ничего не меняет в ChatGPT. `/model` показывает реальный текущий normal-chat model catalog ChatGPT и сохраняет выбранный product slug без собственных алиасов gptty; Work-mode backend entries и Deep Research mode в обычный model picker не попадают.
 
 Отключить enhanced UI и вернуть простой line-oriented режим:
 

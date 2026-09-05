@@ -287,7 +287,11 @@ def _model_slug(model: Any) -> str | None:
 def _model_available(model: Any) -> bool:
     if _field(model, "enabled") is False:
         return False
-    return _field(model, "is_disabled") is not True
+    if _field(model, "is_disabled") is True:
+        return False
+    if _field(model, "is_work_mode_model") is True:
+        return False
+    return _model_slug(model) != "research"
 
 
 def _model_label(model: Any, *, current: bool = False) -> str:

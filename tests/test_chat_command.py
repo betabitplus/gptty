@@ -81,6 +81,27 @@ def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "conv-1"
 
 
+def test_first_prompt_persists_nested_cwa_conversation_shape(tmp_path) -> None:
+    class NestedConversationClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any):
+            self.calls.append(("send", (prompt,), options))
+            return SimpleNamespace(
+                text="reply",
+                conversation=SimpleNamespace(conversation_id="nested-conv"),
+            )
+
+    NestedConversationClient.instances.clear()
+    code = run_chat(
+        make_args(tmp_path, no_stream=True),
+        input_stream=StringIO("hello\n/exit\n"),
+        client_factory=NestedConversationClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "nested-conv"
+
+
 def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
     save_chat_state(tmp_path / "gptty_state.json", ChatState(current_conversation="conv-1"))

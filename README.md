@@ -215,20 +215,25 @@ gptty export https://chatgpt.com/c/... --last 20 --output conversation.md
 
 `gptty export` defaults to Markdown output. When `--output` points to an existing file, add `--overwrite` to replace it.
 
-Minimal SDK-backed interactive chat:
+Interactive chat:
 
 ```bash
 gptty chat
 ```
 
-The SDK-backed chat loop currently supports:
+In a TTY, press `/` and Enter to open the lightweight action menu. It contains only:
 
 ```text
-/help
 /new
+/resume
+/detach
+/model
 /exit
-/quit
 ```
+
+`/resume` opens the real ChatGPT conversation catalog, supports fuzzy filtering, renders the selected conversation's user-visible history, and continues that same conversation. `/resume <URL-or-ID>` skips the picker. `/model` opens the live normal-chat model catalog returned by ChatGPT; gptty does not invent model aliases. `/detach` only clears the local attachment and does not modify the ChatGPT chat.
+
+Use `Ctrl-R` for prompt history and `Alt-Enter` for a newline. `gptty chat --plain` keeps the older line-oriented fallback without the enhanced action menu.
 
 Run the full legacy interactive runtime:
 
