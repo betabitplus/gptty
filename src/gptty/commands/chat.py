@@ -19,6 +19,7 @@ from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
 from ..ui.commands import InteractiveCommands
+from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
 from ..ui.state import history_path, ui_settings_path
@@ -244,6 +245,7 @@ def _send_chat_prompt(
     saw_stream_token = False
     stream_tokens: list[str] = []
     recorder: RunRecorder | None = None
+    completed_successfully = False
     if state.current_conversation:
         recorder = start_run(
             profile=profile,
@@ -293,6 +295,8 @@ def _send_chat_prompt(
         except ConversationLockError as exc:
             if recorder is not None:
                 recorder.fail("conversation lock could not be acquired")
+            if renderer is not None:
+                renderer.turn_abort()
             if explicit_lock_wait:
                 render_lock_timeout(exc, stderr=stderr)
             else:
@@ -311,6 +315,8 @@ def _send_chat_prompt(
         except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
             if recorder is not None:
                 recorder.fail(str(exc))
+            if renderer is not None:
+                renderer.turn_abort()
             print(f"gptty: chat request failed: {exc}", file=stderr)
             return 1
 
@@ -340,12 +346,20 @@ def _send_chat_prompt(
                 print(f"gptty: {exc}", file=stderr)
                 return 1
 
+        if renderer is not None and state.current_conversation:
+            renderer.chat_link(state.current_conversation)
+
         if recorder is not None:
             recorder.complete()
+        completed_successfully = True
         return 0
     finally:
         if lock is not None:
             lock.release()
+        if renderer is not None:
+            renderer.turn_abort()
+            if completed_successfully:
+                notify_response_complete()
 
 
 def _lock_timeout(args: Any) -> float:

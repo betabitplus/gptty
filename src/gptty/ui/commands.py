@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from ..output import normalize_messages
 from ..state import ChatState, StateError, save_chat_state
+from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
 from .session import InteractiveSession
 
@@ -64,6 +65,7 @@ class InteractiveCommands:
             self.state.current_conversation = previous
             return
         self.renderer.clear_context()
+        self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Started a new conversation.")
 
     def _cmd_detach(self, argv: list[str]) -> None:
@@ -76,6 +78,7 @@ class InteractiveCommands:
             self.state.current_conversation = previous
             return
         self.renderer.clear_context()
+        self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Detached locally. The ChatGPT conversation was not changed.")
 
     def _cmd_resume(self, argv: list[str]) -> None:
@@ -98,6 +101,10 @@ class InteractiveCommands:
             return
 
         self.renderer.clear_context()
+        self.renderer.header(
+            conversation=attached_ref,
+            model=self.state.model or "latest frontier · High",
+        )
         self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
@@ -199,6 +206,7 @@ class InteractiveCommands:
         seen = {_message_identity(message): _message_text(message) for message in messages}
         deadline = time.monotonic() + FOLLOW_TIMEOUT_SECONDS
         self.renderer.info("Following active response… Ctrl-C stops following but stays attached.")
+        self.renderer.start_elapsed(initial_elapsed=_active_elapsed_seconds(messages))
         try:
             while time.monotonic() < deadline:
                 time.sleep(FOLLOW_INTERVAL_SECONDS)
@@ -217,16 +225,23 @@ class InteractiveCommands:
 
                 status = _snapshot_status(snapshot)
                 if status == "completed":
+                    self.renderer.finish_elapsed()
+                    self.renderer.chat_link(ref)
+                    notify_response_complete()
                     return
                 if status == "awaiting_tool_approval":
+                    self.renderer.turn_abort()
                     self.renderer.warning("Conversation is waiting for tool approval.")
                     return
                 if status not in ACTIVE_STATUSES:
+                    self.renderer.turn_abort()
                     self.renderer.info(f"Follow stopped: status={status or 'unknown'}")
                     return
         except KeyboardInterrupt:
+            self.renderer.turn_abort()
             self.renderer.info("Stopped following; conversation remains attached.")
             return
+        self.renderer.turn_abort()
         self.renderer.info("Stopped following after 2 hours; conversation remains attached.")
 
     def _save_state(self) -> bool:
@@ -357,6 +372,16 @@ def _message_text(message: Any) -> str:
         if value is not None:
             return str(value)
     return ""
+
+
+def _active_elapsed_seconds(messages: list[Any]) -> float:
+    for message in reversed(messages):
+        if _field_text(message, "role") != "user":
+            continue
+        created = _field(message, "create_time")
+        if isinstance(created, (int, float)) and not isinstance(created, bool):
+            return max(0.0, time.time() - float(created))
+    return 0.0
 
 
 def _field(value: Any, name: str) -> Any:

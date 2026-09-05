@@ -23,6 +23,21 @@ class FakeRenderer:
     def clear_context(self):
         self.events.append(("clear_context", None))
 
+    def header(self, **kwargs):
+        self.events.append(("header", kwargs))
+
+    def start_elapsed(self, *, initial_elapsed=0.0):
+        self.events.append(("start_elapsed", initial_elapsed))
+
+    def finish_elapsed(self):
+        self.events.append(("finish_elapsed", None))
+
+    def chat_link(self, ref):
+        self.events.append(("chat_link", ref))
+
+    def turn_abort(self):
+        self.events.append(("turn_abort", None))
+
     def info(self, text):
         self.events.append(("info", text))
 
@@ -239,12 +254,18 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
     client = FakeClient(snapshots=[running, completed])
     commands, renderer, _, _ = make_commands(tmp_path, client=client)
     monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
+    notified: list[bool] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda: notified.append(True))
 
     commands.handle("/resume conv-1")
 
     message_events = [event for event in renderer.events if event[0] == "messages"]
     assert len(message_events) == 2
     assert message_events[-1][1][0].text == "finished"
+    assert any(event[0] == "start_elapsed" for event in renderer.events)
+    assert ("finish_elapsed", None) in renderer.events
+    assert ("chat_link", "conv-1") in renderer.events
+    assert notified == [True]
     assert [call[0] for call in client.calls].count("snapshot") == 2
 
 
