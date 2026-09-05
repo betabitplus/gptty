@@ -10,9 +10,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..commands.export import save_markdown_export
+from ..goal import (
+    MAX_PROTOCOL_FAILURES,
+    GoalSignal,
+    activation_prompt,
+    continuation_prompt,
+    parse_goal_response,
+    steering_prompt,
+)
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
-from ..state import ChatState, StateError, save_chat_state
+from ..state import ChatState, GoalState, StateError, save_chat_state
 from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
@@ -53,6 +61,7 @@ class InteractiveCommands:
         self._temporary_conversation: str | None = None
         self._temporary_messages: list[OutputMessage] = []
         self._temporary_title: str | None = None
+        self._automatic_prompts: list[str] = []
 
     def handle(self, raw: str) -> int | None:
         try:
@@ -86,6 +95,102 @@ class InteractiveCommands:
     @property
     def pending_media_count(self) -> int:
         return len(self._pending_media)
+
+    @property
+    def goal_active(self) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active" or self._conversation_mode != "normal":
+            return False
+        if goal.conversation_ref is None:
+            return self.state.current_conversation is None
+        return goal.conversation_ref == self.state.current_conversation
+
+    @property
+    def has_automatic_prompt(self) -> bool:
+        return bool(self._automatic_prompts)
+
+    def pop_automatic_prompt(self) -> str | None:
+        if not self._automatic_prompts:
+            return None
+        return self._automatic_prompts.pop(0)
+
+    def prepare_goal_user_prompt(self, prompt: str) -> str:
+        if not self.goal_active:
+            return prompt
+        return steering_prompt(prompt)
+
+    def handle_goal_turn_result(self, result: dict[str, Any]) -> None:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return
+
+        conversation_ref = str(result.get("conversation_ref") or "").strip() or None
+        if goal.conversation_ref is None and conversation_ref:
+            goal.conversation_ref = conversation_ref
+        if goal.conversation_ref and conversation_ref and goal.conversation_ref != conversation_ref:
+            self._interrupt_goal("conversation changed during goal turn", notify=True)
+            return
+
+        goal.turn_count += 1
+        if bool(result.get("stopped_by_user")):
+            goal.status = "paused"
+            goal.reason = "stopped by user"
+            self._automatic_prompts.clear()
+            self._save_state()
+            self.renderer.info("Goal · paused · stopped by user")
+            return
+
+        parsed = parse_goal_response(str(result.get("text") or ""))
+        if parsed.signal is GoalSignal.COMPLETE:
+            goal.status = "complete"
+            goal.protocol_failures = 0
+            goal.reason = None
+            self._automatic_prompts.clear()
+            self._save_state()
+            self.renderer.info(f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}")
+            notify_response_complete(
+                chat_title=str(result.get("title") or "").strip() or None,
+                final_response=parsed.body or "Goal complete.",
+            )
+            return
+
+        if parsed.signal is GoalSignal.BLOCKED:
+            goal.status = "blocked"
+            goal.protocol_failures = 0
+            goal.reason = parsed.body or "agent reported a blocker"
+            self._automatic_prompts.clear()
+            self._save_state()
+            self.renderer.warning("Goal · blocked · user action required")
+            notify_response_complete(
+                chat_title=str(result.get("title") or "").strip() or None,
+                final_response=f"Goal blocked. {parsed.body}".strip(),
+            )
+            return
+
+        protocol_recovery = parsed.signal is None
+        if protocol_recovery:
+            goal.protocol_failures += 1
+            if goal.protocol_failures >= MAX_PROTOCOL_FAILURES:
+                self._interrupt_goal(
+                    f"missing valid GPTTY_GOAL status for {goal.protocol_failures} consecutive turns",
+                    notify=True,
+                    chat_title=str(result.get("title") or "").strip() or None,
+                )
+                return
+        else:
+            goal.protocol_failures = 0
+
+        goal.reason = None
+        if not self._save_state():
+            self._interrupt_goal("failed to persist goal progress", notify=False)
+            return
+        self._queue_goal_continuation(protocol_recovery=protocol_recovery)
+
+    def handle_goal_interruption(self, reason: str, *, chat_title: str | None = None) -> None:
+        self._interrupt_goal(reason, notify=True, chat_title=chat_title)
+
+    def pause_goal_for_local_quit(self) -> None:
+        self._pause_active_goal("local gptty exited while ChatGPT continued")
 
     def record_temporary_turn(
         self,
@@ -135,12 +240,80 @@ class InteractiveCommands:
         self._conversation_mode = "normal"
         self._reset_temporary_context()
 
+    def _cmd_goal(self, argv: list[str]) -> None:
+        if self._conversation_mode == "temporary":
+            self.renderer.warning("Goal mode is only available for normal ChatGPT conversations.")
+            return
+
+        action = argv[0].strip().lower() if argv else ""
+        if action in {"pause", "resume", "clear", "status"} and len(argv) == 1:
+            if action == "pause":
+                if self._pause_active_goal("paused by user"):
+                    self.renderer.info("Goal · paused")
+                elif self.state.goal is None:
+                    self.renderer.info("No goal is configured.")
+                else:
+                    self.renderer.info(f"Goal · {self.state.goal.status}")
+                return
+            if action == "resume":
+                self._resume_goal()
+                return
+            if action == "clear":
+                if self.state.goal is None:
+                    self.renderer.info("No goal is configured.")
+                    return
+                previous_goal = self.state.goal
+                self.state.goal = None
+                self._automatic_prompts.clear()
+                if self._save_state():
+                    self.renderer.info("Goal · cleared")
+                else:
+                    self.state.goal = previous_goal
+                return
+            self._render_goal_status()
+            return
+
+        objective = " ".join(argv).strip() or None
+        existing = self.state.goal
+        if (
+            objective is None
+            and self.state.current_conversation is None
+            and (existing is None or existing.status == "complete")
+        ):
+            self.renderer.warning(
+                "No conversation is attached. Use /goal <objective> to start a goal in a new chat."
+            )
+            return
+        if existing is not None and existing.status not in {"complete"}:
+            if objective:
+                self.renderer.warning("An unfinished goal already exists. Use /goal clear before replacing it.")
+                return
+            if existing.status in {"paused", "blocked", "interrupted"}:
+                self._resume_goal()
+                return
+            self._render_goal_status()
+            return
+
+        self.state.goal = GoalState(
+            conversation_ref=self.state.current_conversation,
+            status="active",
+            objective=objective,
+        )
+        if not self._save_state():
+            self.state.goal = existing
+            return
+        self._automatic_prompts.clear()
+        self._automatic_prompts.append(activation_prompt(objective))
+        self.renderer.info("Goal · active · starting")
+
     def _cmd_exit(self, argv: list[str]) -> int:
+        self._pause_active_goal("gptty exited")
         self._leave_temporary_mode()
         self.close()
         return 0
 
     def _cmd_new(self, argv: list[str]) -> None:
+        self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         previous = self.state.current_conversation
         self.state.current_conversation = None
@@ -156,6 +329,7 @@ class InteractiveCommands:
         if argv:
             self.renderer.warning("/temporary takes no arguments.")
             return
+        self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         previous = self.state.current_conversation
         self.state.current_conversation = None
@@ -173,6 +347,7 @@ class InteractiveCommands:
         self._cmd_temporary(argv)
 
     def _cmd_detach(self, argv: list[str]) -> None:
+        self._pause_active_goal("conversation detached")
         if self._conversation_mode == "temporary":
             self._leave_temporary_mode()
             self.clear_pending_media()
@@ -290,6 +465,8 @@ class InteractiveCommands:
             return
 
         attached_ref = _canonical_conversation_ref(str(ref))
+        if self.state.current_conversation and attached_ref != self.state.current_conversation:
+            self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         try:
             snapshot = client.conversation_snapshot(attached_ref)
@@ -488,6 +665,92 @@ class InteractiveCommands:
         self.renderer.turn_abort()
         self.renderer.info("Stopped following after 2 hours; conversation remains attached.")
         return False
+
+    def _resume_goal(self) -> None:
+        goal = self.state.goal
+        if goal is None:
+            self.renderer.info("No goal is configured.")
+            return
+        if goal.status == "complete":
+            self.renderer.info("Goal · complete")
+            return
+        if goal.status == "active":
+            self._render_goal_status()
+            return
+        if goal.conversation_ref and goal.conversation_ref != self.state.current_conversation:
+            self.renderer.warning(
+                f"Goal belongs to {_short_ref(goal.conversation_ref)}. Resume that conversation before /goal resume."
+            )
+            return
+        bootstrap_without_chat = goal.conversation_ref is None and self.state.current_conversation is None
+        if goal.conversation_ref is None and self.state.current_conversation:
+            goal.conversation_ref = self.state.current_conversation
+        goal.status = "active"
+        goal.reason = None
+        if not self._save_state():
+            return
+        self._automatic_prompts.clear()
+        self._automatic_prompts.append(
+            activation_prompt(goal.objective) if bootstrap_without_chat else continuation_prompt()
+        )
+        self.renderer.info(f"Goal · active · resuming after {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}")
+
+    def _render_goal_status(self) -> None:
+        goal = self.state.goal
+        if goal is None:
+            self.renderer.info("No goal is configured.")
+            return
+        details = [f"Goal · {goal.status}", f"turns {goal.turn_count}"]
+        if goal.conversation_ref:
+            details.append(_short_ref(goal.conversation_ref))
+        if goal.protocol_failures:
+            details.append(f"protocol misses {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}")
+        self.renderer.info(" · ".join(details))
+        if goal.reason:
+            self.renderer.info(f"Goal reason: {goal.reason}")
+
+    def _pause_active_goal(self, reason: str) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        goal.status = "paused"
+        goal.reason = reason
+        self._automatic_prompts.clear()
+        self._save_state()
+        return True
+
+    def _interrupt_goal(
+        self,
+        reason: str,
+        *,
+        notify: bool,
+        chat_title: str | None = None,
+    ) -> None:
+        goal = self.state.goal
+        if goal is None:
+            return
+        goal.status = "interrupted"
+        goal.reason = reason
+        self._automatic_prompts.clear()
+        self._save_state()
+        self.renderer.warning(f"Goal · interrupted · {reason}")
+        if notify:
+            notify_response_complete(
+                chat_title=chat_title,
+                final_response=f"Goal interrupted. {reason}",
+            )
+
+    def _queue_goal_continuation(self, *, protocol_recovery: bool) -> None:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return
+        self._automatic_prompts.append(continuation_prompt(protocol_recovery=protocol_recovery))
+        if protocol_recovery:
+            self.renderer.warning(
+                f"Goal · continuing · missing status {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}"
+            )
+        else:
+            self.renderer.info(f"Goal · continuing · next turn {goal.turn_count + 1}")
 
     def _save_state(self) -> bool:
         try:

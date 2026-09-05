@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from gptty.state import ChatState, StateError, load_chat_state
+from gptty.state import ChatState, GoalState, StateError, load_chat_state
 from gptty.ui.commands import InteractiveCommands
 from gptty.ui.signals import TurnControlSignals
 
@@ -532,3 +532,250 @@ def test_state_save_failure_rolls_back_interactive_change(tmp_path, monkeypatch)
 
     assert state.current_conversation == "conv-1"
     assert renderer.events[-1] == ("warning", "disk failed")
+
+
+def test_goal_command_starts_on_attached_conversation_and_queues_activation(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/goal")
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.conversation_ref == "conv-1"
+    assert load_chat_state(state_path).goal == state.goal
+    prompt = commands.pop_automatic_prompt()
+    assert prompt is not None
+    assert "GPTTY Goal mode is now active" in prompt
+    assert ("info", "Goal · active · starting") in renderer.events
+
+
+def test_goal_command_can_start_new_chat_with_explicit_objective(tmp_path) -> None:
+    commands, _, _, _ = make_commands(tmp_path)
+
+    commands.handle('/goal "Finish the exact agreed task"')
+
+    assert commands.goal_active is True
+    assert commands.state.goal is not None
+    assert commands.state.goal.conversation_ref is None
+    assert commands.state.goal.objective == "Finish the exact agreed task"
+    assert "Finish the exact agreed task" in (commands.pop_automatic_prompt() or "")
+
+
+def test_goal_command_requires_objective_when_no_chat_context_exists(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(tmp_path)
+
+    commands.handle("/goal")
+
+    assert commands.state.goal is None
+    assert renderer.events[-1] == (
+        "warning",
+        "No conversation is attached. Use /goal <objective> to start a goal in a new chat.",
+    )
+
+
+def test_goal_continue_queues_next_turn_without_notification(tmp_path, monkeypatch) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "GPTTY_GOAL: CONTINUE\nImplemented half; tests remain.",
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.turn_count == 1
+    assert state.goal.protocol_failures == 0
+    assert commands.has_automatic_prompt is True
+    assert "Continue pursuing the active goal" in (commands.pop_automatic_prompt() or "")
+    assert notified == []
+    assert ("info", "Goal · continuing · next turn 2") in renderer.events
+
+
+def test_goal_complete_stops_loop_and_sends_single_clean_notification(tmp_path, monkeypatch) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active", turn_count=2),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "GPTTY_GOAL: COMPLETE\nEverything is implemented and verified.",
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "complete"
+    assert state.goal.turn_count == 3
+    assert commands.has_automatic_prompt is False
+    assert notified == [
+        {"chat_title": "Goal chat", "final_response": "Everything is implemented and verified."}
+    ]
+    assert ("info", "Goal · complete · 3 turns") in renderer.events
+
+
+def test_goal_blocked_stops_loop_and_notifies_for_user_action(tmp_path, monkeypatch) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "GPTTY_GOAL: BLOCKED\nPlease log in to the provider account.",
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "blocked"
+    assert commands.has_automatic_prompt is False
+    assert notified == [
+        {"chat_title": "Goal chat", "final_response": "Goal blocked. Please log in to the provider account."}
+    ]
+    assert ("warning", "Goal · blocked · user action required") in renderer.events
+
+
+def test_goal_missing_status_recovers_twice_then_interrupts(tmp_path, monkeypatch) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+
+    for expected_failures in (1, 2):
+        commands.handle_goal_turn_result(
+            {
+                "text": "Turn ended without the protocol marker.",
+                "title": "Goal chat",
+                "conversation_ref": "conv-1",
+                "stopped_by_user": False,
+            }
+        )
+        assert state.goal is not None
+        assert state.goal.status == "active"
+        assert state.goal.protocol_failures == expected_failures
+        recovery = commands.pop_automatic_prompt() or ""
+        assert "previous turn ended without a valid GPTTY_GOAL status line" in recovery
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "Still no marker.",
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "interrupted"
+    assert state.goal.protocol_failures == 3
+    assert commands.has_automatic_prompt is False
+    assert notified == [
+        {
+            "chat_title": "Goal chat",
+            "final_response": "Goal interrupted. missing valid GPTTY_GOAL status for 3 consecutive turns",
+        }
+    ]
+
+
+def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "GPTTY_GOAL: CONTINUE\nPartial response",
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": True,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "paused"
+    assert state.goal.reason == "stopped by user"
+    assert commands.has_automatic_prompt is False
+    assert notified == []
+    assert ("info", "Goal · paused · stopped by user") in renderer.events
+
+
+def test_goal_pause_resume_clear_and_context_switch_are_safe(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, _, _, state_path = make_commands(tmp_path, state=state)
+    commands.handle("/goal important work")
+    assert commands.pop_automatic_prompt() is not None
+
+    commands.handle("/goal pause")
+    assert state.goal is not None and state.goal.status == "paused"
+    commands.handle("/goal resume")
+    assert state.goal is not None and state.goal.status == "active"
+    assert commands.pop_automatic_prompt() is not None
+
+    commands.handle("/new")
+    assert state.goal is not None and state.goal.status == "paused"
+    assert state.current_conversation is None
+    assert load_chat_state(state_path).goal is not None
+
+    commands.handle("/goal clear")
+    assert state.goal is None
+    assert load_chat_state(state_path).goal is None
+
+
+def test_goal_resume_refuses_to_continue_in_different_conversation(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-2",
+        goal=GoalState(conversation_ref="conv-1", status="paused", turn_count=4),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle("/goal resume")
+
+    assert state.goal is not None and state.goal.status == "paused"
+    assert commands.has_automatic_prompt is False
+    assert renderer.events[-1] == (
+        "warning",
+        "Goal belongs to conv-1. Resume that conversation before /goal resume.",
+    )
+
+
+def test_goal_is_rejected_in_temporary_chat(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(tmp_path)
+    commands.handle("/temporary")
+
+    commands.handle("/goal should not run here")
+
+    assert commands.state.goal is None
+    assert commands.has_automatic_prompt is False
+    assert renderer.events[-1] == (
+        "warning",
+        "Goal mode is only available for normal ChatGPT conversations.",
+    )

@@ -103,6 +103,17 @@ def run_chat(
         print(f"gptty: {exc}", file=stderr)
         return 1
 
+    startup_goal_paused = False
+    if state.goal is not None and state.goal.status == "active":
+        state.goal.status = "paused"
+        state.goal.reason = "gptty restarted while goal was active"
+        startup_goal_paused = True
+        try:
+            save_chat_state(state_path, state)
+        except StateError as exc:
+            print(f"gptty: {exc}", file=stderr)
+            return 1
+
     model = getattr(args, "model", None)
     if model and model != state.model:
         state.model = model
@@ -152,59 +163,72 @@ def run_chat(
             conversation=state.current_conversation,
             model=state.model or "latest frontier · High",
         )
+        if startup_goal_paused and state.goal is not None:
+            renderer.info("Goal · paused after restart · use /goal resume")
 
     while True:
-        if interactive and not enhanced:
-            print("> ", end="", file=stdout, flush=True)
+        automatic_prompt = interactive_commands.pop_automatic_prompt() if interactive_commands is not None else None
+        automatic_turn = automatic_prompt is not None
 
-        try:
-            if ui is not None:
-                attachment_count = interactive_commands.pending_media_count if interactive_commands is not None else 0
-                line = ui.read_prompt(attachment_count=attachment_count)
-            else:
-                line = input_stream.readline()
-        except KeyboardInterrupt:
-            if interactive_commands is not None:
-                interactive_commands.close()
-            print(file=stdout)
-            return 130
-        except EOFError:
-            if interactive_commands is not None:
-                interactive_commands.close()
-            print(file=stdout)
-            return 0
+        if automatic_turn:
+            prompt = automatic_prompt or ""
+        else:
+            if interactive and not enhanced:
+                print("> ", end="", file=stdout, flush=True)
 
-        if ui is None and line == "":
-            if interactive_commands is not None:
-                interactive_commands.close()
-            if interactive:
-                print(file=stdout)
-            return 0
-
-        prompt = line.strip()
-        if not prompt:
-            continue
-
-        if prompt == "/" and ui is not None:
-            selected = ui.choose_command()
-            if not selected:
-                continue
-            prompt = selected
-
-        if prompt.startswith("/"):
-            if interactive_commands is not None:
-                result = interactive_commands.handle(prompt)
-            else:
-                result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
-            if result is not None:
+            try:
+                if ui is not None:
+                    attachment_count = interactive_commands.pending_media_count if interactive_commands is not None else 0
+                    line = ui.read_prompt(attachment_count=attachment_count)
+                else:
+                    line = input_stream.readline()
+            except KeyboardInterrupt:
                 if interactive_commands is not None:
                     interactive_commands.close()
-                return result
-            continue
+                print(file=stdout)
+                return 130
+            except EOFError:
+                if interactive_commands is not None:
+                    interactive_commands.close()
+                print(file=stdout)
+                return 0
+
+            if ui is None and line == "":
+                if interactive_commands is not None:
+                    interactive_commands.close()
+                if interactive:
+                    print(file=stdout)
+                return 0
+
+            prompt = line.strip()
+            if not prompt:
+                continue
+
+            if prompt == "/" and ui is not None:
+                selected = ui.choose_command()
+                if not selected:
+                    continue
+                prompt = selected
+
+            if prompt.startswith("/"):
+                if interactive_commands is not None:
+                    result = interactive_commands.handle(prompt)
+                else:
+                    result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
+                if result is not None:
+                    if interactive_commands is not None:
+                        interactive_commands.close()
+                    return result
+                continue
+
+            if interactive_commands is not None:
+                prompt = interactive_commands.prepare_goal_user_prompt(prompt)
 
         media = interactive_commands.pending_media if interactive_commands is not None else None
         conversation_mode = interactive_commands.conversation_mode if interactive_commands is not None else "normal"
         attached_ref = interactive_commands.conversation_ref if interactive_commands is not None else state.current_conversation
+        goal_turn = bool(interactive_commands is not None and interactive_commands.goal_active)
+        turn_result: dict[str, Any] = {}
         turn_client = get_client()
         with turn_control_signals(enabled=renderer is not None) as turn_controls:
             if renderer is not None:
@@ -231,17 +255,25 @@ def run_chat(
                     if interactive_commands is not None and conversation_mode == "temporary"
                     else None
                 ),
+                notify_completion=not goal_turn,
+                result_out=turn_result,
             )
         if code == LOCAL_QUIT_CODE:
             if interactive_commands is not None:
+                if goal_turn:
+                    interactive_commands.pause_goal_for_local_quit()
                 interactive_commands.close()
             return 0
         if code != 0:
             if interactive_commands is not None:
+                if goal_turn:
+                    interactive_commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
                 interactive_commands.close()
             return code
         if interactive_commands is not None and media:
             interactive_commands.clear_pending_media()
+        if interactive_commands is not None and goal_turn:
+            interactive_commands.handle_goal_turn_result(turn_result)
 
 
 def _handle_chat_command(
@@ -290,7 +322,11 @@ def _send_chat_prompt(
     conversation_mode: str = "normal",
     attached_ref: str | None = None,
     temporary_turn_recorder: Callable[..., None] | None = None,
+    notify_completion: bool = True,
+    result_out: dict[str, Any] | None = None,
 ) -> int:
+    if result_out is not None:
+        result_out.clear()
     saw_stream_token = False
     stream_tokens: list[str] = []
     recorder: RunRecorder | None = None
@@ -547,6 +583,13 @@ def _send_chat_prompt(
             if stopped_by_user:
                 recorder.event("stopped_by_user")
             recorder.complete()
+        if result_out is not None:
+            result_out.update(
+                text=rendered_text,
+                title=response_title(response),
+                conversation_ref=conversation_ref,
+                stopped_by_user=stopped_by_user,
+            )
         completed_successfully = True
         return 0
     finally:
@@ -554,7 +597,7 @@ def _send_chat_prompt(
             lock.release()
         if renderer is not None:
             renderer.turn_abort()
-            if completed_successfully and not stopped_by_user:
+            if completed_successfully and not stopped_by_user and notify_completion:
                 notify_response_complete(
                     chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
                     final_response=rendered_text,

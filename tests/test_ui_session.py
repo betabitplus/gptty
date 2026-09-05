@@ -144,6 +144,7 @@ def test_command_registry_exposes_session_actions() -> None:
         "resume",
         "detach",
         "stop",
+        "goal",
         "export",
         "image",
         "paste",

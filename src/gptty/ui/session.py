@@ -29,6 +29,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("resume", "Resume a real ChatGPT conversation"),
     CommandSpec("detach", "Detach locally from the current conversation"),
     CommandSpec("stop", "Stop the active ChatGPT response"),
+    CommandSpec("goal", "Run the current task until complete or blocked"),
     CommandSpec("export", "Export the attached conversation to Markdown"),
     CommandSpec("image", "Attach an image to the next prompt"),
     CommandSpec("paste", "Attach the clipboard image to the next prompt"),
