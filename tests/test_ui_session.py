@@ -138,4 +138,4 @@ def test_searchable_picker_escape_cancels(tmp_path) -> None:
 
 def test_command_registry_exposes_session_actions() -> None:
     names = {spec.name for spec in COMMANDS}
-    assert names == {"new", "resume", "detach", "image", "paste", "model", "exit"}
+    assert names == {"new", "resume", "detach", "stop", "image", "paste", "model", "exit"}

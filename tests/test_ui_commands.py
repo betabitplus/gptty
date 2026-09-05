@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from gptty.state import ChatState, StateError, load_chat_state
 from gptty.ui.commands import InteractiveCommands
+from gptty.ui.signals import TurnControlSignals
 
 
 class FakeUI:
@@ -88,6 +90,10 @@ class FakeClient:
             return self.snapshots.pop(0)
         return self.snapshots[0]
 
+    def stop_generation(self, ref, **options):
+        self.calls.append(("stop_generation", (ref, options)))
+        return {"ok": True, "stopped": True, "conversationId": ref}
+
     def list_models(self):
         self.calls.append(("list_models", None))
         return [
@@ -169,6 +175,18 @@ def test_detach_is_local_only(tmp_path) -> None:
     assert client.calls == []
     assert renderer.events[0] == ("clear_context", None)
     assert "not changed" in renderer.events[-1][1]
+
+
+def test_stop_command_stops_current_chat_without_detaching(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, client, _ = make_commands(tmp_path, state=state)
+
+    commands.handle("/stop")
+
+    assert state.current_conversation == "conv-1"
+    assert ("stop_generation", ("conv-1", {"timeout": 30.0})) in client.calls
+    assert ("turn_abort", None) in renderer.events
+    assert ("info", "Stop requested.") in renderer.events
 
 
 def test_image_command_queues_real_file_for_next_prompt(tmp_path) -> None:
@@ -312,7 +330,7 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
         ui=FakeUI(choices=["conv-1"]),
         client=client,
     )
-    monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("gptty.ui.commands.FOLLOW_INTERVAL_SECONDS", 0.0)
     notified: list[dict[str, object]] = []
     monkeypatch.setattr(
         "gptty.ui.commands.notify_response_complete",
@@ -329,6 +347,78 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
     assert ("chat_link", "conv-1") in renderer.events
     assert notified == [{"chat_title": "First chat", "prompt": "question"}]
     assert [call[0] for call in client.calls].count("snapshot") == 2
+
+
+def test_ctrl_c_while_following_stops_remote_response_and_keeps_attachment(tmp_path, monkeypatch) -> None:
+    running = {
+        "status": SimpleNamespace(status="running"),
+        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
+    }
+    completed = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "partial"},
+        ],
+    }
+    client = FakeClient(snapshots=[running, completed])
+    state = ChatState()
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        state=state,
+        ui=FakeUI(choices=["conv-1"]),
+        client=client,
+    )
+    @contextmanager
+    def stop_controls(*, enabled=True):
+        controls = TurnControlSignals()
+        controls.request_stop()
+        yield controls
+
+    monkeypatch.setattr("gptty.ui.commands.turn_control_signals", stop_controls)
+    monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+
+    commands.handle("/resume")
+
+    assert state.current_conversation == "conv-1"
+    assert ("stop_generation", ("conv-1", {"timeout": 30.0})) in client.calls
+    assert ("info", "Stopped by user.") in renderer.events
+    assert ("chat_link", "conv-1") in renderer.events
+    assert notified == []
+
+
+def test_ctrl_backslash_while_following_exits_locally_without_remote_stop(tmp_path, monkeypatch) -> None:
+    running = {
+        "status": SimpleNamespace(status="running"),
+        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
+    }
+    client = FakeClient(snapshots=[running])
+    state = ChatState()
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        state=state,
+        ui=FakeUI(choices=["conv-1"]),
+        client=client,
+    )
+    @contextmanager
+    def quit_controls(*, enabled=True):
+        controls = TurnControlSignals()
+        controls.request_quit()
+        yield controls
+
+    monkeypatch.setattr("gptty.ui.commands.turn_control_signals", quit_controls)
+
+    result = commands.handle("/resume")
+
+    assert result == 0
+    assert state.current_conversation == "conv-1"
+    assert not any(call[0] == "stop_generation" for call in client.calls)
+    assert ("info", "Exited gptty; ChatGPT response continues in browser.") in renderer.events
 
 
 def test_new_clears_current_conversation(tmp_path) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
@@ -14,7 +15,7 @@ from ..locks import (
     render_lock_timeout,
     render_stale_lock_recovered,
 )
-from ..output import render_live_event
+from ..output import normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
@@ -22,6 +23,7 @@ from ..ui.commands import InteractiveCommands
 from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
+from ..ui.signals import TurnControlSignals, turn_control_signals
 from ..ui.state import history_path, ui_settings_path
 
 CHAT_HELP = """Commands:
@@ -30,6 +32,9 @@ CHAT_HELP = """Commands:
   /exit        Exit chat
   /quit        Exit chat
 """
+
+LOCAL_QUIT_CODE = 97
+
 
 CONVERSATION_REF_FIELDS = (
     "conversation_id",
@@ -198,23 +203,30 @@ def run_chat(
             continue
 
         media = interactive_commands.pending_media if interactive_commands is not None else None
-        if renderer is not None:
-            renderer.turn_start()
-        code = _send_chat_prompt(
-            get_client(),
-            state=state,
-            state_path=state_path,
-            profile=getattr(args, "profile", None),
-            prompt=prompt,
-            model=state.model,
-            media=media,
-            stream=not bool(getattr(args, "no_stream", False)),
-            lock_timeout=_lock_timeout(args),
-            explicit_lock_wait=bool(getattr(args, "wait_lock", False)) or getattr(args, "lock_timeout", None) is not None,
-            stdout=stdout,
-            stderr=stderr,
-            renderer=renderer,
-        )
+        turn_client = get_client()
+        with turn_control_signals(enabled=renderer is not None) as turn_controls:
+            if renderer is not None:
+                renderer.turn_start()
+            code = _send_chat_prompt(
+                turn_client,
+                state=state,
+                state_path=state_path,
+                profile=getattr(args, "profile", None),
+                prompt=prompt,
+                model=state.model,
+                media=media,
+                stream=not bool(getattr(args, "no_stream", False)),
+                lock_timeout=_lock_timeout(args),
+                explicit_lock_wait=bool(getattr(args, "wait_lock", False)) or getattr(args, "lock_timeout", None) is not None,
+                stdout=stdout,
+                stderr=stderr,
+                renderer=renderer,
+                turn_controls=turn_controls,
+            )
+        if code == LOCAL_QUIT_CODE:
+            if interactive_commands is not None:
+                interactive_commands.close()
+            return 0
         if code != 0:
             if interactive_commands is not None:
                 interactive_commands.close()
@@ -265,11 +277,16 @@ def _send_chat_prompt(
     stdout: TextIO,
     stderr: TextIO,
     renderer: PrettyRenderer | None = None,
+    turn_controls: TurnControlSignals | None = None,
 ) -> int:
     saw_stream_token = False
     stream_tokens: list[str] = []
     recorder: RunRecorder | None = None
     completed_successfully = False
+    stopped_by_user = False
+    local_quit_requested = False
+    write_committed = threading.Event()
+    controls = turn_controls or TurnControlSignals()
     if state.current_conversation:
         recorder = start_run(
             profile=profile,
@@ -289,6 +306,10 @@ def _send_chat_prompt(
             print(token, end="", file=stdout, flush=True)
 
     def on_event(event: dict[str, Any]) -> None:
+        if event.get("type") == "browser_native_write_completed":
+            write_committed.set()
+        if stopped_by_user or local_quit_requested:
+            return
         if renderer is not None:
             renderer.live_event(event)
             return
@@ -303,6 +324,7 @@ def _send_chat_prompt(
         options["media"] = media
     if stream:
         options["on_token"] = on_token
+    if stream or renderer is not None:
         options["on_event"] = on_event
 
     lock = None
@@ -333,22 +355,135 @@ def _send_chat_prompt(
     try:
         if recorder is not None:
             recorder.event("waiting_for_reply")
-        try:
-            if state.current_conversation:
-                response = client.send_to_conversation(state.current_conversation, prompt, **options)
-            else:
-                response = client.send(prompt, **options)
-        except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
-            if recorder is not None:
-                recorder.fail(str(exc))
-            if renderer is not None:
+        send_conversation_ref = state.current_conversation
+
+        def perform_send() -> Any:
+            if send_conversation_ref:
+                return client.send_to_conversation(send_conversation_ref, prompt, **options)
+            return client.send(prompt, **options)
+
+        if renderer is None:
+            try:
+                response = perform_send()
+            except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
+                if recorder is not None:
+                    recorder.fail(str(exc))
+                print(f"gptty: chat request failed: {exc}", file=stderr)
+                return 1
+        else:
+            outcome: dict[str, Any] = {}
+
+            def send_worker() -> None:
+                try:
+                    outcome["response"] = perform_send()
+                except BaseException as exc:  # noqa: BLE001 - main thread owns Ctrl-C; worker must surface all exits.
+                    outcome["error"] = exc
+
+            worker = threading.Thread(target=send_worker, name="gptty-chat-turn", daemon=True)
+            worker.start()
+            quit_wait_notice_shown = False
+            while worker.is_alive():
+                worker.join(timeout=0.1)
+                if controls.quit_requested.is_set():
+                    if write_committed.is_set():
+                        local_quit_requested = True
+                        renderer.turn_abort()
+                        renderer.info("Exited gptty; ChatGPT response continues in browser.")
+                        return LOCAL_QUIT_CODE
+                    if not quit_wait_notice_shown:
+                        quit_wait_notice_shown = True
+                        renderer.info("Waiting for safe ChatGPT handoff before local exit…")
+                if not controls.consume_stop():
+                    continue
+                if stopped_by_user:
+                    renderer.info("Stop already requested; waiting for ChatGPT to save the partial response…")
+                    continue
+                renderer.info("Stopping ChatGPT…")
+                try:
+                    stop_result = client.stop_generation(state.current_conversation, timeout=30.0)
+                except Exception as exc:  # noqa: BLE001 - interactive stop is best-effort at this boundary.
+                    renderer.warning(f"Stop failed: {exc}")
+                    continue
+
+                stopped = (
+                    bool(stop_result.get("stopped"))
+                    if isinstance(stop_result, dict)
+                    else bool(getattr(stop_result, "stopped", False))
+                )
+                if not stopped:
+                    renderer.warning("No active ChatGPT response to stop yet; press Ctrl-C again to retry.")
+                    continue
+
+                stopped_by_user = True
+                stop_ref = (
+                    stop_result.get("conversationId")
+                    if isinstance(stop_result, dict)
+                    else getattr(stop_result, "conversation_id", None)
+                )
+                if (
+                    not state.current_conversation
+                    and isinstance(stop_ref, str)
+                    and stop_ref.strip()
+                    and not stop_ref.strip().startswith("WEB:")
+                ):
+                    state.current_conversation = stop_ref.strip()
+                    try:
+                        save_chat_state(state_path, state)
+                    except StateError as exc:
+                        renderer.warning(str(exc))
                 renderer.turn_abort()
-            print(f"gptty: chat request failed: {exc}", file=stderr)
-            return 1
+                renderer.info("Stop requested; waiting for ChatGPT to save the partial response…")
+
+            if controls.quit_requested.is_set():
+                local_quit_requested = True
+                renderer.turn_abort()
+                renderer.info("Exited gptty; ChatGPT response continues in browser.")
+                return LOCAL_QUIT_CODE
+
+            response: Any = None
+            error = outcome.get("error")
+            if error is not None and stopped_by_user:
+                if state.current_conversation:
+                    try:
+                        snapshot = client.conversation_snapshot(state.current_conversation)
+                        response = _stopped_snapshot_response(
+                            snapshot,
+                            conversation_ref=state.current_conversation,
+                        )
+                    except Exception as reconcile_error:  # noqa: BLE001 - confirmed Stop remains a normal user action.
+                        renderer.warning(
+                            "Stopped ChatGPT, but the saved partial response could not be read yet: "
+                            f"{reconcile_error}"
+                        )
+                        response = {
+                            "text": "",
+                            "conversation_id": state.current_conversation,
+                        }
+                else:
+                    renderer.warning(
+                        "Stopped ChatGPT before the new conversation route was committed; "
+                        "use /resume to reopen it if ChatGPT saved the chat."
+                    )
+                    response = {"text": ""}
+                error = None
+            if error is not None:
+                if isinstance(error, Exception):
+                    if recorder is not None:
+                        recorder.fail(str(error))
+                    renderer.turn_abort()
+                    print(f"gptty: chat request failed: {error}", file=stderr)
+                    return 1
+                raise error
+            if "response" in outcome:
+                response = outcome["response"]
+            elif not stopped_by_user:
+                response = None
 
         text = response_text(response)
         if renderer is not None:
             renderer.answer(text or "".join(stream_tokens))
+            if stopped_by_user:
+                renderer.info("Stopped by user.")
         elif stream:
             if saw_stream_token:
                 print(file=stdout)
@@ -376,6 +511,8 @@ def _send_chat_prompt(
             renderer.chat_link(state.current_conversation)
 
         if recorder is not None:
+            if stopped_by_user:
+                recorder.event("stopped_by_user")
             recorder.complete()
         completed_successfully = True
         return 0
@@ -384,8 +521,34 @@ def _send_chat_prompt(
             lock.release()
         if renderer is not None:
             renderer.turn_abort()
-            if completed_successfully:
+            if completed_successfully and not stopped_by_user:
                 notify_response_complete(chat_title=response_title(response), prompt=prompt)
+
+
+def _stopped_snapshot_response(snapshot: Any, *, conversation_ref: str) -> dict[str, str]:
+    raw_messages = snapshot.get("messages") if isinstance(snapshot, dict) else getattr(snapshot, "messages", None)
+    try:
+        messages = list(raw_messages) if raw_messages is not None else []
+    except TypeError:
+        messages = []
+
+    text = ""
+    for message in reversed(messages):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role != "assistant":
+            continue
+        recipient = message.get("recipient") if isinstance(message, dict) else getattr(message, "recipient", None)
+        if recipient not in {None, "", "all"}:
+            continue
+        normalized = normalize_messages([message])
+        if normalized:
+            text = normalized[0].text
+        break
+
+    return {
+        "text": text,
+        "conversation_id": conversation_ref,
+    }
 
 
 def _lock_timeout(args: Any) -> float:

@@ -55,6 +55,10 @@ class FakeSdkClient:
         self.calls.append(("conversation_snapshot", (url_or_id,), options))
         return "snapshot-result"
 
+    def stop_generation(self, url_or_id: object = None, **options: object):
+        self.calls.append(("stop_generation", (url_or_id,), options))
+        return {"ok": True, "stopped": True, "conversationId": url_or_id}
+
 
 class FrontierFakeSdkClient(FakeSdkClient):
     def list_models(self):
@@ -108,6 +112,10 @@ class FakeProductRuntime:
     def conversation_snapshot(self, url_or_id: object, **options: object):
         self.calls.append(("conversation_snapshot", (url_or_id,), options))
         return "runtime-snapshot-result"
+
+    def stop_generation(self, url_or_id: object = None, **options: object):
+        self.calls.append(("stop_generation", (url_or_id,), options))
+        return {"ok": True, "stopped": True, "conversationId": url_or_id}
 
 
 def test_gptty_client_keeps_auth_and_timeout() -> None:
@@ -200,6 +208,7 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
     assert client.list_conversations() == "conversations-result"
     assert client.list_models() == "models-result"
     assert client.conversation_snapshot("abc", limit=10) == "snapshot-result"
+    assert client.stop_generation("abc", timeout=3)["stopped"] is True
     assert client.wait_until_completed("abc", timeout=30) == "wait-result"
 
     assert sdk.calls == [
@@ -210,6 +219,7 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
         ("list_conversations", (), {}),
         ("list_models", (), {}),
         ("conversation_snapshot", ("abc",), {"limit": 10}),
+        ("stop_generation", ("abc",), {"timeout": 3}),
         ("wait_until_completed", ("abc",), {"timeout": 30}),
     ]
 
@@ -267,13 +277,15 @@ def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) ->
 
     assert client.attach_conversation("c1") == "runtime-attach-result"
     assert client.get_messages("c1", limit=4) == "runtime-messages-result"
+    assert client.stop_generation("c1", timeout=2)["stopped"] is True
     status = client.wait_until_completed("c1", timeout=1, poll_interval=0.001)
 
     assert status.status == "completed"
     assert len(sleeps) == 1 and sleeps[0] > 0.9
     assert runtime.calls[0] == ("attach_conversation", ("c1",), {})
     assert runtime.calls[1] == ("get_messages", ("c1",), {"limit": 4})
-    assert runtime.calls[2:] == [
+    assert runtime.calls[2] == ("stop_generation", ("c1",), {"timeout": 2})
+    assert runtime.calls[3:] == [
         ("get_status", ("c1",), {}),
         ("get_status", ("c1",), {}),
     ]

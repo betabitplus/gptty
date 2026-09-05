@@ -26,11 +26,13 @@ class _ElapsedStatus:
     initial_elapsed: float = 0.0
     finished_at: float | None = None
     label: str = "elapsed"
+    hint: str | None = "Ctrl-C stop · Ctrl-\\ quit"
 
     def __rich__(self) -> Text:
         now = self.finished_at if self.finished_at is not None else time.monotonic()
         seconds = self.initial_elapsed + max(0.0, now - self.started_at)
-        return Text(f"{self.label} {_format_elapsed(seconds)}", style="dim")
+        suffix = f" · {self.hint}" if self.hint else ""
+        return Text(f"{self.label} {_format_elapsed(seconds)}{suffix}", style="dim")
 
 
 class PrettyRenderer:
@@ -113,6 +115,7 @@ class PrettyRenderer:
         if status is None:
             return
         status.label = label
+        status.hint = None
         status.finished_at = time.monotonic()
         if self._elapsed_live is not None:
             self._elapsed_live.update(status, refresh=True)

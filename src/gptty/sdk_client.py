@@ -35,6 +35,8 @@ class ChatGPTWebClientProtocol(Protocol):
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any: ...
 
+    def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any: ...
+
 
 class _ProductRuntimeClient:
     """Compatibility adapter from gptty's CLI-shaped SDK surface to CWA 0.3."""
@@ -103,6 +105,9 @@ class _ProductRuntimeClient:
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
         return self.runtime.conversation_snapshot(url_or_id, **options)
+
+    def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
+        return self.runtime.stop_generation(url_or_id, **options)
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         timeout = float(options.pop("timeout", self.timeout))
@@ -198,6 +203,9 @@ class GpttyClient:
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.conversation_snapshot(url_or_id, **options)
+
+    def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
+        return self._client.stop_generation(url_or_id, **options)
 
     def wait_until_completed(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.wait_until_completed(url_or_id, **options)

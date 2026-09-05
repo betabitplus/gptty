@@ -16,6 +16,7 @@ from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
 from .session import InteractiveSession
+from .signals import turn_control_signals
 
 FOLLOW_INTERVAL_SECONDS = 15.0
 FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -112,6 +113,35 @@ class InteractiveCommands:
         self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Detached locally. The ChatGPT conversation was not changed.")
 
+    def _cmd_stop(self, argv: list[str]) -> None:
+        if argv:
+            self.renderer.warning("/stop takes no arguments.")
+            return
+        ref = self.state.current_conversation
+        if not ref:
+            self.renderer.info("No conversation is attached.")
+            return
+        client = self.get_client()
+        if self._request_stop_generation(client, ref):
+            self.renderer.turn_abort()
+            self.renderer.info("Stop requested.")
+
+    def _request_stop_generation(self, client: Any, ref: str) -> bool:
+        try:
+            result = client.stop_generation(ref, timeout=30.0)
+        except Exception as exc:  # noqa: BLE001 - interactive command boundary.
+            self.renderer.warning(f"Stop failed: {exc}")
+            return False
+        stopped = (
+            bool(result.get("stopped"))
+            if isinstance(result, dict)
+            else bool(getattr(result, "stopped", False))
+        )
+        if not stopped:
+            self.renderer.info("No active ChatGPT response to stop.")
+            return False
+        return True
+
     def _cmd_image(self, argv: list[str]) -> None:
         if argv and argv[0].strip().lower() == "clear":
             count = self.pending_media_count
@@ -153,7 +183,7 @@ class InteractiveCommands:
         self._pending_media.append(str(path))
         self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
 
-    def _cmd_resume(self, argv: list[str]) -> None:
+    def _cmd_resume(self, argv: list[str]) -> int | None:
         client = self.get_client()
         ref = argv[0] if argv else self._choose_conversation(client)
         if not ref:
@@ -181,13 +211,15 @@ class InteractiveCommands:
         self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
-        self._follow_if_active(
+        if self._follow_if_active(
             client,
             attached_ref,
             snapshot,
             messages,
             chat_title=self._conversation_titles.get(attached_ref),
-        )
+        ):
+            return 0
+        return None
 
     def _choose_conversation(self, client: Any) -> str | None:
         try:
@@ -282,21 +314,43 @@ class InteractiveCommands:
         messages: list[Any],
         *,
         chat_title: str | None = None,
-    ) -> None:
+    ) -> bool:
         status = _snapshot_status(snapshot)
         if status == "awaiting_tool_approval":
             self.renderer.warning("Conversation is waiting for tool approval.")
-            return
+            return False
         if status not in ACTIVE_STATUSES:
-            return
+            return False
 
         seen = {_message_identity(message): _message_text(message) for message in messages}
         deadline = time.monotonic() + FOLLOW_TIMEOUT_SECONDS
-        self.renderer.info("Following active response… Ctrl-C stops following but stays attached.")
-        self.renderer.start_elapsed(initial_elapsed=_active_elapsed_seconds(messages))
-        try:
+        stopped_by_user = False
+        with turn_control_signals(enabled=True) as controls:
+            self.renderer.info("Following active response… Ctrl-C stops ChatGPT · Ctrl-\\ exits gptty only.")
+            self.renderer.start_elapsed(initial_elapsed=_active_elapsed_seconds(messages))
             while time.monotonic() < deadline:
-                time.sleep(FOLLOW_INTERVAL_SECONDS)
+                woke = controls.wake.wait(timeout=FOLLOW_INTERVAL_SECONDS)
+                controls.wake.clear()
+                if controls.quit_requested.is_set():
+                    self.renderer.turn_abort()
+                    self.renderer.info("Exited gptty; ChatGPT response continues in browser.")
+                    return True
+                if controls.stop_requested.is_set():
+                    controls.stop_requested.clear()
+                    if stopped_by_user:
+                        self.renderer.info("Stop already requested; waiting for ChatGPT to save the partial response…")
+                        continue
+                    self.renderer.info("Stopping ChatGPT…")
+                    if self._request_stop_generation(client, ref):
+                        stopped_by_user = True
+                        self.renderer.turn_abort()
+                        self.renderer.info("Stop requested; waiting for ChatGPT to save the partial response…")
+                        time.sleep(1.0)
+                    else:
+                        continue
+                elif woke:
+                    continue
+
                 snapshot = client.conversation_snapshot(ref)
                 current = _snapshot_messages(snapshot)
                 changed: list[Any] = []
@@ -313,26 +367,26 @@ class InteractiveCommands:
                 status = _snapshot_status(snapshot)
                 if status == "completed":
                     self.renderer.finish_elapsed()
+                    if stopped_by_user:
+                        self.renderer.info("Stopped by user.")
                     self.renderer.chat_link(ref)
-                    notify_response_complete(
-                        chat_title=chat_title,
-                        prompt=_last_user_message_text(current),
-                    )
-                    return
+                    if not stopped_by_user:
+                        notify_response_complete(
+                            chat_title=chat_title,
+                            prompt=_last_user_message_text(current),
+                        )
+                    return False
                 if status == "awaiting_tool_approval":
                     self.renderer.turn_abort()
                     self.renderer.warning("Conversation is waiting for tool approval.")
-                    return
+                    return False
                 if status not in ACTIVE_STATUSES:
                     self.renderer.turn_abort()
                     self.renderer.info(f"Follow stopped: status={status or 'unknown'}")
-                    return
-        except KeyboardInterrupt:
-            self.renderer.turn_abort()
-            self.renderer.info("Stopped following; conversation remains attached.")
-            return
+                    return False
         self.renderer.turn_abort()
         self.renderer.info("Stopped following after 2 hours; conversation remains attached.")
+        return False
 
     def _save_state(self) -> bool:
         try:

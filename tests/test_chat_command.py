@@ -5,8 +5,14 @@ from io import StringIO
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from gptty.commands.chat import _send_chat_prompt, extract_conversation_ref, run_chat
+from gptty.commands.chat import (
+    LOCAL_QUIT_CODE,
+    _send_chat_prompt,
+    extract_conversation_ref,
+    run_chat,
+)
 from gptty.state import ChatState, load_chat_state, save_chat_state
+from gptty.ui.signals import TurnControlSignals
 
 
 class Response:
@@ -238,6 +244,270 @@ def test_completed_enhanced_turn_notifies_with_chat_and_prompt(tmp_path, monkeyp
             "prompt": "Which screenshot is this?",
         }
     ]
+
+
+def test_ctrl_c_stops_active_turn_and_keeps_new_chat_attached(tmp_path, monkeypatch) -> None:
+    class StopClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send(self, prompt, **options):
+            self.calls.append(("send", prompt))
+            return Response(text="partial answer", conversation_id="conv-stopped", title="Stopped Chat")
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            return {"ok": True, "stopped": True, "conversationId": "conv-stopped"}
+
+    controls = TurnControlSignals()
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.alive = True
+            self.join_calls = 0
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            if self.join_calls == 0:
+                self.join_calls += 1
+                controls.request_stop()
+                return None
+            self.target()
+            self.alive = False
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def answer(self, text):
+            self.events.append(("answer", text))
+
+        def chat_link(self, ref):
+            self.events.append(("chat_link", ref))
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    monkeypatch.setattr("gptty.commands.chat.threading.Thread", FakeThread)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.commands.chat.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+    client = StopClient()
+    renderer = FakeRenderer()
+    state = ChatState()
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="keep going for a while",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        turn_controls=controls,
+    )
+
+    assert code == 0
+    assert client.calls == [("stop_generation", None), ("send", "keep going for a while")]
+    assert state.current_conversation == "conv-stopped"
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stopped"
+    assert ("answer", "partial answer") in renderer.events
+    assert ("info", "Stopped by user.") in renderer.events
+    assert notified == []
+
+
+def test_ctrl_c_reconciles_saved_partial_after_stop_aborts_browser_fetch(tmp_path, monkeypatch) -> None:
+    class StopAbortClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send(self, prompt, **options):
+            self.calls.append(("send", prompt))
+            raise RuntimeError("CHATGPT_CONVERSATION_REQUEST_FAILED:net::ERR_ABORTED")
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            return {"ok": True, "stopped": True, "conversationId": "conv-stopped"}
+
+        def conversation_snapshot(self, ref, **options):
+            self.calls.append(("conversation_snapshot", ref))
+            return {
+                "messages": [
+                    {"role": "user", "text": "keep going for a while"},
+                    {"role": "assistant", "recipient": "all", "text": "saved partial answer"},
+                ]
+            }
+
+    controls = TurnControlSignals()
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.alive = True
+            self.join_calls = 0
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            if self.join_calls == 0:
+                self.join_calls += 1
+                controls.request_stop()
+                return None
+            self.target()
+            self.alive = False
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def answer(self, text):
+            self.events.append(("answer", text))
+
+        def chat_link(self, ref):
+            self.events.append(("chat_link", ref))
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    monkeypatch.setattr("gptty.commands.chat.threading.Thread", FakeThread)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.commands.chat.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+    client = StopAbortClient()
+    renderer = FakeRenderer()
+    state = ChatState()
+    stderr = StringIO()
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="keep going for a while",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=stderr,
+        renderer=renderer,
+        turn_controls=controls,
+    )
+
+    assert code == 0
+    assert client.calls == [
+        ("stop_generation", None),
+        ("send", "keep going for a while"),
+        ("conversation_snapshot", "conv-stopped"),
+    ]
+    assert state.current_conversation == "conv-stopped"
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stopped"
+    assert ("answer", "saved partial answer") in renderer.events
+    assert ("info", "Stopped by user.") in renderer.events
+    assert "chat request failed" not in stderr.getvalue()
+    assert notified == []
+
+
+def test_ctrl_backslash_exits_locally_without_stopping_chat(tmp_path, monkeypatch) -> None:
+    class ContinueClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send_to_conversation(self, ref, prompt, **options):
+            self.calls.append(("send_to_conversation", ref))
+            options["on_event"]({"type": "browser_native_write_completed"})
+            return Response(text="eventual answer", conversation_id=ref)
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            return {"ok": True, "stopped": True, "conversationId": ref}
+
+    controls = TurnControlSignals()
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.alive = True
+            self.joins = 0
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.joins += 1
+            if self.joins == 1:
+                controls.request_quit()
+                return
+            self.target()
+            self.alive = False
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+    monkeypatch.setattr("gptty.commands.chat.threading.Thread", FakeThread)
+    client = ContinueClient()
+    renderer = FakeRenderer()
+    state = ChatState(current_conversation="conv-running")
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="continue in browser",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        turn_controls=controls,
+    )
+
+    assert code == LOCAL_QUIT_CODE
+    assert client.calls == [("send_to_conversation", "conv-running")]
+    assert state.current_conversation == "conv-running"
+    assert ("info", "Waiting for safe ChatGPT handoff before local exit…") in renderer.events
+    assert ("info", "Exited gptty; ChatGPT response continues in browser.") in renderer.events
 
 
 def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation() -> None:
