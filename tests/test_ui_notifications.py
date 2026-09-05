@@ -26,7 +26,7 @@ def test_notification_uses_chat_identity_last_prompt_and_sound(monkeypatch) -> N
     assert 'sound name "Glass"' in argv[2]
     assert argv[3] == 'Inspect "this" image please'
     assert argv[4] == "gptty · chat …d32ab031"
-    assert argv[5] == "Response ready"
+    assert len(argv) == 5
     assert kwargs["check"] is False
 
 

@@ -7,8 +7,7 @@ _NOTIFICATION_SCRIPT = r'''
 on run argv
     set notificationBody to item 1 of argv
     set notificationTitle to item 2 of argv
-    set notificationSubtitle to item 3 of argv
-    display notification notificationBody with title notificationTitle subtitle notificationSubtitle sound name "Glass"
+    display notification notificationBody with title notificationTitle sound name "Glass"
 end run
 '''.strip()
 
@@ -33,7 +32,6 @@ def notify_response_complete(*, conversation: str | None = None, prompt: str | N
                 _NOTIFICATION_SCRIPT,
                 body,
                 title,
-                "Response ready",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
