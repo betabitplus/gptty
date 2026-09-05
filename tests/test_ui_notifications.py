@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from gptty.ui import notifications
 
 
-def test_notification_uses_native_macos_osascript(monkeypatch) -> None:
+def test_notification_uses_chat_identity_last_prompt_and_sound(monkeypatch) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_run(argv, **kwargs):
@@ -15,11 +15,26 @@ def test_notification_uses_native_macos_osascript(monkeypatch) -> None:
     monkeypatch.setattr(notifications.sys, "platform", "darwin")
     monkeypatch.setattr(notifications.subprocess, "run", fake_run)
 
-    assert notifications.notify_response_complete() is True
-    assert calls[0][0][0] == "osascript"
-    assert "display notification" in calls[0][0][2]
-    assert 'sound name "Glass"' in calls[0][0][2]
-    assert calls[0][1]["check"] is False
+    assert notifications.notify_response_complete(
+        conversation="6a9bdfca-78e0-83eb-8746-026cd32ab031",
+        prompt='  Inspect   "this"\nimage please  ',
+    ) is True
+
+    argv, kwargs = calls[0]
+    assert argv[0] == "osascript"
+    assert "display notification" in argv[2]
+    assert 'sound name "Glass"' in argv[2]
+    assert argv[3] == 'Inspect "this" image please'
+    assert argv[4] == "gptty · chat …d32ab031"
+    assert argv[5] == "Response ready"
+    assert kwargs["check"] is False
+
+
+def test_notification_prompt_is_bounded() -> None:
+    body = notifications._notification_prompt("x" * 400)
+
+    assert len(body) == 180
+    assert body.endswith("…")
 
 
 def test_notification_is_noop_off_macos(monkeypatch) -> None:
@@ -30,7 +45,7 @@ def test_notification_is_noop_off_macos(monkeypatch) -> None:
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
     )
 
-    assert notifications.notify_response_complete() is False
+    assert notifications.notify_response_complete(conversation="abc", prompt="hello") is False
 
 
 def test_notification_failure_is_best_effort(monkeypatch) -> None:
@@ -41,4 +56,4 @@ def test_notification_failure_is_best_effort(monkeypatch) -> None:
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("missing")),
     )
 
-    assert notifications.notify_response_complete() is False
+    assert notifications.notify_response_complete(conversation="abc", prompt="hello") is False

@@ -5,7 +5,7 @@ from io import StringIO
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from gptty.commands.chat import extract_conversation_ref, run_chat
+from gptty.commands.chat import _send_chat_prompt, extract_conversation_ref, run_chat
 from gptty.state import ChatState, load_chat_state, save_chat_state
 
 
@@ -190,6 +190,48 @@ def test_no_stream_passes_stream_false_and_prints_response_text(tmp_path) -> Non
         {"stream": False, "model": "gpt-4o"},
     )
     assert load_chat_state(tmp_path / "gptty_state.json").model == "gpt-4o"
+
+
+def test_completed_enhanced_turn_notifies_with_chat_and_prompt(tmp_path, monkeypatch) -> None:
+    class FakeRenderer:
+        def answer(self, _text: str) -> None:
+            pass
+
+        def chat_link(self, _ref: str) -> None:
+            pass
+
+        def turn_abort(self) -> None:
+            pass
+
+    client = FakeGpttyClient()
+    state = ChatState()
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.commands.chat.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="Which screenshot is this?",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=FakeRenderer(),
+    )
+
+    assert code == 0
+    assert notified == [
+        {
+            "conversation": "conv-1",
+            "prompt": "Which screenshot is this?",
+        }
+    ]
 
 
 def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation() -> None:

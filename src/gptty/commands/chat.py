@@ -377,7 +377,7 @@ def _send_chat_prompt(
         if renderer is not None:
             renderer.turn_abort()
             if completed_successfully:
-                notify_response_complete()
+                notify_response_complete(conversation=state.current_conversation, prompt=prompt)
 
 
 def _lock_timeout(args: Any) -> float:

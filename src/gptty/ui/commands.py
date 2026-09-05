@@ -299,7 +299,10 @@ class InteractiveCommands:
                 if status == "completed":
                     self.renderer.finish_elapsed()
                     self.renderer.chat_link(ref)
-                    notify_response_complete()
+                    notify_response_complete(
+                        conversation=ref,
+                        prompt=_last_user_message_text(current),
+                    )
                     return
                 if status == "awaiting_tool_approval":
                     self.renderer.turn_abort()
@@ -443,6 +446,13 @@ def _message_text(message: Any) -> str:
         value = _field(message, field)
         if value is not None:
             return str(value)
+    return ""
+
+
+def _last_user_message_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        if _field_text(message, "role") == "user":
+            return _message_text(message)
     return ""
 
 
