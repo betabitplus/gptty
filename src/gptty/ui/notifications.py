@@ -13,7 +13,7 @@ def notify_response_complete() -> bool:
             [
                 "osascript",
                 "-e",
-                'display notification "ChatGPT response is ready." with title "gptty"',
+                'display notification "ChatGPT response is ready." with title "gptty" sound name "Glass"',
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

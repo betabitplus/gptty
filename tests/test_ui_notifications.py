@@ -18,6 +18,7 @@ def test_notification_uses_native_macos_osascript(monkeypatch) -> None:
     assert notifications.notify_response_complete() is True
     assert calls[0][0][0] == "osascript"
     assert "display notification" in calls[0][0][2]
+    assert 'sound name "Glass"' in calls[0][0][2]
     assert calls[0][1]["check"] is False
 
 
