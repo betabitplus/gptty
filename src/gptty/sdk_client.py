@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Protocol
@@ -144,12 +145,13 @@ class GpttyClient:
         self.auth_file = Path(auth_file)
         self.timeout = int(timeout)
         self._client = sdk_client or self._build_sdk_client()
+        self._media_default_model: str | None = None
 
     def _build_sdk_client(self) -> ChatGPTWebClientProtocol:
         return _ProductRuntimeClient(auth_file=self.auth_file, timeout=self.timeout)
 
     def send(self, prompt: str, **options: Any) -> Any:
-        return self._client.send(prompt, **_sdk_send_options(options))
+        return self._client.send(prompt, **self._prepare_send_options(options))
 
     def send_to_conversation(
         self,
@@ -160,8 +162,18 @@ class GpttyClient:
         return self._client.send_to_conversation(
             url_or_id,
             prompt,
-            **_sdk_send_options(options),
+            **self._prepare_send_options(options),
         )
+
+    def _prepare_send_options(self, options: dict[str, Any]) -> dict[str, Any]:
+        media = options.get("media")
+        has_explicit_model = bool(options.get("model") or options.get("model_profile"))
+        media_default_model: str | None = None
+        if media and not has_explicit_model:
+            if self._media_default_model is None:
+                self._media_default_model = _resolve_latest_frontier_model(self._client.list_models())
+            media_default_model = self._media_default_model
+        return _sdk_send_options(options, media_default_model=media_default_model)
 
     def attach_conversation(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.attach_conversation(url_or_id, **options)
@@ -191,12 +203,75 @@ class GpttyClient:
         return self._client.wait_until_completed(url_or_id, **options)
 
 
-def _sdk_send_options(options: dict[str, Any]) -> dict[str, Any]:
+def _sdk_send_options(
+    options: dict[str, Any],
+    *,
+    media_default_model: str | None = None,
+) -> dict[str, Any]:
     sdk_options = dict(options)
     sdk_options.pop("stream", None)
     if not sdk_options.get("model") and not sdk_options.get("model_profile"):
-        sdk_options["model_profile"] = DEFAULT_MODEL_PROFILE
+        if sdk_options.get("media"):
+            if not media_default_model:
+                raise RuntimeError("no compatible default image model is available")
+            sdk_options["model"] = media_default_model
+        else:
+            sdk_options["model_profile"] = DEFAULT_MODEL_PROFILE
     return sdk_options
+
+
+def _resolve_latest_frontier_model(models: Any) -> str:
+    try:
+        items = list(models)
+    except TypeError as exc:
+        raise RuntimeError("ChatGPT model catalog is unavailable") from exc
+
+    candidates: list[tuple[str, tuple[int, tuple[int, int], int, int, int]]] = []
+    for item in items:
+        slug = _model_field(item, "slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        slug = slug.strip()
+        if _model_field(item, "enabled") is False or _model_field(item, "is_disabled") is True:
+            continue
+        if _model_field(item, "is_work_mode_model") is True or slug == "research":
+            continue
+
+        title = _model_field(item, "title")
+        title_text = title if isinstance(title, str) else ""
+        lowered = f"{slug} {title_text}".lower()
+        is_mini = "mini" in lowered
+        is_thinking = "thinking" in lowered or slug.endswith("-thinking")
+        is_instant = "instant" in lowered
+        max_tokens = _model_field(item, "max_tokens")
+        token_score = int(max_tokens) if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) else 0
+        rank = (
+            0 if is_mini else 1,
+            _model_version(slug, title_text),
+            1 if is_thinking else 0,
+            0 if is_instant else 1,
+            token_score,
+        )
+        candidates.append((slug, rank))
+
+    if not candidates:
+        raise RuntimeError("no compatible default image model is available")
+    return max(candidates, key=lambda candidate: candidate[1])[0]
+
+
+def _model_version(slug: str, title: str) -> tuple[int, int]:
+    for value in (slug, title.lower()):
+        match = re.search(r"gpt[- ]?(\d+)[.-](\d+)", value)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        match = re.search(r"gpt[- ]?(\d+)", value)
+        if match:
+            return int(match.group(1)), 0
+    return 0, 0
+
+
+def _model_field(item: Any, name: str) -> Any:
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
 
 
 def _runtime_send_options(options: dict[str, Any]) -> dict[str, Any]:

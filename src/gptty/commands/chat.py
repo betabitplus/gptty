@@ -146,17 +146,24 @@ def run_chat(
 
         try:
             if ui is not None:
-                line = ui.read_prompt()
+                attachment_count = interactive_commands.pending_media_count if interactive_commands is not None else 0
+                line = ui.read_prompt(attachment_count=attachment_count)
             else:
                 line = input_stream.readline()
         except KeyboardInterrupt:
+            if interactive_commands is not None:
+                interactive_commands.close()
             print(file=stdout)
             return 130
         except EOFError:
+            if interactive_commands is not None:
+                interactive_commands.close()
             print(file=stdout)
             return 0
 
         if ui is None and line == "":
+            if interactive_commands is not None:
+                interactive_commands.close()
             if interactive:
                 print(file=stdout)
             return 0
@@ -177,9 +184,12 @@ def run_chat(
             else:
                 result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
             if result is not None:
+                if interactive_commands is not None:
+                    interactive_commands.close()
                 return result
             continue
 
+        media = interactive_commands.pending_media if interactive_commands is not None else None
         if renderer is not None:
             renderer.turn_start()
         code = _send_chat_prompt(
@@ -189,6 +199,7 @@ def run_chat(
             profile=getattr(args, "profile", None),
             prompt=prompt,
             model=state.model,
+            media=media,
             stream=not bool(getattr(args, "no_stream", False)),
             lock_timeout=_lock_timeout(args),
             explicit_lock_wait=bool(getattr(args, "wait_lock", False)) or getattr(args, "lock_timeout", None) is not None,
@@ -197,7 +208,11 @@ def run_chat(
             renderer=renderer,
         )
         if code != 0:
+            if interactive_commands is not None:
+                interactive_commands.close()
             return code
+        if interactive_commands is not None and media:
+            interactive_commands.clear_pending_media()
 
 
 def _handle_chat_command(
@@ -235,6 +250,7 @@ def _send_chat_prompt(
     profile: str | None,
     prompt: str,
     model: str | None,
+    media: list[str] | None,
     stream: bool,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     explicit_lock_wait: bool = False,
@@ -275,6 +291,8 @@ def _send_chat_prompt(
     options: dict[str, Any] = {"stream": stream}
     if model:
         options["model"] = model
+    if media:
+        options["media"] = media
     if stream:
         options["on_token"] = on_token
         options["on_event"] = on_event

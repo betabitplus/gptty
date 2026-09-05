@@ -56,6 +56,19 @@ class FakeSdkClient:
         return "snapshot-result"
 
 
+class FrontierFakeSdkClient(FakeSdkClient):
+    def list_models(self):
+        self.calls.append(("list_models", (), {}))
+        return [
+            {"slug": "gpt-5-5-thinking", "title": "GPT-5.5 Thinking", "max_tokens": 262144},
+            {"slug": "gpt-5-6-instant", "title": "GPT-5.6 Sol", "max_tokens": 52815},
+            {"slug": "gpt-5-6-thinking", "title": "GPT-5.6 Sol", "max_tokens": 262144},
+            {"slug": "gpt-6-astra-wm", "title": "GPT-6 Astra", "is_work_mode_model": True, "max_tokens": 262144},
+            {"slug": "gpt-5-6-t-mini", "title": "GPT-5.6 Luna", "max_tokens": 262144},
+            {"slug": "research", "title": "Deep Research"},
+        ]
+
+
 class OldFakeSdkClient:
     pass
 
@@ -136,6 +149,24 @@ def test_send_defaults_to_latest_frontier_high_profile() -> None:
     assert sdk.calls == [("send", ("hello",), {"model_profile": "DEEP"})]
 
 
+def test_media_defaults_to_latest_normal_thinking_frontier_and_caches_catalog() -> None:
+    sdk = FrontierFakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    assert client.send("inspect", media=["one.png"]) == "send-result"
+    assert client.send_to_conversation("abc", "inspect again", media=["two.png"]) == "send-to-conversation-result"
+
+    assert sdk.calls == [
+        ("list_models", (), {}),
+        ("send", ("inspect",), {"media": ["one.png"], "model": "gpt-5-6-thinking"}),
+        (
+            "send_to_conversation",
+            ("abc", "inspect again"),
+            {"media": ["two.png"], "model": "gpt-5-6-thinking"},
+        ),
+    ]
+
+
 def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
     sdk = FakeSdkClient()
     client = GpttyClient(sdk_client=sdk)
@@ -144,6 +175,7 @@ def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
         "abc",
         "continue",
         stream=False,
+        model="gpt-real",
         media=["image.png"],
     )
 
@@ -152,7 +184,7 @@ def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
         (
             "send_to_conversation",
             ("abc", "continue"),
-            {"media": ["image.png"], "model_profile": "DEEP"},
+            {"model": "gpt-real", "media": ["image.png"]},
         )
     ]
 

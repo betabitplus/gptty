@@ -15,11 +15,11 @@ def collect_media_inputs(args: Any) -> list[str] | None:
         item = str(raw_item).strip()
         if not item:
             raise MediaInputError("--image requires a non-empty path, URL, or data URI")
-        media.append(_normalize_media_item(item))
+        media.append(normalize_media_input(item))
     return media or None
 
 
-def _normalize_media_item(item: str) -> str:
+def normalize_media_input(item: str) -> str:
     if _is_remote_url(item) or _is_data_uri(item):
         return item
 
@@ -33,7 +33,7 @@ def _normalize_media_item(item: str) -> str:
 
 def _is_remote_url(item: str) -> bool:
     lowered = item.lower()
-    return lowered.startswith("http://") or lowered.startswith("https://")
+    return lowered.startswith(("http://", "https://"))
 
 
 def _is_data_uri(item: str) -> bool:

@@ -7,13 +7,17 @@ from gptty.ui.commands import InteractiveCommands
 
 
 class FakeUI:
-    def __init__(self, *, choices=None) -> None:
+    def __init__(self, *, choices=None, image_paths=None) -> None:
         self.choices = list(choices or [])
+        self.image_paths = list(image_paths or [])
         self.seen: list[tuple[str, list[tuple[object, str]]]] = []
 
     def choose_searchable(self, message, options, *, default=None):
         self.seen.append((message, list(options)))
         return self.choices.pop(0) if self.choices else default
+
+    def read_image_path(self):
+        return self.image_paths.pop(0) if self.image_paths else None
 
 
 class FakeRenderer:
@@ -165,6 +169,57 @@ def test_detach_is_local_only(tmp_path) -> None:
     assert client.calls == []
     assert renderer.events[0] == ("clear_context", None)
     assert "not changed" in renderer.events[-1][1]
+
+
+def test_image_command_queues_real_file_for_next_prompt(tmp_path) -> None:
+    image = tmp_path / "screen shot.png"
+    image.write_bytes(b"png")
+    commands, renderer, _, _ = make_commands(tmp_path)
+
+    commands.handle(f'/image "{image}"')
+
+    assert commands.pending_media == [str(image)]
+    assert commands.pending_media_count == 1
+    assert "Attached for next prompt" in renderer.events[-1][1]
+
+
+def test_image_command_without_argument_uses_path_prompt(tmp_path) -> None:
+    image = tmp_path / "picked image.png"
+    image.write_bytes(b"png")
+    dragged_path = str(image).replace(" ", "\\ ")
+    commands, _, _, _ = make_commands(tmp_path, ui=FakeUI(image_paths=[dragged_path]))
+
+    commands.handle("/image")
+
+    assert commands.pending_media == [str(image)]
+
+
+def test_image_clear_removes_pending_clipboard_temp_file(tmp_path, monkeypatch) -> None:
+    clipboard_image = tmp_path / "clipboard.png"
+    clipboard_image.write_bytes(b"png")
+    commands, renderer, _, _ = make_commands(tmp_path)
+    monkeypatch.setattr("gptty.ui.commands.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr("gptty.ui.commands.capture_clipboard_image", lambda _directory: clipboard_image)
+
+    commands.handle("/paste")
+    assert commands.pending_media == [str(clipboard_image)]
+
+    commands.handle("/image clear")
+
+    assert commands.pending_media == []
+    assert not clipboard_image.exists()
+    assert "Cleared 1 pending image" in renderer.events[-1][1]
+
+
+def test_resume_clears_pending_images_before_switching_context(tmp_path) -> None:
+    image = tmp_path / "queued.png"
+    image.write_bytes(b"png")
+    commands, _, _, _ = make_commands(tmp_path)
+    commands.handle(f"/image {image}")
+
+    commands.handle("/resume conv-1")
+
+    assert commands.pending_media == []
 
 
 def test_model_uses_live_catalog_slug(tmp_path) -> None:

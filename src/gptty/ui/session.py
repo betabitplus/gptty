@@ -8,7 +8,7 @@ from typing import Any, TextIO
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
+from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -27,6 +27,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("new", "Start a new ChatGPT conversation"),
     CommandSpec("resume", "Resume a real ChatGPT conversation"),
     CommandSpec("detach", "Detach locally from the current conversation"),
+    CommandSpec("image", "Attach an image to the next prompt"),
+    CommandSpec("paste", "Attach the clipboard image to the next prompt"),
     CommandSpec("model", "Choose a real ChatGPT model"),
     CommandSpec("exit", "Exit gptty chat"),
 )
@@ -81,8 +83,26 @@ class InteractiveSession:
             kwargs["output"] = self._prompt_output
         self._session = PromptSession(**kwargs)
 
-    def read_prompt(self) -> str:
-        return self._session.prompt("❯ ")
+    def read_prompt(self, *, attachment_count: int = 0) -> str:
+        marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
+        return self._session.prompt(f"{marker}❯ ")
+
+    def read_image_path(self) -> str | None:
+        kwargs: dict[str, Any] = {
+            "completer": PathCompleter(expanduser=True),
+            "complete_while_typing": True,
+            "bottom_toolbar": "Enter attach · Esc/Ctrl-C cancel · drag a file here also works",
+        }
+        if self._prompt_input is not None:
+            kwargs["input"] = self._prompt_input
+        if self._prompt_output is not None:
+            kwargs["output"] = self._prompt_output
+        session = PromptSession(**kwargs)
+        try:
+            value = session.prompt("Image path: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        return value or None
 
     def choose_command(self) -> str | None:
         selected = self.choose(

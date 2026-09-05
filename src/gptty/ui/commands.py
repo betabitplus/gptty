@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import shlex
+import shutil
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..media import MediaInputError, normalize_media_input
 from ..output import normalize_messages
 from ..state import ChatState, StateError, save_chat_state
+from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
 from .session import InteractiveSession
@@ -39,6 +43,9 @@ class InteractiveCommands:
         self.get_client = get_client
         self.ui = ui
         self.renderer = renderer
+        self._pending_media: list[str] = []
+        self._owned_media: set[Path] = set()
+        self._clipboard_dir: Path | None = None
 
     def handle(self, raw: str) -> int | None:
         try:
@@ -55,7 +62,28 @@ class InteractiveCommands:
             return None
         return method(parts[1:])
 
+    @property
+    def pending_media(self) -> list[str]:
+        return list(self._pending_media)
+
+    @property
+    def pending_media_count(self) -> int:
+        return len(self._pending_media)
+
+    def clear_pending_media(self) -> None:
+        self._pending_media.clear()
+        for path in list(self._owned_media):
+            path.unlink(missing_ok=True)
+        self._owned_media.clear()
+        if self._clipboard_dir is not None:
+            shutil.rmtree(self._clipboard_dir, ignore_errors=True)
+            self._clipboard_dir = None
+
+    def close(self) -> None:
+        self.clear_pending_media()
+
     def _cmd_exit(self, argv: list[str]) -> int:
+        self.close()
         return 0
 
     def _cmd_new(self, argv: list[str]) -> None:
@@ -64,6 +92,7 @@ class InteractiveCommands:
         if not self._save_state():
             self.state.current_conversation = previous
             return
+        self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Started a new conversation.")
@@ -77,9 +106,51 @@ class InteractiveCommands:
         if not self._save_state():
             self.state.current_conversation = previous
             return
+        self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(model=self.state.model or "latest frontier · High")
         self.renderer.info("Detached locally. The ChatGPT conversation was not changed.")
+
+    def _cmd_image(self, argv: list[str]) -> None:
+        if argv and argv[0].strip().lower() == "clear":
+            count = self.pending_media_count
+            self.clear_pending_media()
+            self.renderer.info(f"Cleared {count} pending image{'s' if count != 1 else ''}.")
+            return
+
+        raw = " ".join(argv).strip() if argv else self.ui.read_image_path()
+        if not raw:
+            return
+        if not argv:
+            try:
+                parsed = shlex.split(raw)
+            except ValueError as exc:
+                self.renderer.warning(f"Invalid image path: {exc}")
+                return
+            raw = " ".join(parsed)
+        try:
+            media = normalize_media_input(raw)
+        except MediaInputError as exc:
+            self.renderer.warning(str(exc))
+            return
+        if media not in self._pending_media:
+            self._pending_media.append(media)
+        self.renderer.info(f"Attached for next prompt: {Path(media).name or media} · pending: {self.pending_media_count}")
+
+    def _cmd_paste(self, argv: list[str]) -> None:
+        if argv:
+            self.renderer.warning("/paste takes no arguments; it attaches the current clipboard image.")
+            return
+        if self._clipboard_dir is None:
+            self._clipboard_dir = Path(tempfile.mkdtemp(prefix="gptty-clipboard-"))
+        try:
+            path = capture_clipboard_image(self._clipboard_dir)
+        except ClipboardImageError as exc:
+            self.renderer.warning(str(exc))
+            return
+        self._owned_media.add(path)
+        self._pending_media.append(str(path))
+        self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
 
     def _cmd_resume(self, argv: list[str]) -> None:
         client = self.get_client()
@@ -100,6 +171,7 @@ class InteractiveCommands:
             self.state.current_conversation = previous
             return
 
+        self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(
             conversation=attached_ref,

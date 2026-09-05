@@ -60,6 +60,8 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"Actions" in menu
         assert b"/resume" in menu
         assert b"/detach" in menu
+        assert b"/image" in menu
+        assert b"/paste" in menu
         assert b"/model" in menu
         assert b"/help" not in menu
         os.write(master, b"\x1b")
@@ -74,6 +76,17 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"\x1b[2J" in selected
         assert b"\x1b[H" in selected
         assert b"Started a new conversation." in selected
+
+        image = tmp_path / "screen shot.png"
+        image.write_bytes(b"png")
+        os.write(master, f'/image "{image}"\r'.encode())
+        attached = _read_until(master, b"[1 image] ", timeout=5.0)
+        assert b"Attached for next prompt" in attached
+        assert b"[1 image]" in attached
+
+        os.write(master, b"/image clear\r")
+        cleared = _read_until(master, b"Cleared 1 pending image.", timeout=5.0)
+        assert b"Cleared 1 pending image." in cleared
 
         os.write(master, b"/exit\r")
         assert process.wait(timeout=5.0) == 0
