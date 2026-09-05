@@ -10,9 +10,15 @@ from gptty.state import ChatState, load_chat_state, save_chat_state
 
 
 class Response:
-    def __init__(self, text: str = "reply", conversation_id: str | None = "conv-1") -> None:
+    def __init__(
+        self,
+        text: str = "reply",
+        conversation_id: str | None = "conv-1",
+        title: str | None = "Test Chat",
+    ) -> None:
         self.text = text
         self.conversation_id = conversation_id
+        self.title = title
 
 
 class FakeGpttyClient:
@@ -228,7 +234,7 @@ def test_completed_enhanced_turn_notifies_with_chat_and_prompt(tmp_path, monkeyp
     assert code == 0
     assert notified == [
         {
-            "conversation": "conv-1",
+            "chat_title": "Test Chat",
             "prompt": "Which screenshot is this?",
         }
     ]

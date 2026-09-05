@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from gptty.ui import notifications
 
 
-def test_notification_uses_chat_identity_last_prompt_and_sound(monkeypatch) -> None:
+def test_notification_uses_chat_title_last_prompt_and_sound(monkeypatch) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_run(argv, **kwargs):
@@ -16,7 +16,7 @@ def test_notification_uses_chat_identity_last_prompt_and_sound(monkeypatch) -> N
     monkeypatch.setattr(notifications.subprocess, "run", fake_run)
 
     assert notifications.notify_response_complete(
-        conversation="6a9bdfca-78e0-83eb-8746-026cd32ab031",
+        chat_title="  Inspect   Image Bands  ",
         prompt='  Inspect   "this"\nimage please  ',
     ) is True
 
@@ -25,7 +25,7 @@ def test_notification_uses_chat_identity_last_prompt_and_sound(monkeypatch) -> N
     assert "display notification" in argv[2]
     assert 'sound name "Glass"' in argv[2]
     assert argv[3] == 'Inspect "this" image please'
-    assert argv[4] == "gptty · chat …d32ab031"
+    assert argv[4] == "Inspect Image Bands"
     assert len(argv) == 5
     assert kwargs["check"] is False
 
@@ -45,7 +45,7 @@ def test_notification_is_noop_off_macos(monkeypatch) -> None:
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run")),
     )
 
-    assert notifications.notify_response_complete(conversation="abc", prompt="hello") is False
+    assert notifications.notify_response_complete(chat_title="Example Chat", prompt="hello") is False
 
 
 def test_notification_failure_is_best_effort(monkeypatch) -> None:
@@ -56,4 +56,4 @@ def test_notification_failure_is_best_effort(monkeypatch) -> None:
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("missing")),
     )
 
-    assert notifications.notify_response_complete(conversation="abc", prompt="hello") is False
+    assert notifications.notify_response_complete(chat_title="Example Chat", prompt="hello") is False

@@ -307,7 +307,11 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
         ],
     }
     client = FakeClient(snapshots=[running, completed])
-    commands, renderer, _, _ = make_commands(tmp_path, client=client)
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        ui=FakeUI(choices=["conv-1"]),
+        client=client,
+    )
     monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
     notified: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -315,7 +319,7 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
         lambda **kwargs: notified.append(kwargs),
     )
 
-    commands.handle("/resume conv-1")
+    commands.handle("/resume")
 
     message_events = [event for event in renderer.events if event[0] == "messages"]
     assert len(message_events) == 2
@@ -323,7 +327,7 @@ def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> No
     assert any(event[0] == "start_elapsed" for event in renderer.events)
     assert ("finish_elapsed", None) in renderer.events
     assert ("chat_link", "conv-1") in renderer.events
-    assert notified == [{"conversation": "conv-1", "prompt": "question"}]
+    assert notified == [{"chat_title": "First chat", "prompt": "question"}]
     assert [call[0] for call in client.calls].count("snapshot") == 2
 
 

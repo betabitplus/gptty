@@ -46,6 +46,7 @@ class InteractiveCommands:
         self._pending_media: list[str] = []
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
+        self._conversation_titles: dict[str, str] = {}
 
     def handle(self, raw: str) -> int | None:
         try:
@@ -180,7 +181,13 @@ class InteractiveCommands:
         self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
-        self._follow_if_active(client, attached_ref, snapshot, messages)
+        self._follow_if_active(
+            client,
+            attached_ref,
+            snapshot,
+            messages,
+            chat_title=self._conversation_titles.get(attached_ref),
+        )
 
     def _choose_conversation(self, client: Any) -> str | None:
         try:
@@ -189,17 +196,23 @@ class InteractiveCommands:
             self.renderer.warning(f"Conversation list failed: {exc}")
             return None
         current_ref = _canonical_conversation_ref(self.state.current_conversation or "")
-        options = [
-            (
-                conversation_id,
-                _conversation_label(
-                    item,
-                    current=conversation_id == current_ref,
-                ),
+        options: list[tuple[str, str]] = []
+        for item in conversations:
+            conversation_id = _catalog_conversation_id(item)
+            if conversation_id is None:
+                continue
+            title = _field_text(item, "title")
+            if title:
+                self._conversation_titles[conversation_id] = title
+            options.append(
+                (
+                    conversation_id,
+                    _conversation_label(
+                        item,
+                        current=conversation_id == current_ref,
+                    ),
+                )
             )
-            for item in conversations
-            if (conversation_id := _catalog_conversation_id(item)) is not None
-        ]
         if not options:
             self.renderer.info("No ChatGPT conversations found.")
             return None
@@ -267,6 +280,8 @@ class InteractiveCommands:
         ref: str,
         snapshot: Any,
         messages: list[Any],
+        *,
+        chat_title: str | None = None,
     ) -> None:
         status = _snapshot_status(snapshot)
         if status == "awaiting_tool_approval":
@@ -300,7 +315,7 @@ class InteractiveCommands:
                     self.renderer.finish_elapsed()
                     self.renderer.chat_link(ref)
                     notify_response_complete(
-                        conversation=ref,
+                        chat_title=chat_title,
                         prompt=_last_user_message_text(current),
                     )
                     return

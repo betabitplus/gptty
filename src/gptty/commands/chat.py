@@ -75,6 +75,14 @@ def response_text(response: Any) -> str:
     return str(response)
 
 
+def response_title(response: Any) -> str | None:
+    value = response.get("title") if isinstance(response, dict) else getattr(response, "title", None)
+    if not isinstance(value, str):
+        return None
+    title = " ".join(value.split())
+    return title or None
+
+
 def run_chat(
     args: Any,
     *,
@@ -377,7 +385,7 @@ def _send_chat_prompt(
         if renderer is not None:
             renderer.turn_abort()
             if completed_successfully:
-                notify_response_complete(conversation=state.current_conversation, prompt=prompt)
+                notify_response_complete(chat_title=response_title(response), prompt=prompt)
 
 
 def _lock_timeout(args: Any) -> float:
