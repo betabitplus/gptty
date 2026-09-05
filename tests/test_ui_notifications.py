@@ -33,7 +33,7 @@ def test_notification_uses_chat_title_final_response_and_sound(monkeypatch) -> N
 def test_notification_response_is_bounded() -> None:
     body = notifications._notification_response("x" * 400)
 
-    assert len(body) == 160
+    assert len(body) == 240
     assert body.endswith("…")
 
 

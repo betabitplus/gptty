@@ -45,7 +45,7 @@ def _notification_title(chat_title: str | None, *, max_chars: int = 64) -> str:
     return _bounded_preview(text, max_chars=max_chars)
 
 
-def _notification_response(final_response: str | None, *, max_chars: int = 160) -> str:
+def _notification_response(final_response: str | None, *, max_chars: int = 240) -> str:
     if not final_response:
         return "Response complete."
     text = " ".join(str(final_response).split())
