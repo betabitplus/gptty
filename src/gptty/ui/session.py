@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
@@ -12,8 +12,10 @@ from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordComplet
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.shortcuts import CompleteStyle, choice
 
+from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
 
 
@@ -53,6 +55,8 @@ class InteractiveSession:
         self.settings = settings or load_ui_settings(self.settings_file)
         self._prompt_input = prompt_input
         self._prompt_output = prompt_output
+        self._turn_controls: TurnControlSignals | None = None
+        self._working_status: Callable[[], str] | None = None
         self._session: PromptSession[str]
         self._build_session()
 
@@ -70,6 +74,20 @@ class InteractiveSession:
         def _newline(event: Any) -> None:
             event.current_buffer.insert_text("\n")
 
+        @bindings.add(Keys.ControlC)
+        def _control_c(event: Any) -> None:
+            if self._turn_controls is not None:
+                self._turn_controls.request_stop()
+                return
+            event.app.exit(exception=KeyboardInterrupt())
+
+        @bindings.add(Keys.ControlBackslash)
+        def _control_backslash(event: Any) -> None:
+            if self._turn_controls is not None:
+                self._turn_controls.request_quit()
+                return
+            event.app.exit(exception=EOFError())
+
         editing_mode = EditingMode.VI if self.settings.editor == "vi" else EditingMode.EMACS
         kwargs: dict[str, Any] = {
             "history": FileHistory(str(self.history_file)),
@@ -79,7 +97,7 @@ class InteractiveSession:
             "multiline": False,
             "key_bindings": bindings,
             "editing_mode": editing_mode,
-            "bottom_toolbar": " / actions · Ctrl-R history · Alt-Enter newline",
+            "bottom_toolbar": self._bottom_toolbar,
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
@@ -90,6 +108,29 @@ class InteractiveSession:
     def read_prompt(self, *, attachment_count: int = 0) -> str:
         marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
         return self._session.prompt(f"{marker}❯ ")
+
+    async def read_prompt_async(self, *, attachment_count: int = 0) -> str:
+        marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
+        return await self._session.prompt_async(f"{marker}❯ ", refresh_interval=1.0)
+
+    def set_active_turn(
+        self,
+        controls: TurnControlSignals | None,
+        *,
+        working_status: Callable[[], str] | None = None,
+    ) -> None:
+        self._turn_controls = controls
+        self._working_status = working_status if controls is not None else None
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
+
+    def _bottom_toolbar(self) -> str:
+        if self._turn_controls is not None:
+            status = self._working_status() if self._working_status is not None else "working"
+            return f" {status} · / commands · Ctrl-C stop · Ctrl-\\ quit"
+        return " / actions · Ctrl-R history · Alt-Enter newline"
 
     def read_image_path(self) -> str | None:
         kwargs: dict[str, Any] = {

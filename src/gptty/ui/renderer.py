@@ -80,13 +80,14 @@ class PrettyRenderer:
         self.console.clear()
         self.state = RenderState()
 
-    def turn_start(self) -> None:
+    def turn_start(self, *, show_elapsed: bool = True) -> None:
         if self.state.turn_active:
             self.console.print()
         self.console.print(Rule("working", style="dim"))
         self.console.print()
         self.state = RenderState(last_block="boundary", turn_active=True)
-        self.start_elapsed()
+        if show_elapsed:
+            self.start_elapsed()
 
     def start_elapsed(self, *, initial_elapsed: float = 0.0) -> None:
         self._stop_elapsed(label="stopped")

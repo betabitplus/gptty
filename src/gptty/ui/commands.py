@@ -114,6 +114,9 @@ class InteractiveCommands:
             return None
         return self._automatic_prompts.pop(0)
 
+    def clear_automatic_prompts(self) -> None:
+        self._automatic_prompts.clear()
+
     def prepare_goal_user_prompt(self, prompt: str) -> str:
         if not self.goal_active:
             return prompt
@@ -226,6 +229,22 @@ class InteractiveCommands:
         self._temporary_messages.append(OutputMessage(role="user", text=prompt))
         if answer:
             self._temporary_messages.append(OutputMessage(role="assistant", text=answer))
+
+    def take_pending_media(self) -> list[str]:
+        media = list(self._pending_media)
+        self._pending_media.clear()
+        return media
+
+    def release_media(self, media: list[str]) -> None:
+        for raw in media:
+            path = Path(raw)
+            if path not in self._owned_media:
+                continue
+            path.unlink(missing_ok=True)
+            self._owned_media.discard(path)
+        if self._clipboard_dir is not None and not self._owned_media:
+            shutil.rmtree(self._clipboard_dir, ignore_errors=True)
+            self._clipboard_dir = None
 
     def clear_pending_media(self) -> None:
         self._pending_media.clear()

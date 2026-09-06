@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import shlex
 import sys
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
+
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..locks import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -34,6 +42,45 @@ CHAT_HELP = """Commands:
 """
 
 LOCAL_QUIT_CODE = 97
+
+
+@dataclass
+class _EnhancedLoopOutcome:
+    exit_code: int | None = None
+    command: str | None = None
+
+
+@dataclass
+class _EnhancedTurn:
+    task: asyncio.Task[int]
+    controls: TurnControlSignals
+    result: dict[str, Any]
+    goal_turn: bool
+    media: list[str]
+    started_at: float
+    pause_goal_after_turn: bool = False
+    exit_after_turn: bool = False
+
+
+class _PromptAwareStream:
+    """Write through prompt_toolkit's patched stdio only while its app is active."""
+
+    def __init__(self, base: TextIO, *, stream_name: str) -> None:
+        self._base = base
+        self._stream_name = stream_name
+
+    def _target(self) -> TextIO:
+        current = getattr(sys, self._stream_name)
+        return current if current is not self._base else self._base
+
+    def write(self, text: str) -> int:
+        return self._target().write(text)
+
+    def flush(self) -> None:
+        self._target().flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
 
 
 CONVERSATION_REF_FIELDS = (
@@ -150,7 +197,14 @@ def run_chat(
             settings_file=ui_settings_path(state_path),
             settings=ui_settings,
         )
-        renderer = PrettyRenderer(stdout, ui_settings)
+        prompt_patch_enabled = stdout is sys.stdout or stderr is sys.stderr
+        renderer_stdout: TextIO = (
+            _PromptAwareStream(stdout, stream_name="stdout") if stdout is sys.stdout else stdout
+        )
+        renderer_stderr: TextIO = (
+            _PromptAwareStream(stderr, stream_name="stderr") if stderr is sys.stderr else stderr
+        )
+        renderer = PrettyRenderer(renderer_stdout, ui_settings)
         interactive_commands = InteractiveCommands(
             state=state,
             state_path=state_path,
@@ -165,6 +219,39 @@ def run_chat(
         )
         if startup_goal_paused and state.goal is not None:
             renderer.info("Goal · paused after restart · use /goal resume")
+        queued_prompts: deque[str] = deque()
+        while True:
+            outcome = _run_enhanced_loop(
+                args=args,
+                state=state,
+                state_path=state_path,
+                get_client=get_client,
+                ui=ui,
+                renderer=renderer,
+                commands=interactive_commands,
+                queued_prompts=queued_prompts,
+                stdout=renderer_stdout,
+                stderr=renderer_stderr,
+                patch_stdout_enabled=prompt_patch_enabled,
+            )
+            if outcome.exit_code is not None:
+                interactive_commands.close()
+                return outcome.exit_code
+            prompt = (outcome.command or "").strip()
+            if not prompt:
+                continue
+            if prompt == "/":
+                selected = ui.choose_command()
+                if not selected:
+                    continue
+                prompt = selected
+            if not prompt.startswith("/"):
+                queued_prompts.append(prompt)
+                continue
+            result = interactive_commands.handle(prompt)
+            if result is not None:
+                interactive_commands.close()
+                return result
 
     while True:
         automatic_prompt = interactive_commands.pop_automatic_prompt() if interactive_commands is not None else None
@@ -279,6 +366,401 @@ def run_chat(
             interactive_commands.clear_pending_media()
         if interactive_commands is not None and goal_turn:
             interactive_commands.handle_goal_turn_result(turn_result)
+
+
+def _run_enhanced_loop(
+    *,
+    args: Any,
+    state: ChatState,
+    state_path: Path,
+    get_client: Callable[[], Any],
+    ui: InteractiveSession,
+    renderer: PrettyRenderer,
+    commands: InteractiveCommands,
+    queued_prompts: deque[str],
+    stdout: TextIO,
+    stderr: TextIO,
+    patch_stdout_enabled: bool,
+) -> _EnhancedLoopOutcome:
+    return asyncio.run(
+        _run_enhanced_loop_async(
+            args=args,
+            state=state,
+            state_path=state_path,
+            get_client=get_client,
+            ui=ui,
+            renderer=renderer,
+            commands=commands,
+            queued_prompts=queued_prompts,
+            stdout=stdout,
+            stderr=stderr,
+            patch_stdout_enabled=patch_stdout_enabled,
+        )
+    )
+
+
+async def _run_enhanced_loop_async(
+    *,
+    args: Any,
+    state: ChatState,
+    state_path: Path,
+    get_client: Callable[[], Any],
+    ui: InteractiveSession,
+    renderer: PrettyRenderer,
+    commands: InteractiveCommands,
+    queued_prompts: deque[str],
+    stdout: TextIO,
+    stderr: TextIO,
+    patch_stdout_enabled: bool,
+) -> _EnhancedLoopOutcome:
+    output_context = patch_stdout(raw=True) if patch_stdout_enabled else nullcontext()
+    with output_context:
+        return await _enhanced_loop_core(
+            args=args,
+            state=state,
+            state_path=state_path,
+            get_client=get_client,
+            ui=ui,
+            renderer=renderer,
+            commands=commands,
+            queued_prompts=queued_prompts,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+async def _enhanced_loop_core(
+    *,
+    args: Any,
+    state: ChatState,
+    state_path: Path,
+    get_client: Callable[[], Any],
+    ui: InteractiveSession,
+    renderer: PrettyRenderer,
+    commands: InteractiveCommands,
+    queued_prompts: deque[str],
+    stdout: TextIO,
+    stderr: TextIO,
+) -> _EnhancedLoopOutcome:
+    active: _EnhancedTurn | None = None
+    prompt_task: asyncio.Task[str] | None = None
+    accepting_input = True
+
+    while True:
+        if active is None:
+            next_prompt: str | None = None
+            automatic_turn = False
+            if queued_prompts:
+                commands.clear_automatic_prompts()
+                next_prompt = queued_prompts.popleft()
+            else:
+                next_prompt = commands.pop_automatic_prompt()
+                automatic_turn = next_prompt is not None
+            if next_prompt is not None:
+                active = _start_enhanced_turn(
+                    args=args,
+                    state=state,
+                    state_path=state_path,
+                    get_client=get_client,
+                    ui=ui,
+                    renderer=renderer,
+                    commands=commands,
+                    queued_prompts=queued_prompts,
+                    stdout=stdout,
+                    stderr=stderr,
+                    prompt=next_prompt,
+                    automatic_turn=automatic_turn,
+                )
+
+        if prompt_task is None and accepting_input:
+            prompt_task = asyncio.create_task(
+                ui.read_prompt_async(attachment_count=commands.pending_media_count)
+            )
+
+        wait_for: set[asyncio.Task[Any]] = set()
+        if prompt_task is not None:
+            wait_for.add(prompt_task)
+        if active is not None:
+            wait_for.add(active.task)
+        if not wait_for:
+            return _EnhancedLoopOutcome(exit_code=0)
+
+        done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
+
+        if prompt_task is not None and prompt_task in done:
+            finished_prompt = prompt_task
+            prompt_task = None
+            try:
+                raw = finished_prompt.result()
+            except KeyboardInterrupt:
+                if active is None:
+                    return _EnhancedLoopOutcome(exit_code=130)
+                active.controls.request_stop()
+            except EOFError:
+                if active is None:
+                    return _EnhancedLoopOutcome(exit_code=0)
+                active.controls.request_quit()
+                accepting_input = False
+            else:
+                prompt = raw.strip()
+                if prompt:
+                    if active is None:
+                        if prompt.startswith("/"):
+                            return _EnhancedLoopOutcome(command=prompt)
+                        queued_prompts.append(prompt)
+                    else:
+                        accepting_input = _handle_working_input(
+                            prompt,
+                            active=active,
+                            commands=commands,
+                            renderer=renderer,
+                            queued_prompts=queued_prompts,
+                        )
+                        _refresh_active_turn_ui(ui, active, queued_prompts)
+
+        if active is not None and active.task in done:
+            finished_turn = active
+            active = None
+            await asyncio.sleep(0)
+            ui.set_active_turn(None)
+            commands.release_media(finished_turn.media)
+            outcome = await _finish_enhanced_turn(
+                finished_turn,
+                commands=commands,
+                renderer=renderer,
+                stderr=stderr,
+                prompt_task=prompt_task,
+                queued_prompts=queued_prompts,
+            )
+            if outcome is not None:
+                return outcome
+            accepting_input = True
+
+
+async def _finish_enhanced_turn(
+    turn: _EnhancedTurn,
+    *,
+    commands: InteractiveCommands,
+    renderer: PrettyRenderer,
+    stderr: TextIO,
+    prompt_task: asyncio.Task[str] | None,
+    queued_prompts: deque[str],
+) -> _EnhancedLoopOutcome | None:
+    try:
+        code = turn.task.result()
+    except BaseException as exc:  # noqa: BLE001 - async orchestration boundary.
+        renderer.turn_abort()
+        print(f"gptty: chat request failed: {exc}", file=stderr)
+        await _cancel_prompt_task(prompt_task)
+        return _EnhancedLoopOutcome(exit_code=1)
+
+    if code == LOCAL_QUIT_CODE:
+        if turn.goal_turn:
+            commands.pause_goal_for_local_quit()
+        await _cancel_prompt_task(prompt_task)
+        return _EnhancedLoopOutcome(exit_code=0)
+    if code != 0:
+        if turn.goal_turn:
+            commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
+        await _cancel_prompt_task(prompt_task)
+        return _EnhancedLoopOutcome(exit_code=code)
+
+    if turn.result.get("stopped_by_user"):
+        queued_count = len(queued_prompts)
+        queued_prompts.clear()
+        commands.clear_automatic_prompts()
+        if queued_count:
+            renderer.info(f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after Stop.")
+
+    if turn.goal_turn:
+        commands.handle_goal_turn_result(turn.result)
+        if turn.pause_goal_after_turn and commands.goal_active:
+            commands.handle("/goal pause")
+
+    if turn.exit_after_turn or turn.controls.quit_requested.is_set():
+        if turn.goal_turn and commands.goal_active:
+            commands.pause_goal_for_local_quit()
+        await _cancel_prompt_task(prompt_task)
+        return _EnhancedLoopOutcome(exit_code=0)
+    return None
+
+
+async def _cancel_prompt_task(task: asyncio.Task[str] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, KeyboardInterrupt, EOFError):
+        pass
+
+
+def _start_enhanced_turn(
+    *,
+    args: Any,
+    state: ChatState,
+    state_path: Path,
+    get_client: Callable[[], Any],
+    ui: InteractiveSession,
+    renderer: PrettyRenderer,
+    commands: InteractiveCommands,
+    queued_prompts: deque[str],
+    stdout: TextIO,
+    stderr: TextIO,
+    prompt: str,
+    automatic_turn: bool,
+) -> _EnhancedTurn:
+    if automatic_turn:
+        media: list[str] = []
+    else:
+        prompt = commands.prepare_goal_user_prompt(prompt)
+        media = commands.take_pending_media()
+
+    conversation_mode = commands.conversation_mode
+    attached_ref = commands.conversation_ref
+    goal_turn = commands.goal_active
+    turn_result: dict[str, Any] = {}
+    controls = TurnControlSignals()
+    started_at = time.monotonic()
+    renderer.turn_start(show_elapsed=False)
+
+    loop = asyncio.get_running_loop()
+
+    def stop_confirmed(ref: str | None) -> None:
+        loop.call_soon_threadsafe(commands.pause_goal_after_user_stop, ref)
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _send_chat_prompt,
+            get_client(),
+            state=state,
+            state_path=state_path,
+            profile=getattr(args, "profile", None),
+            prompt=prompt,
+            model=state.model,
+            media=media or None,
+            stream=not bool(getattr(args, "no_stream", False)),
+            lock_timeout=_lock_timeout(args),
+            explicit_lock_wait=bool(getattr(args, "wait_lock", False))
+            or getattr(args, "lock_timeout", None) is not None,
+            stdout=stdout,
+            stderr=stderr,
+            renderer=renderer,
+            turn_controls=controls,
+            conversation_mode=conversation_mode,
+            attached_ref=attached_ref,
+            temporary_turn_recorder=(
+                commands.record_temporary_turn if conversation_mode == "temporary" else None
+            ),
+            notify_completion=not goal_turn,
+            result_out=turn_result,
+            on_stop_confirmed=stop_confirmed if goal_turn else None,
+        )
+    )
+    active = _EnhancedTurn(
+        task=task,
+        controls=controls,
+        result=turn_result,
+        goal_turn=goal_turn,
+        media=media,
+        started_at=started_at,
+    )
+    _refresh_active_turn_ui(ui, active, queued_prompts)
+    return active
+
+
+def _refresh_active_turn_ui(
+    ui: InteractiveSession,
+    active: _EnhancedTurn,
+    queued_prompts: deque[str],
+) -> None:
+    ui.set_active_turn(
+        active.controls,
+        working_status=lambda: _working_status(active.started_at, len(queued_prompts)),
+    )
+
+
+def _working_status(started_at: float, queued_count: int) -> str:
+    elapsed = max(0, int(time.monotonic() - started_at))
+    minutes, seconds = divmod(elapsed, 60)
+    status = f"working {minutes:02d}:{seconds:02d}"
+    if queued_count:
+        status += f" · queued {queued_count}"
+    return status
+
+
+def _handle_working_input(
+    prompt: str,
+    *,
+    active: _EnhancedTurn,
+    commands: InteractiveCommands,
+    renderer: PrettyRenderer,
+    queued_prompts: deque[str],
+) -> bool:
+    if not prompt.startswith("/"):
+        queued_prompts.append(prompt)
+        renderer.info(f"Queued · {len(queued_prompts)}")
+        return True
+
+    if prompt == "/":
+        renderer.info(
+            "While working: /stop · /exit · /goal pause · /goal status · /image PATH · /paste"
+        )
+        return True
+
+    try:
+        parts = shlex.split(prompt)
+    except ValueError as exc:
+        renderer.warning(f"Invalid command: {exc}")
+        return True
+    if not parts:
+        return True
+    name = parts[0].lstrip("/").lower()
+    argv = parts[1:]
+
+    if name == "stop":
+        if argv:
+            renderer.warning("/stop takes no arguments.")
+            return True
+        active.controls.request_stop()
+        return True
+
+    if name in {"exit", "quit"}:
+        if argv:
+            renderer.warning(f"/{name} takes no arguments.")
+            return True
+        active.exit_after_turn = True
+        active.controls.request_quit()
+        return False
+
+    if name == "goal":
+        action = argv[0].lower() if len(argv) == 1 else ""
+        if action == "pause" and active.goal_turn and commands.goal_active:
+            active.pause_goal_after_turn = True
+            renderer.info("Goal · pause pending · current turn will finish")
+            return True
+        if action == "status" or (not argv and commands.goal_active):
+            if active.pause_goal_after_turn:
+                renderer.info("Goal · active · pause pending")
+            else:
+                commands.handle(prompt)
+            return True
+        renderer.warning("While working, only /goal pause and /goal status are available.")
+        return True
+
+    if name == "image":
+        if not argv:
+            renderer.warning("While working, use /image PATH or /image clear.")
+            return True
+        commands.handle(prompt)
+        return True
+
+    if name == "paste":
+        commands.handle(prompt)
+        return True
+
+    renderer.warning(f"/{name} is unavailable while working; stop the current response first.")
+    return True
 
 
 def _handle_chat_command(
