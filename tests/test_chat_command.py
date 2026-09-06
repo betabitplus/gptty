@@ -376,6 +376,76 @@ def test_ctrl_c_stops_active_turn_and_keeps_new_chat_attached(tmp_path, monkeypa
     assert notified == []
 
 
+def test_second_ctrl_c_after_confirmed_stop_exits_local_readback_wait(tmp_path, monkeypatch) -> None:
+    class StopClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            return {"ok": True, "stopped": True, "conversationId": "conv-stopped"}
+
+    controls = TurnControlSignals()
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.alive = True
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            controls.request_stop()
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events = []
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    monkeypatch.setattr("gptty.commands.chat.threading.Thread", FakeThread)
+    client = StopClient()
+    renderer = FakeRenderer()
+    state = ChatState()
+    confirmed = []
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="keep going",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        turn_controls=controls,
+        on_stop_confirmed=confirmed.append,
+    )
+
+    assert code == LOCAL_QUIT_CODE
+    assert client.calls == [("stop_generation", None)]
+    assert confirmed == ["conv-stopped"]
+    assert state.current_conversation == "conv-stopped"
+    assert ("info", "ChatGPT stopped; finalizing local readback…") in renderer.events
+    assert (
+        "info",
+        "ChatGPT is already stopped; exiting gptty without waiting for local readback.",
+    ) in renderer.events
+
+
 def test_ctrl_c_reconciles_saved_partial_after_stop_aborts_browser_fetch(tmp_path, monkeypatch) -> None:
     class StopAbortClient:
         def __init__(self) -> None:

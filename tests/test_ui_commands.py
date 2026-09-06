@@ -711,6 +711,16 @@ def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -
     notified: list[dict[str, object]] = []
     monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
 
+    commands.pause_goal_after_user_stop("conv-1")
+
+    assert state.goal is not None
+    assert state.goal.status == "paused"
+    assert state.goal.reason == "stopped by user"
+    assert state.goal.turn_count == 1
+    assert commands.has_automatic_prompt is False
+    assert notified == []
+    assert renderer.events.count(("info", "Goal · paused · stopped by user")) == 1
+
     commands.handle_goal_turn_result(
         {
             "text": "GPTTY_GOAL: CONTINUE\nPartial response",
@@ -719,13 +729,8 @@ def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -
             "stopped_by_user": True,
         }
     )
-
-    assert state.goal is not None
-    assert state.goal.status == "paused"
-    assert state.goal.reason == "stopped by user"
-    assert commands.has_automatic_prompt is False
-    assert notified == []
-    assert ("info", "Goal · paused · stopped by user") in renderer.events
+    assert state.goal.turn_count == 1
+    assert renderer.events.count(("info", "Goal · paused · stopped by user")) == 1
 
 
 def test_goal_pause_resume_clear_and_context_switch_are_safe(tmp_path) -> None:

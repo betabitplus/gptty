@@ -119,6 +119,23 @@ class InteractiveCommands:
             return prompt
         return steering_prompt(prompt)
 
+    def pause_goal_after_user_stop(self, conversation_ref: str | None) -> None:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return
+        normalized_ref = str(conversation_ref or "").strip() or None
+        if goal.conversation_ref is None and normalized_ref:
+            goal.conversation_ref = normalized_ref
+        if goal.conversation_ref and normalized_ref and goal.conversation_ref != normalized_ref:
+            self._interrupt_goal("conversation changed while stopping goal", notify=True)
+            return
+        goal.turn_count += 1
+        goal.status = "paused"
+        goal.reason = "stopped by user"
+        self._automatic_prompts.clear()
+        self._save_state()
+        self.renderer.info("Goal · paused · stopped by user")
+
     def handle_goal_turn_result(self, result: dict[str, Any]) -> None:
         goal = self.state.goal
         if goal is None or goal.status != "active":

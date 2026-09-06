@@ -257,6 +257,11 @@ def run_chat(
                 ),
                 notify_completion=not goal_turn,
                 result_out=turn_result,
+                on_stop_confirmed=(
+                    interactive_commands.pause_goal_after_user_stop
+                    if goal_turn and interactive_commands is not None
+                    else None
+                ),
             )
         if code == LOCAL_QUIT_CODE:
             if interactive_commands is not None:
@@ -324,6 +329,7 @@ def _send_chat_prompt(
     temporary_turn_recorder: Callable[..., None] | None = None,
     notify_completion: bool = True,
     result_out: dict[str, Any] | None = None,
+    on_stop_confirmed: Callable[[str | None], None] | None = None,
 ) -> int:
     if result_out is not None:
         result_out.clear()
@@ -450,8 +456,10 @@ def _send_chat_prompt(
                 if not controls.consume_stop():
                     continue
                 if stopped_by_user:
-                    renderer.info("Stop already requested; waiting for ChatGPT to save the partial response…")
-                    continue
+                    local_quit_requested = True
+                    renderer.turn_abort()
+                    renderer.info("ChatGPT is already stopped; exiting gptty without waiting for local readback.")
+                    return LOCAL_QUIT_CODE
                 renderer.info("Stopping ChatGPT…")
                 try:
                     stop_result = client.stop_generation(active_ref, timeout=30.0)
@@ -486,8 +494,10 @@ def _send_chat_prompt(
                             save_chat_state(state_path, state)
                         except StateError as exc:
                             renderer.warning(str(exc))
+                if on_stop_confirmed is not None:
+                    on_stop_confirmed(active_ref)
                 renderer.turn_abort()
-                renderer.info("Stop requested; waiting for ChatGPT to save the partial response…")
+                renderer.info("ChatGPT stopped; finalizing local readback…")
 
             if controls.quit_requested.is_set():
                 local_quit_requested = True
