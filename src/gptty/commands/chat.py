@@ -27,7 +27,7 @@ from ..output import normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
-from ..ui.commands import InteractiveCommands
+from ..ui.commands import InteractiveCommands, ResumeRequest
 from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
@@ -60,6 +60,12 @@ class _EnhancedTurn:
     started_at: float
     pause_goal_after_turn: bool = False
     exit_after_turn: bool = False
+
+
+@dataclass
+class _EnhancedResume:
+    request: ResumeRequest
+    future: asyncio.Future[tuple[bool, Any]]
 
 
 class _PromptAwareStream:
@@ -457,11 +463,18 @@ async def _enhanced_loop_core(
     stderr: TextIO,
 ) -> _EnhancedLoopOutcome:
     active: _EnhancedTurn | None = None
+    active_resume: _EnhancedResume | None = None
     prompt_task: asyncio.Task[str] | None = None
     accepting_input = True
 
     while True:
-        if active is None:
+        if active is None and active_resume is None and commands.has_pending_resume:
+            active_resume = _start_enhanced_resume(
+                get_client=get_client,
+                commands=commands,
+            )
+
+        if active is None and active_resume is None:
             next_prompt: str | None = None
             automatic_turn = False
             if queued_prompts:
@@ -491,11 +504,13 @@ async def _enhanced_loop_core(
                 ui.read_prompt_async(attachment_count=commands.pending_media_count)
             )
 
-        wait_for: set[asyncio.Task[Any]] = set()
+        wait_for: set[asyncio.Future[Any]] = set()
         if prompt_task is not None:
             wait_for.add(prompt_task)
         if active is not None:
             wait_for.add(active.task)
+        if active_resume is not None:
+            wait_for.add(active_resume.future)
         if not wait_for:
             return _EnhancedLoopOutcome(exit_code=0)
 
@@ -507,21 +522,35 @@ async def _enhanced_loop_core(
             try:
                 raw = finished_prompt.result()
             except KeyboardInterrupt:
-                if active is None:
+                if active is not None:
+                    active.controls.request_stop()
+                elif active_resume is not None:
+                    renderer.info("Conversation is still loading; use Ctrl-\\ or /exit to exit gptty.")
+                else:
                     return _EnhancedLoopOutcome(exit_code=130)
-                active.controls.request_stop()
             except EOFError:
                 if active is None:
+                    if active_resume is not None:
+                        commands.pause_goal_for_local_quit()
                     return _EnhancedLoopOutcome(exit_code=0)
                 active.controls.request_quit()
                 accepting_input = False
             else:
                 prompt = raw.strip()
                 if prompt:
-                    if active is None:
+                    if active is None and active_resume is None:
                         if prompt.startswith("/"):
                             return _EnhancedLoopOutcome(command=prompt)
                         queued_prompts.append(prompt)
+                    elif active_resume is not None and active is None:
+                        outcome = _handle_resume_loading_input(
+                            prompt,
+                            commands=commands,
+                            renderer=renderer,
+                            queued_prompts=queued_prompts,
+                        )
+                        if outcome is not None:
+                            return outcome
                     else:
                         accepting_input = _handle_working_input(
                             prompt,
@@ -531,6 +560,25 @@ async def _enhanced_loop_core(
                             queued_prompts=queued_prompts,
                         )
                         _refresh_active_turn_ui(ui, active, queued_prompts)
+
+        if active_resume is not None and active_resume.future in done:
+            finished_resume = active_resume
+            active_resume = None
+            ok, payload = finished_resume.future.result()
+            resumed = False
+            if ok:
+                resumed = commands.complete_resume(finished_resume.request, payload)
+            else:
+                commands.fail_resume(finished_resume.request, payload)
+            if not resumed:
+                queued_count = len(queued_prompts)
+                queued_prompts.clear()
+                commands.clear_automatic_prompts()
+                if queued_count:
+                    renderer.info(
+                        f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after failed resume."
+                    )
+            accepting_input = True
 
         if active is not None and active.task in done:
             finished_turn = active
@@ -549,6 +597,84 @@ async def _enhanced_loop_core(
             if outcome is not None:
                 return outcome
             accepting_input = True
+
+
+def _start_enhanced_resume(
+    *,
+    get_client: Callable[[], Any],
+    commands: InteractiveCommands,
+) -> _EnhancedResume | None:
+    request = commands.take_pending_resume()
+    if request is None:
+        return None
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[bool, Any]] = loop.create_future()
+    client = get_client()
+
+    def publish(result: tuple[bool, Any]) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def worker() -> None:
+        try:
+            result: tuple[bool, Any] = (
+                True,
+                client.conversation_snapshot(request.conversation_ref),
+            )
+        except BaseException as exc:  # noqa: BLE001 - background resume boundary.
+            result = (False, exc)
+        try:
+            loop.call_soon_threadsafe(publish, result)
+        except RuntimeError:
+            # The user may exit while a slow snapshot is still finishing. The
+            # daemon worker must never keep gptty alive or touch a closed loop.
+            pass
+
+    threading.Thread(
+        target=worker,
+        name="gptty-resume-snapshot",
+        daemon=True,
+    ).start()
+    return _EnhancedResume(request=request, future=future)
+
+
+def _handle_resume_loading_input(
+    prompt: str,
+    *,
+    commands: InteractiveCommands,
+    renderer: PrettyRenderer,
+    queued_prompts: deque[str],
+) -> _EnhancedLoopOutcome | None:
+    if not prompt.startswith("/"):
+        queued_prompts.append(prompt)
+        renderer.info(f"Queued · {len(queued_prompts)}")
+        return None
+
+    try:
+        parts = shlex.split(prompt)
+    except ValueError as exc:
+        renderer.warning(f"Invalid command: {exc}")
+        return None
+    if not parts:
+        return None
+
+    name = parts[0].lstrip("/").lower()
+    argv = parts[1:]
+    if name in {"exit", "quit"}:
+        if argv:
+            renderer.warning(f"/{name} takes no arguments.")
+            return None
+        result = commands.handle("/exit")
+        return _EnhancedLoopOutcome(exit_code=0 if result is None else result)
+    if name == "":
+        renderer.info("While loading a conversation: /exit · Ctrl-\\ quit")
+        return None
+
+    renderer.warning(
+        f"/{name} is unavailable while the conversation is loading; queued text will send after resume."
+    )
+    return None
 
 
 async def _finish_enhanced_turn(
@@ -848,6 +974,7 @@ def _send_chat_prompt(
     local_quit_requested = False
     incomplete_turn = False
     write_committed = threading.Event()
+    write_conversation_ref: str | None = None
     controls = turn_controls or TurnControlSignals()
     if conversation_mode not in {"normal", "temporary"}:
         raise ValueError(f"unsupported conversation mode: {conversation_mode}")
@@ -872,7 +999,11 @@ def _send_chat_prompt(
             print(token, end="", file=stdout, flush=True)
 
     def on_event(event: dict[str, Any]) -> None:
+        nonlocal write_conversation_ref
         if event.get("type") == "browser_native_write_completed":
+            candidate = event.get("conversation_id") or event.get("conversationId")
+            if isinstance(candidate, str) and candidate.strip() and not candidate.strip().startswith("WEB:"):
+                write_conversation_ref = candidate.strip()
             write_committed.set()
         if stopped_by_user or local_quit_requested:
             return
@@ -882,6 +1013,20 @@ def _send_chat_prompt(
         rendered = render_live_event(event)
         if rendered:
             print(rendered, file=stderr, flush=True)
+
+    def persist_committed_conversation_for_local_quit() -> None:
+        nonlocal active_ref
+        if is_temporary or state.current_conversation or not write_conversation_ref:
+            return
+        state.current_conversation = write_conversation_ref
+        active_ref = write_conversation_ref
+        try:
+            save_chat_state(state_path, state)
+        except StateError as exc:
+            if renderer is not None:
+                renderer.warning(str(exc))
+            else:
+                print(str(exc), file=stderr)
 
     options: dict[str, Any] = {"stream": stream}
     if model:
@@ -954,6 +1099,7 @@ def _send_chat_prompt(
                 worker.join(timeout=0.1)
                 if controls.quit_requested.is_set():
                     if write_committed.is_set():
+                        persist_committed_conversation_for_local_quit()
                         local_quit_requested = True
                         renderer.turn_abort()
                         renderer.info("Exited gptty; ChatGPT response continues in browser.")
@@ -1008,6 +1154,7 @@ def _send_chat_prompt(
                 renderer.info("ChatGPT stopped; finalizing local readback…")
 
             if controls.quit_requested.is_set():
+                persist_committed_conversation_for_local_quit()
                 local_quit_requested = True
                 renderer.turn_abort()
                 renderer.info("Exited gptty; ChatGPT response continues in browser.")

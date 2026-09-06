@@ -599,3 +599,174 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(tmp_path, monkeyp
     assert state.goal is not None
     assert state.goal.status == "interrupted"
     assert state.goal.reason == "ChatGPT stream ended without a final answer"
+
+
+def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, monkeypatch) -> None:
+    class SlowResumeClient:
+        instances: list["SlowResumeClient"] = []
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.snapshot_active = False
+            self.__class__.instances.append(self)
+
+        def conversation_snapshot(self, ref: str):
+            self.calls.append(("snapshot", ref))
+            self.snapshot_active = True
+            self.__class__.snapshot_started.set()
+            assert self.__class__.release_snapshot.wait(timeout=2)
+            self.snapshot_active = False
+            return {
+                "status": SimpleNamespace(status="completed"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "old question"},
+                    {"message_id": "a1", "role": "assistant", "text": "old answer"},
+                ],
+            }
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            assert not self.snapshot_active, "send must not overlap the resume snapshot"
+            self.calls.append(("send_to_conversation", ref))
+            return SimpleNamespace(
+                text="queued reply",
+                conversation_id=ref,
+                title="Resumed chat",
+            )
+
+    SlowResumeClient.instances.clear()
+    SlowResumeClient.snapshot_started.clear()
+    SlowResumeClient.release_snapshot.clear()
+    _FakeRenderer.instances.clear()
+
+    def queued_send_finished() -> bool:
+        if _FakeRenderer.instances and ("info", "Queued · 1") in _FakeRenderer.instances[0].events:
+            SlowResumeClient.release_snapshot.set()
+        if not SlowResumeClient.instances:
+            return False
+        return any(call[0] == "send_to_conversation" for call in SlowResumeClient.instances[0].calls)
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-resume",
+            (lambda: SlowResumeClient.snapshot_started.is_set(), "queued after resume"),
+            (queued_send_finished, "/exit"),
+        ]
+    )
+    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=SlowResumeClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = SlowResumeClient.instances[0]
+    assert client.calls == [
+        ("snapshot", "conv-resume"),
+        ("send_to_conversation", "conv-resume"),
+    ]
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-resume"
+
+
+def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeypatch) -> None:
+    class BlockingResumeClient:
+        instances: list["BlockingResumeClient"] = []
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.__class__.instances.append(self)
+
+        def conversation_snapshot(self, ref: str):
+            self.calls.append(("snapshot", ref))
+            self.__class__.snapshot_started.set()
+            self.__class__.release_snapshot.wait(timeout=5)
+            return {"status": SimpleNamespace(status="completed"), "messages": []}
+
+    BlockingResumeClient.instances.clear()
+    BlockingResumeClient.snapshot_started.clear()
+    BlockingResumeClient.release_snapshot.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            "/resume conv-slow",
+            (lambda: BlockingResumeClient.snapshot_started.is_set(), "/exit"),
+        ]
+    )
+    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    try:
+        code = run_chat(
+            _args(tmp_path),
+            client_factory=BlockingResumeClient,
+            input_stream=StringIO(),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+    finally:
+        BlockingResumeClient.release_snapshot.set()
+
+    assert code == 0
+    assert BlockingResumeClient.snapshot_started.is_set()
+    assert load_chat_state(tmp_path / "state.json").current_conversation is None
+
+
+def test_unfinished_resume_returns_to_prompt_without_polling(tmp_path, monkeypatch) -> None:
+    class UnfinishedResumeClient:
+        instances: list["UnfinishedResumeClient"] = []
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.__class__.instances.append(self)
+
+        def conversation_snapshot(self, ref: str):
+            self.calls.append(("snapshot", ref))
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "old question"},
+                    {"message_id": "t1", "role": "tool", "text": "old tool output"},
+                ],
+            }
+
+    UnfinishedResumeClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            "/resume conv-stale",
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    event[0] == "warning" and "unfinished turn (status=tool_running)" in str(event[1])
+                    for event in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=UnfinishedResumeClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = UnfinishedResumeClient.instances[0]
+    assert client.calls == [("snapshot", "conv-stale")]
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"

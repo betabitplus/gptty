@@ -622,6 +622,85 @@ def test_ctrl_backslash_exits_locally_without_stopping_chat(tmp_path, monkeypatc
     assert ("info", "Exited gptty; ChatGPT response continues in browser.") in renderer.events
 
 
+def test_ctrl_backslash_persists_new_conversation_after_safe_handoff(tmp_path, monkeypatch) -> None:
+    class ContinueClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send(self, prompt, **options):
+            self.calls.append(("send", prompt))
+            options["on_event"](
+                {
+                    "type": "browser_native_write_completed",
+                    "conversation_id": "conv-new-running",
+                }
+            )
+            return Response(text="eventual answer", conversation_id="conv-new-running")
+
+    controls = TurnControlSignals()
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.alive = True
+            self.joins = 0
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.joins += 1
+            if self.joins == 1:
+                controls.request_quit()
+                return
+            self.target()
+            self.alive = False
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    monkeypatch.setattr("gptty.commands.chat.threading.Thread", FakeThread)
+    client = ContinueClient()
+    renderer = FakeRenderer()
+    state = ChatState()
+    state_path = tmp_path / "state.json"
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=state_path,
+        profile=None,
+        prompt="start and keep going",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        turn_controls=controls,
+    )
+
+    assert code == LOCAL_QUIT_CODE
+    assert client.calls == [("send", "start and keep going")]
+    assert state.current_conversation == "conv-new-running"
+    assert load_chat_state(state_path).current_conversation == "conv-new-running"
+    assert ("info", "Waiting for safe ChatGPT handoff before local exit…") in renderer.events
+    assert ("info", "Exited gptty; ChatGPT response continues in browser.") in renderer.events
+
+
 def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation() -> None:
     assert extract_conversation_ref({"conversation_url": "https://chatgpt.com/c/abc"}) == (
         "https://chatgpt.com/c/abc"

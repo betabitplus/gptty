@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 from gptty.state import ChatState, GoalState, StateError, load_chat_state
 from gptty.ui.commands import InteractiveCommands
-from gptty.ui.signals import TurnControlSignals
 
 
 class FakeUI:
@@ -136,18 +134,31 @@ def make_commands(tmp_path, *, state=None, ui=None, client=None):
     return commands, renderer, client, state_path
 
 
+def finish_pending_resume(commands, client):
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = client.conversation_snapshot(request.conversation_ref)
+    commands.complete_resume(request, snapshot)
+    return request
+
+
 def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> None:
     ui = FakeUI(choices=["conv-2"])
     commands, renderer, client, state_path = make_commands(tmp_path, ui=ui)
 
     assert commands.handle("/resume") is None
+    assert client.calls == [("list_conversations", None)]
+    assert load_chat_state(state_path).current_conversation is None
+
+    finish_pending_resume(commands, client)
 
     assert client.calls[:2] == [
         ("list_conversations", None),
         ("snapshot", "conv-2"),
     ]
     assert load_chat_state(state_path).current_conversation == "conv-2"
-    assert renderer.events[0] == ("clear_context", None)
+    clear_index = next(index for index, event in enumerate(renderer.events) if event[0] == "clear_context")
+    assert clear_index > 0
     rendered = [event for event in renderer.events if event[0] == "messages"][-1][1]
     assert [message.text for message in rendered] == ["question", "answer"]
 
@@ -161,6 +172,9 @@ def test_resume_switches_while_already_attached_without_detach(tmp_path) -> None
     )
 
     commands.handle("/resume")
+    assert state.current_conversation == "conv-1"
+
+    finish_pending_resume(commands, client)
 
     assert client.calls[:2] == [
         ("list_conversations", None),
@@ -174,8 +188,10 @@ def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
 
     commands.handle("/resume https://chatgpt.com/c/direct")
 
-    assert ("list_conversations", None) not in client.calls
-    assert client.calls[0] == ("snapshot", "direct")
+    assert client.calls == []
+    assert load_chat_state(state_path).current_conversation is None
+    finish_pending_resume(commands, client)
+    assert client.calls == [("snapshot", "direct")]
     assert load_chat_state(state_path).current_conversation == "direct"
 
 
@@ -199,7 +215,7 @@ def test_stop_command_stops_current_chat_without_detaching(tmp_path) -> None:
     commands.handle("/stop")
 
     assert state.current_conversation == "conv-1"
-    assert ("stop_generation", ("conv-1", {"timeout": 30.0})) in client.calls
+    assert ("stop_generation", ("conv-1", {"timeout": 2.0})) in client.calls
     assert ("turn_abort", None) in renderer.events
     assert ("info", "Stop requested.") in renderer.events
 
@@ -320,11 +336,13 @@ def test_image_clear_removes_pending_clipboard_temp_file(tmp_path, monkeypatch) 
 def test_resume_clears_pending_images_before_switching_context(tmp_path) -> None:
     image = tmp_path / "queued.png"
     image.write_bytes(b"png")
-    commands, _, _, _ = make_commands(tmp_path)
+    commands, _, client, _ = make_commands(tmp_path)
     commands.handle(f"/image {image}")
 
     commands.handle("/resume conv-1")
+    assert commands.pending_media == [str(image)]
 
+    finish_pending_resume(commands, client)
     assert commands.pending_media == []
 
 
@@ -400,113 +418,47 @@ def test_model_rejects_slug_not_in_live_catalog(tmp_path) -> None:
     assert "live ChatGPT list" in renderer.events[-1][1]
 
 
-def test_resume_follows_active_chat_until_completed(tmp_path, monkeypatch) -> None:
-    running = {
-        "status": SimpleNamespace(status="running"),
-        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
-    }
-    completed = {
-        "status": SimpleNamespace(status="completed"),
+def test_resume_unfinished_snapshot_attaches_without_follow_polling(tmp_path) -> None:
+    unfinished = {
+        "status": SimpleNamespace(status="tool_running"),
         "messages": [
             {"message_id": "u1", "role": "user", "text": "question"},
-            {"message_id": "a1", "role": "assistant", "text": "finished"},
+            {"message_id": "t1", "role": "tool", "text": "tool output"},
         ],
     }
-    client = FakeClient(snapshots=[running, completed])
-    commands, renderer, _, _ = make_commands(
+    client = FakeClient(snapshots=[unfinished])
+    commands, renderer, _, state_path = make_commands(
         tmp_path,
         ui=FakeUI(choices=["conv-1"]),
         client=client,
-    )
-    monkeypatch.setattr("gptty.ui.commands.FOLLOW_INTERVAL_SECONDS", 0.0)
-    notified: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        "gptty.ui.commands.notify_response_complete",
-        lambda **kwargs: notified.append(kwargs),
     )
 
     commands.handle("/resume")
+    finish_pending_resume(commands, client)
 
-    message_events = [event for event in renderer.events if event[0] == "messages"]
-    assert len(message_events) == 2
-    assert message_events[-1][1][0].text == "finished"
-    assert any(event[0] == "start_elapsed" for event in renderer.events)
-    assert ("finish_elapsed", None) in renderer.events
-    assert ("chat_link", "conv-1") in renderer.events
-    assert notified == [{"chat_title": "First chat", "final_response": "finished"}]
-    assert [call[0] for call in client.calls].count("snapshot") == 2
-
-
-def test_ctrl_c_while_following_stops_remote_response_and_keeps_attachment(tmp_path, monkeypatch) -> None:
-    running = {
-        "status": SimpleNamespace(status="running"),
-        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
-    }
-    completed = {
-        "status": SimpleNamespace(status="completed"),
-        "messages": [
-            {"message_id": "u1", "role": "user", "text": "question"},
-            {"message_id": "a1", "role": "assistant", "text": "partial"},
-        ],
-    }
-    client = FakeClient(snapshots=[running, completed])
-    state = ChatState()
-    commands, renderer, _, _ = make_commands(
-        tmp_path,
-        state=state,
-        ui=FakeUI(choices=["conv-1"]),
-        client=client,
-    )
-    @contextmanager
-    def stop_controls(*, enabled=True):
-        controls = TurnControlSignals()
-        controls.request_stop()
-        yield controls
-
-    monkeypatch.setattr("gptty.ui.commands.turn_control_signals", stop_controls)
-    monkeypatch.setattr("gptty.ui.commands.time.sleep", lambda _seconds: None)
-    notified: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        "gptty.ui.commands.notify_response_complete",
-        lambda **kwargs: notified.append(kwargs),
-    )
-
-    commands.handle("/resume")
-
-    assert state.current_conversation == "conv-1"
-    assert ("stop_generation", ("conv-1", {"timeout": 30.0})) in client.calls
-    assert ("info", "Stopped by user.") in renderer.events
-    assert ("chat_link", "conv-1") in renderer.events
-    assert notified == []
-
-
-def test_ctrl_backslash_while_following_exits_locally_without_remote_stop(tmp_path, monkeypatch) -> None:
-    running = {
-        "status": SimpleNamespace(status="running"),
-        "messages": [{"message_id": "u1", "role": "user", "text": "question"}],
-    }
-    client = FakeClient(snapshots=[running])
-    state = ChatState()
-    commands, renderer, _, _ = make_commands(
-        tmp_path,
-        state=state,
-        ui=FakeUI(choices=["conv-1"]),
-        client=client,
-    )
-    @contextmanager
-    def quit_controls(*, enabled=True):
-        controls = TurnControlSignals()
-        controls.request_quit()
-        yield controls
-
-    monkeypatch.setattr("gptty.ui.commands.turn_control_signals", quit_controls)
-
-    result = commands.handle("/resume")
-
-    assert result == 0
-    assert state.current_conversation == "conv-1"
+    assert load_chat_state(state_path).current_conversation == "conv-1"
+    assert [call[0] for call in client.calls].count("snapshot") == 1
     assert not any(call[0] == "stop_generation" for call in client.calls)
-    assert ("info", "Exited gptty; ChatGPT response continues in browser.") in renderer.events
+    assert any(
+        event[0] == "warning" and "unfinished turn (status=tool_running)" in event[1]
+        for event in renderer.events
+    )
+
+
+def test_resume_failure_keeps_previous_attachment(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-old")
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/resume conv-new")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.fail_resume(request, RuntimeError("snapshot failed"))
+
+    assert state.current_conversation == "conv-old"
+    assert any(
+        event[0] == "warning" and "snapshot failed" in event[1]
+        for event in renderer.events
+    )
 
 
 def test_new_clears_current_conversation(tmp_path) -> None:

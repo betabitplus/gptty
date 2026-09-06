@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -25,17 +26,19 @@ from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
 from .session import InteractiveSession
-from .signals import turn_control_signals
 
-FOLLOW_INTERVAL_SECONDS = 15.0
-FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
-ACTIVE_STATUSES = {
+UNFINISHED_STATUSES = {
     "running",
     "streaming",
     "tool_running",
     "tool_calling",
     "user_last_message",
 }
+
+
+@dataclass(frozen=True)
+class ResumeRequest:
+    conversation_ref: str
 
 
 class InteractiveCommands:
@@ -62,6 +65,7 @@ class InteractiveCommands:
         self._temporary_messages: list[OutputMessage] = []
         self._temporary_title: str | None = None
         self._automatic_prompts: list[str] = []
+        self._pending_resume: ResumeRequest | None = None
 
     def handle(self, raw: str) -> int | None:
         try:
@@ -116,6 +120,46 @@ class InteractiveCommands:
 
     def clear_automatic_prompts(self) -> None:
         self._automatic_prompts.clear()
+
+    @property
+    def has_pending_resume(self) -> bool:
+        return self._pending_resume is not None
+
+    def take_pending_resume(self) -> ResumeRequest | None:
+        request = self._pending_resume
+        self._pending_resume = None
+        return request
+
+    def complete_resume(self, request: ResumeRequest, snapshot: Any) -> bool:
+        attached_ref = request.conversation_ref
+        previous = self.state.current_conversation
+        self.state.current_conversation = attached_ref
+        if not self._save_state():
+            self.state.current_conversation = previous
+            return False
+
+        self.clear_pending_media()
+        self.renderer.clear_context()
+        self.renderer.header(
+            conversation=attached_ref,
+            model=self.state.model or "latest frontier · High",
+        )
+        self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
+        messages = _snapshot_messages(snapshot)
+        self.renderer.messages(normalize_messages(messages))
+        status = _snapshot_status(snapshot)
+        if status == "awaiting_tool_approval":
+            self.renderer.warning("Conversation is waiting for tool approval.")
+        elif status in UNFINISHED_STATUSES:
+            self.renderer.warning(
+                f"Conversation has an unfinished turn (status={status}); attached without blocking."
+            )
+        return True
+
+    def fail_resume(self, request: ResumeRequest, error: BaseException) -> None:
+        self.renderer.warning(
+            f"Resume failed for {_short_ref(request.conversation_ref)}: {error}"
+        )
 
     def prepare_goal_user_prompt(self, prompt: str) -> str:
         if not self.goal_active:
@@ -439,7 +483,7 @@ class InteractiveCommands:
 
     def _request_stop_generation(self, client: Any, ref: str) -> bool:
         try:
-            result = client.stop_generation(ref, timeout=30.0)
+            result = client.stop_generation(ref, timeout=2.0)
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Stop failed: {exc}")
             return False
@@ -494,9 +538,8 @@ class InteractiveCommands:
         self._pending_media.append(str(path))
         self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
 
-    def _cmd_resume(self, argv: list[str]) -> int | None:
-        client = self.get_client()
-        ref = argv[0] if argv else self._choose_conversation(client)
+    def _cmd_resume(self, argv: list[str]) -> None:
+        ref = argv[0] if argv else self._choose_conversation(self.get_client())
         if not ref:
             return
 
@@ -504,36 +547,8 @@ class InteractiveCommands:
         if self.state.current_conversation and attached_ref != self.state.current_conversation:
             self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
-        try:
-            snapshot = client.conversation_snapshot(attached_ref)
-        except Exception as exc:  # noqa: BLE001 - interactive command boundary.
-            self.renderer.warning(f"Resume failed: {exc}")
-            return
-
-        previous = self.state.current_conversation
-        self.state.current_conversation = attached_ref
-        if not self._save_state():
-            self.state.current_conversation = previous
-            return
-
-        self.clear_pending_media()
-        self.renderer.clear_context()
-        self.renderer.header(
-            conversation=attached_ref,
-            model=self.state.model or "latest frontier · High",
-        )
-        self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
-        messages = _snapshot_messages(snapshot)
-        self.renderer.messages(normalize_messages(messages))
-        if self._follow_if_active(
-            client,
-            attached_ref,
-            snapshot,
-            messages,
-            chat_title=self._conversation_titles.get(attached_ref),
-        ):
-            return 0
-        return None
+        self._pending_resume = ResumeRequest(conversation_ref=attached_ref)
+        self.renderer.info(f"Loading conversation: {_short_ref(attached_ref)}")
 
     def _choose_conversation(self, client: Any) -> str | None:
         try:
@@ -619,88 +634,6 @@ class InteractiveCommands:
             self.state.model = previous
             return
         self.renderer.info(f"Model: {self.state.model or 'latest frontier · High'}")
-
-    def _follow_if_active(
-        self,
-        client: Any,
-        ref: str,
-        snapshot: Any,
-        messages: list[Any],
-        *,
-        chat_title: str | None = None,
-    ) -> bool:
-        status = _snapshot_status(snapshot)
-        if status == "awaiting_tool_approval":
-            self.renderer.warning("Conversation is waiting for tool approval.")
-            return False
-        if status not in ACTIVE_STATUSES:
-            return False
-
-        seen = {_message_identity(message): _message_text(message) for message in messages}
-        deadline = time.monotonic() + FOLLOW_TIMEOUT_SECONDS
-        stopped_by_user = False
-        with turn_control_signals(enabled=True) as controls:
-            self.renderer.info("Following active response… Ctrl-C stops ChatGPT · Ctrl-\\ exits gptty only.")
-            self.renderer.start_elapsed(initial_elapsed=_active_elapsed_seconds(messages))
-            while time.monotonic() < deadline:
-                woke = controls.wake.wait(timeout=FOLLOW_INTERVAL_SECONDS)
-                controls.wake.clear()
-                if controls.quit_requested.is_set():
-                    self.renderer.turn_abort()
-                    self.renderer.info("Exited gptty; ChatGPT response continues in browser.")
-                    return True
-                if controls.stop_requested.is_set():
-                    controls.stop_requested.clear()
-                    if stopped_by_user:
-                        self.renderer.info("Stop already requested; waiting for ChatGPT to save the partial response…")
-                        continue
-                    self.renderer.info("Stopping ChatGPT…")
-                    if self._request_stop_generation(client, ref):
-                        stopped_by_user = True
-                        self.renderer.turn_abort()
-                        self.renderer.info("Stop requested; waiting for ChatGPT to save the partial response…")
-                        time.sleep(1.0)
-                    else:
-                        continue
-                elif woke:
-                    continue
-
-                snapshot = client.conversation_snapshot(ref)
-                current = _snapshot_messages(snapshot)
-                changed: list[Any] = []
-                for message in current:
-                    identity = _message_identity(message)
-                    text = _message_text(message)
-                    if seen.get(identity) == text:
-                        continue
-                    seen[identity] = text
-                    changed.append(message)
-                if changed:
-                    self.renderer.messages(normalize_messages(changed))
-
-                status = _snapshot_status(snapshot)
-                if status == "completed":
-                    self.renderer.finish_elapsed()
-                    if stopped_by_user:
-                        self.renderer.info("Stopped by user.")
-                    self.renderer.chat_link(ref)
-                    if not stopped_by_user:
-                        notify_response_complete(
-                            chat_title=chat_title,
-                            final_response=_last_assistant_message_text(current),
-                        )
-                    return False
-                if status == "awaiting_tool_approval":
-                    self.renderer.turn_abort()
-                    self.renderer.warning("Conversation is waiting for tool approval.")
-                    return False
-                if status not in ACTIVE_STATUSES:
-                    self.renderer.turn_abort()
-                    self.renderer.info(f"Follow stopped: status={status or 'unknown'}")
-                    return False
-        self.renderer.turn_abort()
-        self.renderer.info("Stopped following after 2 hours; conversation remains attached.")
-        return False
 
     def _resume_goal(self) -> None:
         goal = self.state.goal
