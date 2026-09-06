@@ -190,6 +190,33 @@ def test_render_tool_calls_use_compact_useful_details() -> None:
         {
             "type": "canonical_intermediate_message",
             "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Searching LOCAL_QUIT_CODE...",
+            "text": "",
+        }
+    ) == "[tool] search · LOCAL_QUIT_CODE"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Calling list workspaces...",
+            "text": "",
+        }
+    ) == "[tool] list_workspaces"
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
+            "tool_name": "api_tool.call_tool",
+            "label": "Using tool...",
+            "text": "",
+        }
+    ) is None
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_call",
             "tool_name": "web.run",
             "label": "Searching the web...",
             "text": "",

@@ -459,3 +459,143 @@ def test_stop_command_while_working_uses_active_turn_stop_path(tmp_path, monkeyp
     assert ("info", "ChatGPT stopped; finalizing local readback…") in renderer.events
     assert ("info", "Stopped by user.") in renderer.events
     assert ("info", "Cleared 1 queued prompt after Stop.") in renderer.events
+
+
+def test_incomplete_turn_returns_prompt_and_clears_queued_followup(tmp_path, monkeypatch) -> None:
+    class IncompleteClient:
+        instances: list["IncompleteClient"] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[str] = []
+            self.__class__.instances.append(self)
+
+        def send(self, prompt: str, **options):
+            self.calls.append(prompt)
+            self.__class__.started.set()
+            assert self.__class__.release.wait(timeout=2)
+            return SimpleNamespace(
+                text="",
+                title=None,
+                conversation=SimpleNamespace(
+                    conversation_id="conv-incomplete",
+                    finish_reason="incomplete",
+                ),
+            )
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            raise AssertionError("queued follow-up must be cleared after incomplete turn")
+
+    IncompleteClient.instances.clear()
+    IncompleteClient.started.clear()
+    IncompleteClient.release.clear()
+    _FakeRenderer.instances.clear()
+
+    def queue_ready() -> bool:
+        if not IncompleteClient.started.is_set():
+            return False
+        IncompleteClient.release.set()
+        return True
+
+    _FakeSession.script = iter(
+        [
+            "Start a tool-heavy turn",
+            (queue_ready, "Queued follow-up must not run"),
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and (
+                    "warning",
+                    "ChatGPT stream ended without a final answer; returned control to gptty.",
+                )
+                in _FakeRenderer.instances[0].events,
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    notifications: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.commands.chat.notify_response_complete",
+        lambda **kwargs: notifications.append(kwargs),
+    )
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=IncompleteClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = IncompleteClient.instances[0]
+    assert client.calls == ["Start a tool-heavy turn"]
+    state = load_chat_state(tmp_path / "state.json")
+    assert state.current_conversation == "conv-incomplete"
+    renderer = _FakeRenderer.instances[0]
+    assert (
+        "warning",
+        "ChatGPT stream ended without a final answer; returned control to gptty.",
+    ) in renderer.events
+    assert ("info", "Cleared 1 queued prompt after incomplete turn.") in renderer.events
+    assert notifications == []
+
+
+def test_goal_incomplete_turn_interrupts_without_auto_continue(tmp_path, monkeypatch) -> None:
+    class IncompleteGoalClient:
+        instances: list["IncompleteGoalClient"] = []
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[str] = []
+            self.__class__.instances.append(self)
+
+        def send(self, prompt: str, **options):
+            self.calls.append(prompt)
+            return SimpleNamespace(
+                text="",
+                title="Incomplete goal",
+                conversation=SimpleNamespace(
+                    conversation_id="conv-goal-incomplete",
+                    finish_reason="incomplete",
+                ),
+            )
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            raise AssertionError("incomplete Goal must not auto-continue")
+
+    IncompleteGoalClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            '/goal "Finish the task"',
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    event[0] == "warning" and "Goal · interrupted" in str(event[1])
+                    for event in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=IncompleteGoalClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert len(IncompleteGoalClient.instances[0].calls) == 1
+    state = load_chat_state(tmp_path / "state.json")
+    assert state.goal is not None
+    assert state.goal.status == "interrupted"
+    assert state.goal.reason == "ChatGPT stream ended without a final answer"

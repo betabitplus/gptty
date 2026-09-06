@@ -26,6 +26,37 @@ def test_renderer_separates_thinking_and_groups_tools() -> None:
     assert text.rstrip().endswith("Final answer")
 
 
+def test_renderer_live_tool_calls_use_compact_formatter() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    for tool_name, label in (
+        ("api_tool.list_resources", "Using tool..."),
+        ("api_tool.call_tool", "Searching LOCAL_QUIT_CODE..."),
+        ("api_tool.call_tool", "Calling list workspaces..."),
+        ("api_tool.call_tool", "Opening current CodexPro workspace..."),
+        ("api_tool.call_tool", "Using tool..."),
+    ):
+        renderer.live_event(
+            {
+                "type": "canonical_intermediate_message",
+                "message_kind": "tool_call",
+                "tool_name": tool_name,
+                "label": label,
+            }
+        )
+
+    text = out.getvalue()
+    assert "◇ list_resources" in text
+    assert "◇ search  LOCAL_QUIT_CODE" in text
+    assert "◇ list_workspaces" in text
+    assert "◇ open_current_workspace" in text
+    assert "api_tool.call_tool" not in text
+    assert "call_tool" not in text
+    assert "Using tool" not in text
+    assert "Searching LOCAL_QUIT_CODE" not in text
+
+
 def test_renderer_header_shows_full_chat_link() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))

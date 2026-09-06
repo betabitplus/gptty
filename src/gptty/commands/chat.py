@@ -135,6 +135,20 @@ def response_title(response: Any) -> str | None:
     return title or None
 
 
+def response_finish_reason(response: Any) -> str | None:
+    conversation = response.get("conversation") if isinstance(response, dict) else getattr(response, "conversation", None)
+    if isinstance(conversation, dict):
+        value = conversation.get("finish_reason")
+    else:
+        value = getattr(conversation, "finish_reason", None)
+    if not isinstance(value, str):
+        value = response.get("finish_reason") if isinstance(response, dict) else getattr(response, "finish_reason", None)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
 def run_chat(
     args: Any,
     *,
@@ -572,7 +586,18 @@ async def _finish_enhanced_turn(
         if queued_count:
             renderer.info(f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after Stop.")
 
-    if turn.goal_turn:
+    incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
+    if incomplete_turn:
+        queued_count = len(queued_prompts)
+        queued_prompts.clear()
+        commands.clear_automatic_prompts()
+        if queued_count:
+            renderer.info(
+                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after incomplete turn."
+            )
+        if turn.goal_turn:
+            commands.handle_goal_interruption("ChatGPT stream ended without a final answer")
+    elif turn.goal_turn:
         commands.handle_goal_turn_result(turn.result)
         if turn.pause_goal_after_turn and commands.goal_active:
             commands.handle("/goal pause")
@@ -821,6 +846,7 @@ def _send_chat_prompt(
     completed_successfully = False
     stopped_by_user = False
     local_quit_requested = False
+    incomplete_turn = False
     write_committed = threading.Event()
     controls = turn_controls or TurnControlSignals()
     if conversation_mode not in {"normal", "temporary"}:
@@ -1033,10 +1059,18 @@ def _send_chat_prompt(
 
         text = response_text(response)
         rendered_text = text or "".join(stream_tokens)
+        finish_reason = response_finish_reason(response)
+        incomplete_turn = finish_reason == "incomplete"
         if renderer is not None:
-            renderer.answer(rendered_text)
+            if incomplete_turn:
+                renderer.turn_abort()
+                renderer.warning("ChatGPT stream ended without a final answer; returned control to gptty.")
+            else:
+                renderer.answer(rendered_text)
             if stopped_by_user:
                 renderer.info("Stopped by user.")
+        elif incomplete_turn:
+            print("gptty: ChatGPT stream ended without a final answer.", file=stderr)
         elif stream:
             if saw_stream_token:
                 print(file=stdout)
@@ -1074,13 +1108,17 @@ def _send_chat_prompt(
         if recorder is not None:
             if stopped_by_user:
                 recorder.event("stopped_by_user")
+            if incomplete_turn:
+                recorder.event("incomplete_without_terminal")
             recorder.complete()
         if result_out is not None:
             result_out.update(
                 text=rendered_text,
                 title=response_title(response),
                 conversation_ref=conversation_ref,
+                finish_reason=finish_reason,
                 stopped_by_user=stopped_by_user,
+                incomplete_without_terminal=incomplete_turn,
             )
         completed_successfully = True
         return 0
@@ -1089,7 +1127,7 @@ def _send_chat_prompt(
             lock.release()
         if renderer is not None:
             renderer.turn_abort()
-            if completed_successfully and not stopped_by_user and notify_completion:
+            if completed_successfully and not stopped_by_user and not incomplete_turn and notify_completion:
                 notify_response_complete(
                     chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
                     final_response=rendered_text,

@@ -10,7 +10,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.text import Text
 
-from ..output import OutputMessage
+from ..output import OutputMessage, render_tool_call_parts
 from .state import UISettings
 
 
@@ -146,7 +146,9 @@ class PrettyRenderer:
             return
 
         if kind == "tool_call" and self.settings.tools != "hidden":
-            self.tool(tool_name, label)
+            name, detail = render_tool_call_parts(tool=tool_name, text=text, label=label)
+            if name:
+                self.tool(name, detail)
             return
 
         if kind == "activity":

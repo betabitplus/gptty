@@ -116,15 +116,15 @@ def render_live_event(event: Any) -> str | None:
     return None
 
 
-def _render_tool_call(*, tool: str, text: str, label: str) -> str:
+def render_tool_call_parts(*, tool: str, text: str, label: str) -> tuple[str, str]:
     payload = _json_mapping(text)
 
     if tool == "api_tool.call_tool":
         action = _api_tool_action(payload)
         args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
         if action:
-            return _tool_line(action, _api_tool_detail(action, args))
-        return _tool_line("call_tool", _clean_tool_detail(label))
+            return action, _api_tool_detail(action, args)
+        return _api_tool_label_parts(label)
 
     if tool == "api_tool.list_resources":
         detail = ""
@@ -135,9 +135,60 @@ def _render_tool_call(*, tool: str, text: str, label: str) -> str:
             paths = payload.get("paths")
             if isinstance(paths, list) and paths and isinstance(paths[0], str):
                 detail = paths[0]
-        return _tool_line("list_resources", detail or _clean_tool_detail(label))
+        return "list_resources", detail or _list_resources_label_detail(label)
 
-    return _tool_line(tool or "tool", _clean_tool_detail(label))
+    return tool or "tool", _clean_tool_detail(label)
+
+
+def _render_tool_call(*, tool: str, text: str, label: str) -> str | None:
+    name, detail = render_tool_call_parts(tool=tool, text=text, label=label)
+    return _tool_line(name, detail) if name else None
+
+
+def _api_tool_label_parts(label: str) -> tuple[str, str]:
+    cleaned = _clean_tool_detail(label)
+    if not cleaned:
+        return "", ""
+    lowered = cleaned.lower()
+    if lowered in {"using tool", "calling tool"}:
+        return "", ""
+    if lowered == "reading git status":
+        return "git_status", ""
+    if lowered == "reviewing changes":
+        return "show_changes", ""
+    if lowered in {"opening current workspace", "opening current codexpro workspace"}:
+        return "open_current_workspace", ""
+    if lowered in {"opening workspace", "opening codexpro workspace"}:
+        return "open_workspace", ""
+    if lowered == "running command":
+        return "bash", ""
+    if lowered.startswith("reading tree "):
+        return "tree", cleaned[len("Reading tree ") :].strip()
+    if lowered.startswith("reading "):
+        detail = cleaned[len("Reading ") :].strip()
+        return "read", "" if detail.lower() == "file" else detail
+    if lowered.startswith("searching "):
+        detail = cleaned[len("Searching ") :].strip()
+        return "search", "" if detail.lower() == "workspace" else detail
+    if lowered.startswith("calling "):
+        action = cleaned[len("Calling ") :].strip().lower().replace("-", " ")
+        action = "_".join(action.split())
+        return (action, "") if action else ("", "")
+    return "tool", cleaned
+
+
+def _list_resources_label_detail(label: str) -> str:
+    cleaned = _clean_tool_detail(label)
+    if not cleaned or cleaned.lower() == "using tool":
+        return ""
+    if cleaned.lower().startswith("discovering "):
+        detail = cleaned[len("Discovering ") :].strip()
+        if detail.lower() == "tools":
+            return ""
+        if detail.lower().endswith(" tools"):
+            detail = detail[:-6].rstrip()
+        return detail
+    return cleaned
 
 
 def _api_tool_action(payload: dict[str, Any]) -> str:
