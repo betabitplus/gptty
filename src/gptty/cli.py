@@ -9,6 +9,19 @@ from .io import StdinReadError, read_stdin_text
 from .profiles import ProfileError, resolve_auth_path, resolve_session_paths
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 7200
+BROWSER_BACKEND_CHOICES = ("chrome-native", "wkwebview")
+
+
+def _add_backend_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--backend",
+        choices=BROWSER_BACKEND_CHOICES,
+        default=None,
+        help=(
+            "Browser authority backend for ChatGPT web-session writes. "
+            "Defaults to CWA's production backend."
+        ),
+    )
 
 
 def _add_profile_option(parser: argparse.ArgumentParser, *, suppress_default: bool = True) -> None:
@@ -22,6 +35,7 @@ def _add_profile_option(parser: argparse.ArgumentParser, *, suppress_default: bo
 
 def _add_session_options(parser: argparse.ArgumentParser) -> None:
     _add_profile_option(parser)
+    _add_backend_option(parser)
     parser.add_argument(
         "--auth",
         default=None,
@@ -193,6 +207,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_stdin_options(ask_parser)
     _add_image_options(ask_parser)
     _add_auth_file_option(ask_parser)
+    _add_backend_option(ask_parser)
     ask_parser.add_argument(
         "--model",
         default=None,
@@ -257,6 +272,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start an interactive SDK-backed chat loop.",
     )
     _add_profile_option(chat_parser)
+    _add_backend_option(chat_parser)
     chat_parser.add_argument(
         "--legacy",
         action="store_true",

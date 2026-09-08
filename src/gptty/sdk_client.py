@@ -52,20 +52,25 @@ class _ProductRuntimeClient:
         *,
         auth_file: str | Path,
         timeout: int,
+        browser_authority_backend: str | None = None,
         runtime: Any | None = None,
     ) -> None:
         self.auth_file = Path(auth_file)
         self.timeout = int(timeout)
+        self.browser_authority_backend = browser_authority_backend
         self.runtime = runtime or self._build_runtime()
 
     def _build_runtime(self) -> Any:
         from chatgpt_web_adapter import assemble_product_runtime
 
-        return assemble_product_runtime(
-            transport="browser-owned",
-            auth_file=self.auth_file,
-            client_timeout=self.timeout,
-        )
+        runtime_options: dict[str, Any] = {
+            "transport": "browser-owned",
+            "auth_file": self.auth_file,
+            "client_timeout": self.timeout,
+        }
+        if self.browser_authority_backend is not None:
+            runtime_options["browser_authority_backend"] = self.browser_authority_backend
+        return assemble_product_runtime(**runtime_options)
 
     def send(self, prompt: str, **options: Any) -> Any:
         runtime_options = _runtime_send_options(options)
@@ -119,6 +124,18 @@ class _ProductRuntimeClient:
     def list_models(self) -> Any:
         return self.runtime.list_models()
 
+    def media_default_model_profile(self) -> str | None:
+        write_transport = getattr(self.runtime, "write_transport", None)
+        governance = getattr(write_transport, "governance", None)
+        if not callable(governance):
+            return None
+        metadata = governance()
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("media_semantic_default_model_profile_supported") is True:
+            return DEFAULT_MODEL_PROFILE
+        return None
+
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
         return self.runtime.conversation_snapshot(url_or_id, **options)
 
@@ -167,15 +184,21 @@ class GpttyClient:
         auth_file: str | Path = "auth_data.json",
         timeout: int = 90,
         *,
+        browser_authority_backend: str | None = None,
         sdk_client: ChatGPTWebClientProtocol | None = None,
     ) -> None:
         self.auth_file = Path(auth_file)
         self.timeout = int(timeout)
+        self.browser_authority_backend = browser_authority_backend
         self._client = sdk_client or self._build_sdk_client()
         self._media_default_model: str | None = None
 
     def _build_sdk_client(self) -> ChatGPTWebClientProtocol:
-        return _ProductRuntimeClient(auth_file=self.auth_file, timeout=self.timeout)
+        return _ProductRuntimeClient(
+            auth_file=self.auth_file,
+            timeout=self.timeout,
+            browser_authority_backend=self.browser_authority_backend,
+        )
 
     def send(self, prompt: str, **options: Any) -> Any:
         return self._client.send(prompt, **self._prepare_send_options(options))
@@ -196,14 +219,20 @@ class GpttyClient:
         )
 
     def _prepare_send_options(self, options: dict[str, Any]) -> dict[str, Any]:
-        media = options.get("media")
-        has_explicit_model = bool(options.get("model") or options.get("model_profile"))
+        prepared = dict(options)
+        media = prepared.get("media")
+        has_explicit_model = bool(prepared.get("model") or prepared.get("model_profile"))
         media_default_model: str | None = None
         if media and not has_explicit_model:
-            if self._media_default_model is None:
-                self._media_default_model = _resolve_latest_frontier_model(self._client.list_models())
-            media_default_model = self._media_default_model
-        return _sdk_send_options(options, media_default_model=media_default_model)
+            semantic_default = getattr(self._client, "media_default_model_profile", None)
+            profile = semantic_default() if callable(semantic_default) else None
+            if isinstance(profile, str) and profile.strip():
+                prepared["model_profile"] = profile.strip()
+            else:
+                if self._media_default_model is None:
+                    self._media_default_model = _resolve_latest_frontier_model(self._client.list_models())
+                media_default_model = self._media_default_model
+        return _sdk_send_options(prepared, media_default_model=media_default_model)
 
     def attach_conversation(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.attach_conversation(url_or_id, **options)

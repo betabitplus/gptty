@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -28,6 +29,7 @@ from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
 from ..ui.commands import InteractiveCommands, ResumeRequest
+from ._client import build_client
 from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
@@ -87,6 +89,28 @@ class _PromptAwareStream:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
+
+
+class _ThreadsafeRendererProxy:
+    """Marshal PrettyRenderer method calls onto the asyncio/UI thread."""
+
+    def __init__(self, renderer: PrettyRenderer, loop: asyncio.AbstractEventLoop) -> None:
+        self._renderer = renderer
+        self._loop = loop
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._renderer, name)
+        if not callable(value):
+            return value
+
+        def publish(*args: Any, **kwargs: Any) -> None:
+            try:
+                self._loop.call_soon_threadsafe(partial(value, *args, **kwargs))
+            except RuntimeError:
+                # The loop may already be closed during local quit/shutdown.
+                pass
+
+        return publish
 
 
 CONVERSATION_REF_FIELDS = (
@@ -202,10 +226,7 @@ def run_chat(
     def get_client() -> Any:
         nonlocal client
         if client is None:
-            client = client_factory(
-                auth_file=getattr(args, "auth", "auth_data.json"),
-                timeout=getattr(args, "timeout", 90),
-            )
+            client = build_client(client_factory, args)
         return client
 
     ui: InteractiveSession | None = None
@@ -695,15 +716,31 @@ async def _finish_enhanced_turn(
         return _EnhancedLoopOutcome(exit_code=1)
 
     if code == LOCAL_QUIT_CODE:
+        renderer.turn_abort()
         if turn.goal_turn:
             commands.pause_goal_for_local_quit()
         await _cancel_prompt_task(prompt_task)
         return _EnhancedLoopOutcome(exit_code=0)
     if code != 0:
+        renderer.turn_abort()
         if turn.goal_turn:
             commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
         await _cancel_prompt_task(prompt_task)
         return _EnhancedLoopOutcome(exit_code=code)
+
+    incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
+    stopped_by_user = bool(turn.result.get("stopped_by_user"))
+    final_text = str(turn.result.get("text") or "")
+    if incomplete_turn:
+        renderer.turn_abort()
+        renderer.warning("ChatGPT stream ended without a final answer; returned control to gptty.")
+    else:
+        renderer.answer(final_text)
+    if stopped_by_user:
+        renderer.info("Stopped by user.")
+    conversation_ref = turn.result.get("conversation_ref")
+    if not turn.result.get("is_temporary") and isinstance(conversation_ref, str) and conversation_ref.strip():
+        renderer.chat_link(conversation_ref.strip())
 
     if turn.result.get("stopped_by_user"):
         queued_count = len(queued_prompts)
@@ -776,6 +813,7 @@ def _start_enhanced_turn(
     renderer.turn_start(show_elapsed=False)
 
     loop = asyncio.get_running_loop()
+    threaded_renderer = _ThreadsafeRendererProxy(renderer, loop)
 
     def stop_confirmed(ref: str | None) -> None:
         loop.call_soon_threadsafe(commands.pause_goal_after_user_stop, ref)
@@ -796,7 +834,7 @@ def _start_enhanced_turn(
             or getattr(args, "lock_timeout", None) is not None,
             stdout=stdout,
             stderr=stderr,
-            renderer=renderer,
+            renderer=threaded_renderer,
             turn_controls=controls,
             conversation_mode=conversation_mode,
             attached_ref=attached_ref,
@@ -806,6 +844,7 @@ def _start_enhanced_turn(
             notify_completion=not goal_turn,
             result_out=turn_result,
             on_stop_confirmed=stop_confirmed if goal_turn else None,
+            defer_final_rendering=True,
         )
     )
     active = _EnhancedTurn(
@@ -963,6 +1002,7 @@ def _send_chat_prompt(
     notify_completion: bool = True,
     result_out: dict[str, Any] | None = None,
     on_stop_confirmed: Callable[[str | None], None] | None = None,
+    defer_final_rendering: bool = False,
 ) -> int:
     if result_out is not None:
         result_out.clear()
@@ -1208,7 +1248,7 @@ def _send_chat_prompt(
         rendered_text = text or "".join(stream_tokens)
         finish_reason = response_finish_reason(response)
         incomplete_turn = finish_reason == "incomplete"
-        if renderer is not None:
+        if renderer is not None and not defer_final_rendering:
             if incomplete_turn:
                 renderer.turn_abort()
                 renderer.warning("ChatGPT stream ended without a final answer; returned control to gptty.")
@@ -1216,7 +1256,7 @@ def _send_chat_prompt(
                 renderer.answer(rendered_text)
             if stopped_by_user:
                 renderer.info("Stopped by user.")
-        elif incomplete_turn:
+        elif renderer is None and incomplete_turn:
             print("gptty: ChatGPT stream ended without a final answer.", file=stderr)
         elif stream:
             if saw_stream_token:
@@ -1249,7 +1289,7 @@ def _send_chat_prompt(
                 print(f"gptty: {exc}", file=stderr)
                 return 1
 
-        if renderer is not None and not is_temporary and state.current_conversation:
+        if renderer is not None and not defer_final_rendering and not is_temporary and state.current_conversation:
             renderer.chat_link(state.current_conversation)
 
         if recorder is not None:
@@ -1266,19 +1306,20 @@ def _send_chat_prompt(
                 finish_reason=finish_reason,
                 stopped_by_user=stopped_by_user,
                 incomplete_without_terminal=incomplete_turn,
+                is_temporary=is_temporary,
             )
         completed_successfully = True
         return 0
     finally:
         if lock is not None:
             lock.release()
-        if renderer is not None:
+        if renderer is not None and not defer_final_rendering:
             renderer.turn_abort()
-            if completed_successfully and not stopped_by_user and not incomplete_turn and notify_completion:
-                notify_response_complete(
-                    chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
-                    final_response=rendered_text,
-                )
+        if renderer is not None and completed_successfully and not stopped_by_user and not incomplete_turn and notify_completion:
+            notify_response_complete(
+                chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
+                final_response=rendered_text,
+            )
 
 
 def _stopped_snapshot_response(snapshot: Any, *, conversation_ref: str) -> dict[str, str]:

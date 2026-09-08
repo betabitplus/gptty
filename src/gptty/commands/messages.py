@@ -9,6 +9,7 @@ from ..output import OutputMessage as ChatMessage
 from ..output import OutputFormat, normalize_messages, render_messages
 from ..sdk_client import GpttyClient
 from ..state import StateError, load_chat_state
+from ._client import build_client
 
 NO_CONVERSATION_ERROR = (
     "gptty messages requires a conversation URL/id or an attached conversation. "
@@ -33,10 +34,7 @@ def run_messages(
         print(NO_CONVERSATION_ERROR, file=stderr)
         return 2
 
-    client = client_factory(
-        auth_file=getattr(args, "auth", "auth_data.json"),
-        timeout=getattr(args, "timeout", 90),
-    )
+    client = build_client(client_factory, args)
 
     options: dict[str, Any] = {}
     last = getattr(args, "last", None)

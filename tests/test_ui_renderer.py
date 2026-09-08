@@ -109,3 +109,40 @@ def test_renderer_can_hide_thinking_and_tools() -> None:
     text = out.getvalue()
     assert "hidden" not in text
     assert "visible" in text
+
+
+def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.turn_start(show_elapsed=False)
+    renderer.live_event(
+        {"type": "assistant_text_snapshot", "sequence": 1, "message_id": "m1", "text": "hello"}
+    )
+    renderer.live_event(
+        {"type": "assistant_text_delta", "sequence": 2, "message_id": "m1", "delta": " world"}
+    )
+    renderer.answer("hello world")
+
+    text = out.getvalue()
+    assert text.count("hello world") == 1
+    assert "corrected answer follows" not in text
+
+
+def test_renderer_revision_falls_back_to_canonical_final() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.turn_start(show_elapsed=False)
+    renderer.live_event(
+        {"type": "assistant_text_snapshot", "sequence": 1, "message_id": "m1", "text": "draft"}
+    )
+    renderer.live_event(
+        {"type": "assistant_text_revision", "sequence": 2, "message_id": "m1", "text": "revised"}
+    )
+    renderer.answer("revised final")
+
+    text = out.getvalue()
+    assert "Response revised while streaming; canonical final follows." in text
+    assert "answer · final" in text
+    assert text.rstrip().endswith("revised final")

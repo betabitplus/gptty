@@ -8,6 +8,7 @@ from ..media import MediaInputError, collect_media_inputs
 from ..prompt import build_prompt
 from ..required_action import maybe_render_required_action
 from ..sdk_client import GpttyClient
+from ._client import build_client
 
 
 EMPTY_PROMPT_ERROR = "gptty ask requires a prompt argument or piped stdin."
@@ -68,10 +69,7 @@ def run_ask(
         saw_stream_token = True
         print(token, end="", file=stdout, flush=True)
 
-    client = client_factory(
-        auth_file=getattr(args, "auth", "auth_data.json"),
-        timeout=getattr(args, "timeout", 90),
-    )
+    client = build_client(client_factory, args)
     try:
         response = client.send(
             prompt,

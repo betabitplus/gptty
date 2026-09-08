@@ -8,6 +8,7 @@ from typing import Any, TextIO
 from ..output import OutputFormat, normalize_status, render_status
 from ..sdk_client import GpttyClient
 from ..state import StateError, load_chat_state
+from ._client import build_client
 
 NO_CONVERSATION_ERROR = (
     "gptty status requires a conversation URL/id or an attached conversation. "
@@ -32,10 +33,7 @@ def run_status(
         print(NO_CONVERSATION_ERROR, file=stderr)
         return 2
 
-    client = client_factory(
-        auth_file=getattr(args, "auth", "auth_data.json"),
-        timeout=getattr(args, "timeout", 90),
-    )
+    client = build_client(client_factory, args)
 
     try:
         response = client.get_status(conversation_ref)

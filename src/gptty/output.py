@@ -23,6 +23,53 @@ class OutputMessage:
     created_at: str | None = None
 
 
+@dataclass
+class RevisionTextState:
+    """Apply CWA revision-safe assistant text events without assuming append-only output."""
+
+    message_id: str | None = None
+    sequence: int = 0
+    text: str = ""
+
+    def apply(self, event: Any) -> bool:
+        if not isinstance(event, dict):
+            return False
+        event_type = event.get("type")
+        if event_type not in {
+            "assistant_text_snapshot",
+            "assistant_text_delta",
+            "assistant_text_revision",
+        }:
+            return False
+
+        raw_sequence = event.get("sequence")
+        if isinstance(raw_sequence, int) and not isinstance(raw_sequence, bool):
+            if raw_sequence <= self.sequence:
+                return False
+            self.sequence = raw_sequence
+
+        raw_message_id = event.get("message_id")
+        message_id = raw_message_id.strip() if isinstance(raw_message_id, str) else None
+        if message_id and message_id != self.message_id:
+            self.message_id = message_id
+            self.text = ""
+
+        if event_type == "assistant_text_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return False
+            self.text += delta
+            return True
+
+        text = event.get("text")
+        if not isinstance(text, str):
+            return False
+        if text == self.text:
+            return False
+        self.text = text
+        return True
+
+
 def normalize_messages(response: Any) -> list[OutputMessage]:
     raw_messages = _extract_raw_messages(response)
     return [_normalize_message(message) for message in raw_messages]

@@ -11,8 +11,14 @@ import gptty.commands.export as export_command
 import gptty.commands.messages as messages_command
 import gptty.commands.send as send_command
 import gptty.commands.status as status_command
+import gptty.profiles as profiles
 from gptty import cli
 from gptty.io import StdinReadError
+
+
+def _force_legacy_profile_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(profiles.PROFILE_ENV, raising=False)
+    monkeypatch.setattr(profiles, "get_active_profile", lambda: None)
 
 
 def test_ask_uses_auto_stdin_mode_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -171,6 +177,7 @@ def test_send_stdin_read_error_returns_1(monkeypatch: pytest.MonkeyPatch, capsys
 
 
 def test_chat_routes_to_sdk_chat_with_new_state_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
     calls: dict[str, Any] = {}
 
     def fake_run_chat(args: Any) -> int:
@@ -194,6 +201,7 @@ def test_chat_routes_to_sdk_chat_with_new_state_default(monkeypatch: pytest.Monk
 
 
 def test_no_args_routes_to_sdk_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
     calls: dict[str, Any] = {}
 
     def fake_run_chat(args: Any) -> int:
@@ -207,6 +215,7 @@ def test_no_args_routes_to_sdk_chat(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_chat_legacy_routes_to_legacy_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
     calls: dict[str, Any] = {}
 
     def fake_run_legacy_chat(state_path: str, auth_file: str) -> int:

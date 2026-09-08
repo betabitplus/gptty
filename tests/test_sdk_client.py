@@ -85,6 +85,11 @@ class FrontierFakeSdkClient(FakeSdkClient):
         ]
 
 
+class SemanticMediaFakeSdkClient(FrontierFakeSdkClient):
+    def media_default_model_profile(self) -> str:
+        return "DEEP"
+
+
 class OldFakeSdkClient:
     pass
 
@@ -201,6 +206,17 @@ def test_media_defaults_to_latest_normal_thinking_frontier_and_caches_catalog() 
             ("abc", "inspect again"),
             {"media": ["two.png"], "model": "gpt-5-6-thinking"},
         ),
+    ]
+
+
+def test_media_uses_semantic_default_profile_when_runtime_declares_support() -> None:
+    sdk = SemanticMediaFakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    assert client.send("inspect", media=["one.png"]) == "send-result"
+
+    assert sdk.calls == [
+        ("send", ("inspect",), {"media": ["one.png"], "model_profile": "DEEP"}),
     ]
 
 

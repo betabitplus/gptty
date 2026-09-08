@@ -10,7 +10,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.text import Text
 
-from ..output import OutputMessage, render_tool_call_parts
+from ..output import OutputMessage, RevisionTextState, render_tool_call_parts
 from .state import UISettings
 
 
@@ -45,6 +45,9 @@ class PrettyRenderer:
         self.state = RenderState()
         self._elapsed_status: _ElapsedStatus | None = None
         self._elapsed_live: Live | None = None
+        self._answer_state = RevisionTextState()
+        self._answer_stream_started = False
+        self._answer_stream_suppressed = False
 
     def header(
         self,
@@ -83,6 +86,9 @@ class PrettyRenderer:
     def turn_start(self, *, show_elapsed: bool = True) -> None:
         if self.state.turn_active:
             self.console.print()
+        self._answer_state = RevisionTextState()
+        self._answer_stream_started = False
+        self._answer_stream_suppressed = False
         self.console.print(Rule("working", style="dim"))
         self.console.print()
         self.state = RenderState(last_block="boundary", turn_active=True)
@@ -110,8 +116,12 @@ class PrettyRenderer:
         self.state.turn_active = False
 
     def turn_abort(self) -> None:
-        if self.state.turn_active or self._elapsed_status is not None:
+        if self.state.turn_active or self._elapsed_status is not None or self._answer_stream_started:
             self._stop_elapsed(label="stopped")
+            if self._answer_stream_started and not self._answer_stream_suppressed:
+                self.console.print()
+            self._answer_stream_started = False
+            self._answer_stream_suppressed = False
             self.state.turn_active = False
 
     def _stop_elapsed(self, *, label: str) -> None:
@@ -129,6 +139,15 @@ class PrettyRenderer:
 
     def live_event(self, event: Any) -> None:
         if not isinstance(event, dict):
+            return
+        previous_text = self._answer_state.text
+        previous_message_id = self._answer_state.message_id
+        if self._answer_state.apply(event):
+            self._render_stream_answer_event(
+                event,
+                previous_text=previous_text,
+                previous_message_id=previous_message_id,
+            )
             return
         if event.get("type") != "canonical_intermediate_message":
             return
@@ -177,8 +196,87 @@ class PrettyRenderer:
         self.console.print(Text(text, style="dim"))
         self.state.last_block = "activity"
 
+    def _start_stream_answer(self) -> None:
+        if self._answer_stream_started:
+            return
+        self.finish_elapsed()
+        self.console.print()
+        self.console.print(Rule("answer"))
+        self.console.print()
+        self._answer_stream_started = True
+        self.state.last_block = "answer"
+        self.state.turn_active = True
+
+    def _suppress_revised_stream(self) -> None:
+        if self._answer_stream_suppressed:
+            return
+        if self._answer_stream_started:
+            self.console.print()
+        self.console.print(Text("Response revised while streaming; canonical final follows.", style="dim"))
+        self._answer_stream_suppressed = True
+
+    def _render_stream_answer_event(
+        self,
+        event: dict[str, Any],
+        *,
+        previous_text: str,
+        previous_message_id: str | None,
+    ) -> None:
+        event_type = event.get("type")
+        message_id = self._answer_state.message_id
+        if self._answer_stream_suppressed:
+            return
+        if event_type == "assistant_text_revision":
+            self._suppress_revised_stream()
+            return
+
+        self._start_stream_answer()
+        if event_type == "assistant_text_delta":
+            delta = event.get("delta")
+            if isinstance(delta, str) and delta:
+                self.console.print(Text(delta), end="")
+            return
+
+        text = self._answer_state.text
+        if not previous_text or previous_message_id is None:
+            if text:
+                self.console.print(Text(text), end="")
+            return
+        if message_id == previous_message_id and text.startswith(previous_text):
+            suffix = text[len(previous_text) :]
+            if suffix:
+                self.console.print(Text(suffix), end="")
+            return
+        self._suppress_revised_stream()
+
     def answer(self, text: str) -> None:
         self.finish_elapsed()
+        if (
+            self._answer_stream_started
+            and not self._answer_stream_suppressed
+            and self._answer_state.text == text
+        ):
+            self.console.print()
+            self._answer_stream_started = False
+            self.state.last_block = "answer"
+            self.state.turn_active = False
+            return
+        if self._answer_stream_started:
+            if not self._answer_stream_suppressed:
+                self.console.print()
+                self.console.print(Text("Stream differed from canonical final; corrected answer follows.", style="dim"))
+            self._answer_stream_started = False
+            self._answer_stream_suppressed = False
+            self.console.print()
+            self.console.print(Rule("answer · final"))
+            self.console.print()
+            if self.settings.markdown and text:
+                self.console.print(Markdown(text))
+            else:
+                self.console.print(text)
+            self.state.last_block = "answer"
+            self.state.turn_active = False
+            return
         self.console.print()
         self.console.print(Rule("answer"))
         self.console.print()

@@ -80,6 +80,35 @@ def test_send_uses_attached_conversation_by_default(tmp_path: Path) -> None:
     assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "attached-ref"
 
 
+def test_extract_conversation_ref_supports_nested_sdk_conversation() -> None:
+    nested = type("Conversation", (), {"conversation_id": "nested-conv"})()
+    response = type("SDKResponse", (), {"conversation": nested})()
+
+    assert extract_conversation_ref(response) == "nested-conv"
+    assert extract_conversation_ref({"conversation": {"conversation_id": "dict-conv"}}) == "dict-conv"
+
+
+def test_send_new_persists_nested_sdk_conversation(tmp_path: Path) -> None:
+    class NestedClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any):
+            self.calls.append(("send", (prompt,), options))
+            nested = type("Conversation", (), {"conversation_id": "nested-new-conv"})()
+            return type("SDKResponse", (), {"text": "nested reply", "conversation": nested})()
+
+    FakeGpttyClient.instances.clear()
+    stdout = StringIO()
+
+    code = run_send(
+        make_args(tmp_path, new=True),
+        client_factory=NestedClient,
+        stdout=stdout,
+    )
+
+    assert code == 0
+    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "nested-new-conv"
+    assert stdout.getvalue() == "nested reply\n"
+
+
 def test_send_to_explicit_conversation_updates_state(tmp_path: Path) -> None:
     FakeGpttyClient.instances.clear()
     stdout = StringIO()

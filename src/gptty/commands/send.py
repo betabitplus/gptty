@@ -21,6 +21,7 @@ from ..required_action import maybe_render_required_action
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import StateError, load_chat_state, save_chat_state
+from ._client import build_client
 
 EMPTY_PROMPT_ERROR = "gptty send requires a prompt argument or piped stdin."
 NO_CONVERSATION_ERROR = (
@@ -130,10 +131,7 @@ def run_send(
         render_stale_lock_recovered(lock, stderr=stderr)
 
     try:
-        client = client_factory(
-            auth_file=getattr(args, "auth", "auth_data.json"),
-            timeout=getattr(args, "timeout", 90),
-        )
+        client = build_client(client_factory, args)
 
         if recorder is not None:
             recorder.event("waiting_for_reply")
@@ -222,17 +220,35 @@ def _render_lock_failure(exc: ConversationLockError, *, args: Any, stderr: TextI
 
 
 def extract_conversation_ref(response: Any, fallback: Any = None) -> str | None:
-    if isinstance(response, dict):
+    def resolve(value: Any, *, depth: int = 0) -> str | None:
+        if value is None or depth > 2:
+            return None
+        if isinstance(value, str):
+            return value if value.strip() else None
+        if isinstance(value, dict):
+            for field in CONVERSATION_REF_FIELDS:
+                candidate = value.get(field)
+                if candidate:
+                    return str(candidate)
+            nested = value.get("conversation")
+            if nested is not value:
+                resolved = resolve(nested, depth=depth + 1)
+                if resolved:
+                    return resolved
+            return None
+
         for field in CONVERSATION_REF_FIELDS:
-            value = response.get(field)
-            if value:
-                return str(value)
+            candidate = getattr(value, field, None)
+            if candidate:
+                return str(candidate)
+        nested = getattr(value, "conversation", None)
+        if nested is not value:
+            return resolve(nested, depth=depth + 1)
+        return None
 
-    for field in CONVERSATION_REF_FIELDS:
-        value = getattr(response, field, None)
-        if value:
-            return str(value)
-
+    resolved = resolve(response)
+    if resolved:
+        return resolved
     if fallback:
         return str(fallback)
     return None

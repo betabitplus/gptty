@@ -4,6 +4,7 @@ import json
 
 from gptty.output import (
     OutputMessage,
+    RevisionTextState,
     normalize_messages,
     normalize_response,
     normalize_status,
@@ -36,6 +37,47 @@ class TextResponse:
     def __init__(self, text: str, conversation_id: str = "conv-1") -> None:
         self.text = text
         self.conversation_id = conversation_id
+
+
+def test_revision_text_state_applies_snapshot_delta_and_revision() -> None:
+    state = RevisionTextState()
+
+    assert state.apply(
+        {
+            "type": "assistant_text_snapshot",
+            "sequence": 1,
+            "message_id": "assistant-1",
+            "text": "hel",
+        }
+    )
+    assert state.text == "hel"
+    assert state.apply(
+        {
+            "type": "assistant_text_delta",
+            "sequence": 2,
+            "message_id": "assistant-1",
+            "delta": "lo",
+        }
+    )
+    assert state.text == "hello"
+    assert state.apply(
+        {
+            "type": "assistant_text_revision",
+            "sequence": 3,
+            "message_id": "assistant-1",
+            "text": "hello!",
+        }
+    )
+    assert state.text == "hello!"
+    assert not state.apply(
+        {
+            "type": "assistant_text_delta",
+            "sequence": 2,
+            "message_id": "assistant-1",
+            "delta": "duplicate",
+        }
+    )
+    assert state.text == "hello!"
 
 
 def test_render_messages_plain() -> None:
