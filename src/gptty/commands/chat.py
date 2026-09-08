@@ -1039,12 +1039,19 @@ def _send_chat_prompt(
             print(token, end="", file=stdout, flush=True)
 
     def on_event(event: dict[str, Any]) -> None:
-        nonlocal write_conversation_ref
-        if event.get("type") == "browser_native_write_completed":
+        nonlocal active_ref, write_conversation_ref
+        event_type = event.get("type")
+        if event_type in {
+            "browser_native_write_identity_resolved",
+            "browser_native_write_completed",
+        }:
             candidate = event.get("conversation_id") or event.get("conversationId")
             if isinstance(candidate, str) and candidate.strip() and not candidate.strip().startswith("WEB:"):
                 write_conversation_ref = candidate.strip()
-            write_committed.set()
+                if not is_temporary and not active_ref:
+                    active_ref = write_conversation_ref
+            if event_type == "browser_native_write_completed":
+                write_committed.set()
         if stopped_by_user or local_quit_requested:
             return
         if renderer is not None:

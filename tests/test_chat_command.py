@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from argparse import Namespace
 from io import StringIO
 from types import SimpleNamespace
@@ -374,6 +375,83 @@ def test_ctrl_c_stops_active_turn_and_keeps_new_chat_attached(tmp_path, monkeypa
     assert ("answer", "partial answer") in renderer.events
     assert ("info", "Stopped by user.") in renderer.events
     assert notified == []
+
+
+def test_ctrl_c_new_chat_uses_browser_write_conversation_identity(tmp_path) -> None:
+    controls = TurnControlSignals()
+
+    class StopClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+            self.release = threading.Event()
+
+        def send(self, prompt, **options):
+            self.calls.append(("send", prompt))
+            options["on_event"](
+                {
+                    "type": "browser_native_write_identity_resolved",
+                    "conversation_id": "conv-stopped",
+                }
+            )
+            controls.request_stop()
+            assert self.release.wait(timeout=2.0)
+            return Response(
+                text="partial answer",
+                conversation_id="conv-stopped",
+                title="Stopped Chat",
+            )
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            self.release.set()
+            return {"ok": True, "stopped": True, "conversationId": "conv-stopped"}
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def live_event(self, event):
+            self.events.append(("live_event", event.get("type")))
+
+        def answer(self, text):
+            self.events.append(("answer", text))
+
+        def chat_link(self, ref):
+            self.events.append(("chat_link", ref))
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def info(self, text):
+            self.events.append(("info", text))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    client = StopClient()
+    renderer = FakeRenderer()
+    state = ChatState()
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="keep going for a while",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        turn_controls=controls,
+    )
+
+    assert code == 0
+    assert ("stop_generation", "conv-stopped") in client.calls
+    assert state.current_conversation == "conv-stopped"
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stopped"
+    assert ("info", "Stopped by user.") in renderer.events
 
 
 def test_second_ctrl_c_after_confirmed_stop_exits_local_readback_wait(tmp_path, monkeypatch) -> None:
