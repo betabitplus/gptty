@@ -20,6 +20,7 @@ webchat_state.json
 .env.*
 
 # Build / packaging
+uv.lock
 build/
 dist/
 *.egg-info/
