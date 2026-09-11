@@ -28,7 +28,16 @@ from ..output import normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
-from ..ui.commands import InteractiveCommands, ResumeRequest
+from ..ui.commands import (
+    UNFINISHED_STATUSES,
+    InteractiveCommands,
+    ResumeRequest,
+    _last_assistant_message_text,
+    _message_identity,
+    _message_text,
+    _snapshot_messages,
+    _snapshot_status,
+)
 from ._client import build_client
 from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
@@ -44,6 +53,9 @@ CHAT_HELP = """Commands:
 """
 
 LOCAL_QUIT_CODE = 97
+FOLLOW_INTERVAL_SECONDS = 5.0
+FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
+FOLLOW_MESSAGE_LIMIT = 128
 
 
 @dataclass
@@ -68,6 +80,18 @@ class _EnhancedTurn:
 class _EnhancedResume:
     request: ResumeRequest
     future: asyncio.Future[tuple[bool, Any]]
+
+
+@dataclass
+class _EnhancedFollow:
+    conversation_ref: str
+    emitted_message_ids: set[str]
+    seen_messages: dict[str, str]
+    deadline: float
+    timer: asyncio.Task[None] | None = None
+    future: asyncio.Future[tuple[bool, Any]] | None = None
+    stop_requested: bool = False
+    stopped_by_user: bool = False
 
 
 class _PromptAwareStream:
@@ -485,17 +509,49 @@ async def _enhanced_loop_core(
 ) -> _EnhancedLoopOutcome:
     active: _EnhancedTurn | None = None
     active_resume: _EnhancedResume | None = None
+    active_follow: _EnhancedFollow | None = None
+    pending_follow_command: str | None = None
     prompt_task: asyncio.Task[str] | None = None
     accepting_input = True
 
     while True:
+        if active_follow is not None and time.monotonic() >= active_follow.deadline:
+            _cancel_enhanced_follow_timer(active_follow)
+            renderer.info("Stopped following after 2 hours; conversation remains attached.")
+            active_follow = None
+
+        if (
+            active_follow is not None
+            and pending_follow_command is not None
+            and active_follow.future is None
+        ):
+            _cancel_enhanced_follow_timer(active_follow)
+            command = pending_follow_command
+            pending_follow_command = None
+            result = commands.handle(command)
+            if result is not None:
+                return _EnhancedLoopOutcome(exit_code=result)
+            if commands.has_pending_resume or commands.conversation_ref != active_follow.conversation_ref:
+                active_follow = None
+            else:
+                if command.split(maxsplit=1)[0].lower() == "/stop":
+                    active_follow.stopped_by_user = True
+                active_follow.stop_requested = False
+
         if active is None and active_resume is None and commands.has_pending_resume:
+            if active_follow is not None:
+                _cancel_enhanced_follow_timer(active_follow)
+                active_follow = None
             active_resume = _start_enhanced_resume(
                 get_client=get_client,
                 commands=commands,
             )
 
-        if active is None and active_resume is None:
+        if active_follow is not None and active is None and active_resume is None:
+            if active_follow.future is None and active_follow.timer is None:
+                _schedule_enhanced_follow_timer(active_follow)
+
+        if active is None and active_resume is None and active_follow is None:
             next_prompt: str | None = None
             automatic_turn = False
             if queued_prompts:
@@ -532,6 +588,11 @@ async def _enhanced_loop_core(
             wait_for.add(active.task)
         if active_resume is not None:
             wait_for.add(active_resume.future)
+        if active_follow is not None:
+            if active_follow.timer is not None:
+                wait_for.add(active_follow.timer)
+            if active_follow.future is not None:
+                wait_for.add(active_follow.future)
         if not wait_for:
             return _EnhancedLoopOutcome(exit_code=0)
 
@@ -547,6 +608,10 @@ async def _enhanced_loop_core(
                     active.controls.request_stop()
                 elif active_resume is not None:
                     renderer.info("Conversation is still loading; use Ctrl-\\ or /exit to exit gptty.")
+                elif active_follow is not None:
+                    pending_follow_command = "/stop"
+                    active_follow.stop_requested = True
+                    _cancel_enhanced_follow_timer(active_follow)
                 else:
                     return _EnhancedLoopOutcome(exit_code=130)
             except EOFError:
@@ -559,7 +624,22 @@ async def _enhanced_loop_core(
             else:
                 prompt = raw.strip()
                 if prompt:
-                    if active is None and active_resume is None:
+                    if active_follow is not None and active is None and active_resume is None:
+                        if not prompt.startswith("/"):
+                            queued_prompts.append(prompt)
+                            renderer.info(f"Queued · {len(queued_prompts)}")
+                        elif prompt.split(maxsplit=1)[0].lower() in {"/exit", "/quit"}:
+                            result = commands.handle(prompt)
+                            return _EnhancedLoopOutcome(exit_code=0 if result is None else result)
+                        elif prompt == "/":
+                            renderer.info(
+                                "While following: text queues · /stop · /exit · other commands run between follow reads"
+                            )
+                        else:
+                            pending_follow_command = prompt
+                            active_follow.stop_requested = True
+                            _cancel_enhanced_follow_timer(active_follow)
+                    elif active is None and active_resume is None:
                         if prompt.startswith("/"):
                             return _EnhancedLoopOutcome(command=prompt)
                         queued_prompts.append(prompt)
@@ -589,6 +669,12 @@ async def _enhanced_loop_core(
             resumed = False
             if ok:
                 resumed = commands.complete_resume(finished_resume.request, payload)
+                if resumed:
+                    active_follow = _seed_enhanced_follow(
+                        finished_resume.request,
+                        payload,
+                        renderer=renderer,
+                    )
             else:
                 commands.fail_resume(finished_resume.request, payload)
             if not resumed:
@@ -600,6 +686,30 @@ async def _enhanced_loop_core(
                         f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after failed resume."
                     )
             accepting_input = True
+
+        if active_follow is not None and active_follow.timer is not None and active_follow.timer in done:
+            active_follow.timer = None
+            if not active_follow.stop_requested:
+                _start_enhanced_follow_poll(active_follow, get_client=get_client)
+
+        if active_follow is not None and active_follow.future is not None and active_follow.future in done:
+            finished_follow = active_follow.future
+            active_follow.future = None
+            ok, payload = finished_follow.result()
+            keep_following = True
+            if ok:
+                keep_following = _apply_enhanced_follow_snapshot(
+                    active_follow,
+                    payload,
+                    renderer=renderer,
+                )
+            else:
+                renderer.warning(f"Live follow read failed; will retry: {payload}")
+            if not keep_following:
+                _cancel_enhanced_follow_timer(active_follow)
+                active_follow = None
+            elif active_follow.stop_requested and pending_follow_command is None:
+                active_follow.stop_requested = False
 
         if active is not None and active.task in done:
             finished_turn = active
@@ -639,10 +749,16 @@ def _start_enhanced_resume(
 
     def worker() -> None:
         try:
-            result: tuple[bool, Any] = (
-                True,
-                client.conversation_snapshot(request.conversation_ref),
-            )
+            follow_snapshot = getattr(client, "conversation_follow_snapshot", None)
+            if callable(follow_snapshot):
+                payload = follow_snapshot(
+                    request.conversation_ref,
+                    emitted_message_ids=(),
+                    limit=None,
+                )
+            else:
+                payload = client.conversation_snapshot(request.conversation_ref)
+            result: tuple[bool, Any] = (True, payload)
         except BaseException as exc:  # noqa: BLE001 - background resume boundary.
             result = (False, exc)
         try:
@@ -658,6 +774,147 @@ def _start_enhanced_resume(
         daemon=True,
     ).start()
     return _EnhancedResume(request=request, future=future)
+
+
+def _seed_enhanced_follow(
+    request: ResumeRequest,
+    snapshot: Any,
+    *,
+    renderer: PrettyRenderer,
+) -> _EnhancedFollow | None:
+    if not isinstance(snapshot, dict) or "emitted_message_ids" not in snapshot:
+        return None
+    status = _snapshot_status(snapshot)
+    if status not in UNFINISHED_STATUSES:
+        return None
+    emitted = {
+        str(message_id).strip()
+        for message_id in snapshot.get("emitted_message_ids", [])
+        if str(message_id).strip()
+    }
+    messages = _snapshot_messages(snapshot)
+    seen = {_message_identity(message): _message_text(message) for message in messages}
+    renderer.info("Following active response in background…")
+    return _EnhancedFollow(
+        conversation_ref=request.conversation_ref,
+        emitted_message_ids=emitted,
+        seen_messages=seen,
+        deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
+    )
+
+
+def _cancel_enhanced_follow_timer(follow: _EnhancedFollow) -> None:
+    timer = follow.timer
+    follow.timer = None
+    if timer is not None and not timer.done():
+        timer.cancel()
+
+
+def _schedule_enhanced_follow_timer(follow: _EnhancedFollow) -> bool:
+    if follow.stop_requested or follow.future is not None or follow.timer is not None:
+        return False
+    if time.monotonic() >= follow.deadline:
+        return False
+    follow.timer = asyncio.create_task(asyncio.sleep(FOLLOW_INTERVAL_SECONDS))
+    return True
+
+
+def _start_enhanced_follow_poll(
+    follow: _EnhancedFollow,
+    *,
+    get_client: Callable[[], Any],
+) -> None:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[bool, Any]] = loop.create_future()
+    client = get_client()
+    emitted = tuple(sorted(follow.emitted_message_ids))
+
+    def publish(result: tuple[bool, Any]) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def worker() -> None:
+        try:
+            result: tuple[bool, Any] = (
+                True,
+                client.conversation_follow_snapshot(
+                    follow.conversation_ref,
+                    emitted_message_ids=emitted,
+                    limit=FOLLOW_MESSAGE_LIMIT,
+                ),
+            )
+        except BaseException as exc:  # noqa: BLE001 - background follow boundary.
+            result = (False, exc)
+        try:
+            loop.call_soon_threadsafe(publish, result)
+        except RuntimeError:
+            pass
+
+    follow.future = future
+    threading.Thread(
+        target=worker,
+        name="gptty-resume-follow",
+        daemon=True,
+    ).start()
+
+
+def _apply_enhanced_follow_snapshot(
+    follow: _EnhancedFollow,
+    snapshot: Any,
+    *,
+    renderer: PrettyRenderer,
+) -> bool:
+    if not isinstance(snapshot, dict):
+        renderer.warning("Live follow stopped: invalid canonical snapshot.")
+        return False
+
+    events = snapshot.get("events")
+    event_items = [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+    event_ids = {
+        str(event.get("message_id")).strip()
+        for event in event_items
+        if event.get("message_id")
+    }
+    for event in event_items:
+        renderer.live_event(event)
+
+    emitted = snapshot.get("emitted_message_ids")
+    if isinstance(emitted, (list, tuple, set, frozenset)):
+        follow.emitted_message_ids = {
+            str(message_id).strip()
+            for message_id in emitted
+            if str(message_id).strip()
+        }
+
+    current = _snapshot_messages(snapshot)
+    changed: list[Any] = []
+    for message in current:
+        identity = _message_identity(message)
+        text = _message_text(message)
+        previous = follow.seen_messages.get(identity)
+        follow.seen_messages[identity] = text
+        if previous == text or identity in event_ids:
+            continue
+        changed.append(message)
+    if changed:
+        renderer.messages(normalize_messages(changed))
+
+    status = _snapshot_status(snapshot)
+    if status == "completed":
+        renderer.chat_link(follow.conversation_ref)
+        if not follow.stopped_by_user:
+            notify_response_complete(
+                chat_title=None,
+                final_response=_last_assistant_message_text(current),
+            )
+        return False
+    if status == "awaiting_tool_approval":
+        renderer.warning("Conversation is waiting for tool approval.")
+        return False
+    if status not in UNFINISHED_STATUSES:
+        renderer.info(f"Follow stopped: status={status or 'unknown'}")
+        return False
+    return True
 
 
 def _handle_resume_loading_input(

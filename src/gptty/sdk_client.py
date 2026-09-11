@@ -35,6 +35,8 @@ class ChatGPTWebClientProtocol(Protocol):
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any: ...
 
+    def conversation_follow_snapshot(self, url_or_id: Any, **options: Any) -> Any: ...
+
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any: ...
 
     def send_temporary(self, prompt: str, **options: Any) -> Any: ...
@@ -138,6 +140,12 @@ class _ProductRuntimeClient:
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
         return self.runtime.conversation_snapshot(url_or_id, **options)
+
+    def conversation_follow_snapshot(self, url_or_id: Any, **options: Any) -> Any:
+        helper = getattr(self.runtime, "conversation_follow_snapshot", None)
+        if callable(helper):
+            return helper(url_or_id, **options)
+        return self.runtime.conversation_snapshot(url_or_id)
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
         return self.runtime.stop_generation(url_or_id, **options)
@@ -257,6 +265,12 @@ class GpttyClient:
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any:
         return self._client.conversation_snapshot(url_or_id, **options)
+
+    def conversation_follow_snapshot(self, url_or_id: Any, **options: Any) -> Any:
+        helper = getattr(self._client, "conversation_follow_snapshot", None)
+        if callable(helper):
+            return helper(url_or_id, **options)
+        return self._client.conversation_snapshot(url_or_id)
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
         return self._client.stop_generation(url_or_id, **options)

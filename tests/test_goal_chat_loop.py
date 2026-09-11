@@ -675,6 +675,125 @@ def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, mon
     assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-resume"
 
 
+def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path, monkeypatch) -> None:
+    class LiveFollowClient:
+        instances: list["LiveFollowClient"] = []
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.follow_count = 0
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.follow_count += 1
+            self.calls.append(("follow", ref))
+            if self.follow_count == 1:
+                assert limit is None
+                return {
+                    "status": SimpleNamespace(status="tool_running"),
+                    "messages": [
+                        {"message_id": "u1", "role": "user", "text": "question"},
+                        {"message_id": "a0", "role": "assistant", "text": "first thought"},
+                    ],
+                    "events": [],
+                    "emitted_message_ids": ["old-event"],
+                }
+            if self.follow_count == 2:
+                assert "old-event" in emitted_message_ids
+                return {
+                    "status": SimpleNamespace(status="tool_running"),
+                    "messages": [
+                        {"message_id": "u1", "role": "user", "text": "question"},
+                        {"message_id": "a0", "role": "assistant", "text": "first thought"},
+                    ],
+                    "events": [
+                        {
+                            "type": "canonical_intermediate_message",
+                            "message_id": "reasoning-2",
+                            "message_kind": "reasoning",
+                            "text": "second live thought",
+                        }
+                    ],
+                    "emitted_message_ids": ["old-event", "reasoning-2"],
+                }
+            return {
+                "status": SimpleNamespace(status="completed"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                    {"message_id": "a0", "role": "assistant", "text": "first thought"},
+                    {"message_id": "a1", "role": "assistant", "text": "final answer"},
+                ],
+                "events": [],
+                "emitted_message_ids": ["old-event", "reasoning-2"],
+            }
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", ref))
+            return SimpleNamespace(
+                text="queued reply",
+                conversation_id=ref,
+                title="Live follow chat",
+            )
+
+    LiveFollowClient.instances.clear()
+    _FakeRenderer.instances.clear()
+
+    def saw_live_reasoning() -> bool:
+        return bool(_FakeRenderer.instances) and any(
+            event[0] == "live_event"
+            and isinstance(event[1], dict)
+            and event[1].get("message_id") == "reasoning-2"
+            for event in _FakeRenderer.instances[0].events
+        )
+
+    def queued_turn_sent() -> bool:
+        return bool(LiveFollowClient.instances) and any(
+            call[0] == "send_to_conversation"
+            for call in LiveFollowClient.instances[0].calls
+        )
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-live",
+            (saw_live_reasoning, "queued while following"),
+            (queued_turn_sent, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    monkeypatch.setattr("gptty.commands.chat.FOLLOW_INTERVAL_SECONDS", 0.001)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=LiveFollowClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = LiveFollowClient.instances[0]
+    assert client.follow_count >= 3
+    assert ("send_to_conversation", "conv-live") in client.calls
+    renderer = _FakeRenderer.instances[0]
+    assert saw_live_reasoning()
+    assert any(
+        event[0] == "messages"
+        and any(getattr(message, "text", "") == "final answer" for message in event[1])
+        for event in renderer.events
+    )
+
+
 def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeypatch) -> None:
     class BlockingResumeClient:
         instances: list["BlockingResumeClient"] = []
