@@ -796,6 +796,68 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
     )
 
 
+def test_resume_seed_renders_only_current_turn_intermediate_events() -> None:
+    _FakeRenderer.instances.clear()
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    snapshot = {
+        "status": SimpleNamespace(status="tool_running"),
+        "messages": [],
+        "events": [
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "old-reasoning",
+                "message_kind": "reasoning",
+                "turn_exchange_id": "turn-old",
+                "text": "historical reasoning",
+            },
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "current-tool",
+                "message_kind": "tool_call",
+                "turn_exchange_id": "turn-current",
+                "tool_name": "web.run",
+                "text": "current tool",
+            },
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "current-reasoning",
+                "message_kind": "reasoning",
+                "turn_exchange_id": "turn-current",
+                "text": "current reasoning",
+            },
+        ],
+        "emitted_message_ids": [
+            "old-reasoning",
+            "current-tool",
+            "current-reasoning",
+        ],
+        "current_turn_event_ids": ["current-tool", "current-reasoning"],
+        "stream_topic_id": "conversation-turn-turn-current",
+        "turn_exchange_id": "turn-current",
+        "stream_answer_message_id": None,
+        "stream_answer_text": "",
+    }
+
+    follow = chat_module._seed_enhanced_follow(
+        SimpleNamespace(conversation_ref="conv-current"),
+        snapshot,
+        renderer=renderer,
+    )
+
+    assert follow is not None
+    assert follow.emitted_message_ids == {
+        "old-reasoning",
+        "current-tool",
+        "current-reasoning",
+    }
+    rendered_ids = [
+        event[1].get("message_id")
+        for event in renderer.events
+        if event[0] == "live_event" and isinstance(event[1], dict)
+    ]
+    assert rendered_ids == ["current-tool", "current-reasoning"]
+
+
 def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeypatch) -> None:
     class StreamFollowClient:
         instances: list["StreamFollowClient"] = []

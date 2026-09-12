@@ -824,9 +824,15 @@ async def _enhanced_loop_core(
                 else:
                     active_follow.stream_disabled = True
                     active_follow.next_interval = FOLLOW_MIN_INTERVAL_SECONDS
-                    renderer.warning(
-                        f"Live stream unavailable; falling back to canonical polling: {payload}"
-                    )
+                    stream_error = str(payload)
+                    if "maximum length for this conversation" in stream_error.lower():
+                        renderer.warning(
+                            "Live stream rejected for this long conversation; continuing via canonical polling."
+                        )
+                    else:
+                        renderer.warning(
+                            f"Live stream unavailable; falling back to canonical polling: {payload}"
+                        )
             elif ok:
                 keep_following = _apply_enhanced_follow_snapshot(
                     active_follow,
@@ -953,6 +959,24 @@ def _seed_enhanced_follow(
         if stream_topic_id
         else "Following active response in background…"
     )
+    current_turn_event_ids = {
+        str(message_id).strip()
+        for message_id in snapshot.get("current_turn_event_ids", [])
+        if str(message_id).strip()
+    }
+    raw_events = snapshot.get("events")
+    if current_turn_event_ids and isinstance(raw_events, list):
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            message_id = event.get("message_id")
+            normalized_message_id = (
+                message_id.strip()
+                if isinstance(message_id, str) and message_id.strip()
+                else None
+            )
+            if normalized_message_id in current_turn_event_ids:
+                renderer.live_event(event)
     return _EnhancedFollow(
         conversation_ref=request.conversation_ref,
         emitted_message_ids=emitted,
