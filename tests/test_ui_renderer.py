@@ -57,6 +57,32 @@ def test_renderer_live_tool_calls_use_compact_formatter() -> None:
     assert "Searching LOCAL_QUIT_CODE" not in text
 
 
+def test_renderer_surfaces_tool_result_errors_but_hides_successes() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "text": '{"ok":true,"message":"done"}',
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "tool_name": "api_tool.call_tool",
+            "text": '{"ok":false,"error":"Workspace not found"}',
+        }
+    )
+
+    text = out.getvalue()
+    assert "done" not in text
+    assert "api_tool.call_tool failed · Workspace not found" in text
+
+
 def test_renderer_header_shows_full_chat_link() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))

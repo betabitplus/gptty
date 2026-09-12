@@ -10,7 +10,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.text import Text
 
-from ..output import OutputMessage, RevisionTextState, render_tool_call_parts
+from ..output import OutputMessage, RevisionTextState, _tool_result_error, render_tool_call_parts
 from .state import UISettings
 
 
@@ -168,6 +168,12 @@ class PrettyRenderer:
             name, detail = render_tool_call_parts(tool=tool_name, text=text, label=label)
             if name:
                 self.tool(name, detail)
+            return
+
+        if kind == "tool_result":
+            error = _tool_result_error(text)
+            if error:
+                self.warning(f"{tool_name or 'tool'} failed · {error}")
             return
 
         if kind == "activity":

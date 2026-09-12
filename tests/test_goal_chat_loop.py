@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from io import StringIO
 from types import SimpleNamespace
 
@@ -952,6 +953,146 @@ def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeyp
         and event[1].get("delta") == " final"
         for event in renderer.events
     )
+
+
+def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
+    tmp_path, monkeypatch
+) -> None:
+    class SilentStreamClient:
+        instances: list["SilentStreamClient"] = []
+        release_stream = threading.Event()
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.snapshot_count = 0
+            self.stream_count = 0
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.snapshot_count += 1
+            self.calls.append(("snapshot", ref))
+            if self.snapshot_count == 1:
+                assert limit is None
+                return {
+                    "status": SimpleNamespace(status="tool_running"),
+                    "messages": [
+                        {"message_id": "u1", "role": "user", "text": "question"},
+                    ],
+                    "events": [],
+                    "emitted_message_ids": ["old-event"],
+                    "stream_topic_id": "conversation-turn-turn-silent",
+                    "turn_exchange_id": "turn-silent",
+                    "stream_answer_message_id": None,
+                    "stream_answer_text": "",
+                }
+            assert limit == chat_module.FOLLOW_MESSAGE_LIMIT
+            assert "old-event" in emitted_message_ids
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                ],
+                "events": [
+                    {
+                        "type": "canonical_intermediate_message",
+                        "message_id": "reasoning-reconciled",
+                        "message_kind": "reasoning",
+                        "text": "visible only through canonical reconciliation",
+                    }
+                ],
+                "emitted_message_ids": ["old-event", "reasoning-reconciled"],
+                "stream_topic_id": "conversation-turn-turn-silent",
+                "turn_exchange_id": "turn-silent",
+                "stream_answer_message_id": None,
+                "stream_answer_text": "",
+            }
+
+        def conversation_follow_stream(
+            self,
+            ref: str,
+            *,
+            topic_id,
+            emitted_message_ids,
+            answer_message_id,
+            answer_text,
+            timeout,
+            limit,
+            on_event,
+            should_stop,
+        ):
+            self.stream_count += 1
+            self.calls.append(("stream", ref))
+            assert topic_id == "conversation-turn-turn-silent"
+            assert "old-event" in emitted_message_ids
+            assert answer_message_id is None
+            assert answer_text == ""
+            assert limit == chat_module.FOLLOW_MESSAGE_LIMIT
+            deadline = time.monotonic() + 2.0
+            while (
+                not self.release_stream.is_set()
+                and not should_stop()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+            return {
+                "stream_completed": False,
+                "stream_cancelled": should_stop(),
+                "stream_topic_id": topic_id,
+                "emitted_message_ids": list(emitted_message_ids),
+            }
+
+    SilentStreamClient.instances.clear()
+    SilentStreamClient.release_stream.clear()
+    _FakeRenderer.instances.clear()
+
+    def saw_reconciled_reasoning() -> bool:
+        visible = bool(_FakeRenderer.instances) and any(
+            event[0] == "live_event"
+            and isinstance(event[1], dict)
+            and event[1].get("message_id") == "reasoning-reconciled"
+            for event in _FakeRenderer.instances[0].events
+        )
+        if visible:
+            SilentStreamClient.release_stream.set()
+        return visible
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-silent",
+            (saw_reconciled_reasoning, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    monkeypatch.setattr(
+        "gptty.commands.chat.FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS",
+        0.001,
+    )
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=SilentStreamClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = SilentStreamClient.instances[0]
+    assert client.stream_count == 1
+    assert client.snapshot_count >= 2
+    assert ("stream", "conv-silent") in client.calls
+    assert saw_reconciled_reasoning()
 
 
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:

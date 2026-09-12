@@ -54,6 +54,7 @@ CHAT_HELP = """Commands:
 
 LOCAL_QUIT_CODE = 97
 FOLLOW_MIN_INTERVAL_SECONDS = 15.0
+FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS = 5.0
 FOLLOW_MAX_IDLE_INTERVAL_SECONDS = 60.0
 FOLLOW_RATE_LIMIT_BACKOFF_SECONDS = 120.0
 FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
@@ -101,6 +102,10 @@ class _EnhancedFollow:
     future: asyncio.Future[tuple[bool, Any]] | None = None
     event_queue: asyncio.Queue[dict[str, Any]] | None = None
     event_task: asyncio.Task[dict[str, Any]] | None = None
+    reconcile_timer: asyncio.Task[None] | None = None
+    reconcile_future: asyncio.Future[tuple[bool, Any]] | None = None
+    reconcile_interval: float = FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
+    terminal_reconciled: bool = False
     stop_requested: bool = False
     stopped_by_user: bool = False
 
@@ -530,6 +535,7 @@ async def _enhanced_loop_core(
             active_follow.stop_requested = True
             _cancel_enhanced_follow_timer(active_follow)
             _cancel_enhanced_follow_event_task(active_follow)
+            _cancel_enhanced_follow_reconcile(active_follow)
             renderer.info("Stopped following after 2 hours; conversation remains attached.")
             active_follow = None
 
@@ -556,6 +562,7 @@ async def _enhanced_loop_core(
                 active_follow.stop_requested = True
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
+                _cancel_enhanced_follow_reconcile(active_follow)
                 active_follow = None
             active_resume = _start_enhanced_resume(
                 get_client=get_client,
@@ -614,6 +621,10 @@ async def _enhanced_loop_core(
                 wait_for.add(active_follow.future)
             if active_follow.event_task is not None:
                 wait_for.add(active_follow.event_task)
+            if active_follow.reconcile_timer is not None:
+                wait_for.add(active_follow.reconcile_timer)
+            if active_follow.reconcile_future is not None:
+                wait_for.add(active_follow.reconcile_future)
         if not wait_for:
             return _EnhancedLoopOutcome(exit_code=0)
 
@@ -727,6 +738,54 @@ async def _enhanced_loop_core(
                 )
             _restart_enhanced_follow_event_task(active_follow)
 
+        if (
+            active_follow is not None
+            and active_follow.reconcile_timer is not None
+            and active_follow.reconcile_timer in done
+        ):
+            active_follow.reconcile_timer = None
+            _start_enhanced_follow_reconcile(active_follow, get_client=get_client)
+
+        if (
+            active_follow is not None
+            and active_follow.reconcile_future is not None
+            and active_follow.reconcile_future in done
+        ):
+            finished_reconcile = active_follow.reconcile_future
+            active_follow.reconcile_future = None
+            try:
+                reconcile_ok, reconcile_payload = finished_reconcile.result()
+            except asyncio.CancelledError:
+                reconcile_ok, reconcile_payload = False, None
+            if reconcile_ok:
+                keep_following = _apply_enhanced_follow_snapshot(
+                    active_follow,
+                    reconcile_payload,
+                    renderer=renderer,
+                )
+                if keep_following:
+                    active_follow.reconcile_interval = (
+                        FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
+                        if active_follow.next_interval == FOLLOW_MIN_INTERVAL_SECONDS
+                        else min(
+                            FOLLOW_MAX_IDLE_INTERVAL_SECONDS,
+                            max(
+                                FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS,
+                                active_follow.next_interval,
+                            ),
+                        )
+                    )
+                    _schedule_enhanced_follow_reconcile(active_follow)
+                else:
+                    active_follow.terminal_reconciled = True
+                    active_follow.stop_requested = True
+                    _cancel_enhanced_follow_reconcile(active_follow)
+            else:
+                renderer.warning(
+                    f"Live follow canonical reconciliation failed; retrying: {reconcile_payload}"
+                )
+                _schedule_enhanced_follow_reconcile(active_follow)
+
         if active_follow is not None and active_follow.timer is not None and active_follow.timer in done:
             active_follow.timer = None
             if not active_follow.stop_requested:
@@ -737,6 +796,7 @@ async def _enhanced_loop_core(
             follow_mode = active_follow.mode
             active_follow.future = None
             active_follow.mode = None
+            _cancel_enhanced_follow_reconcile(active_follow)
             ok, payload = finished_follow.result()
             keep_following = True
 
@@ -747,7 +807,9 @@ async def _enhanced_loop_core(
                 )
                 _cancel_enhanced_follow_event_task(active_follow)
                 active_follow.event_queue = None
-                if ok and isinstance(payload, dict) and payload.get("stream_completed") is True:
+                if active_follow.terminal_reconciled:
+                    keep_following = False
+                elif ok and isinstance(payload, dict) and payload.get("stream_completed") is True:
                     keep_following = _apply_enhanced_follow_snapshot(
                         active_follow,
                         payload,
@@ -781,6 +843,7 @@ async def _enhanced_loop_core(
             if not keep_following:
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
+                _cancel_enhanced_follow_reconcile(active_follow)
                 active_follow = None
             elif active_follow.stop_requested and pending_follow_command is None:
                 active_follow.stop_requested = False
@@ -925,6 +988,92 @@ def _cancel_enhanced_follow_event_task(follow: _EnhancedFollow) -> None:
         task.cancel()
 
 
+def _cancel_enhanced_follow_reconcile(follow: _EnhancedFollow) -> None:
+    timer = follow.reconcile_timer
+    follow.reconcile_timer = None
+    if timer is not None and not timer.done():
+        timer.cancel()
+    future = follow.reconcile_future
+    follow.reconcile_future = None
+    if future is not None and not future.done():
+        future.cancel()
+
+
+def _schedule_enhanced_follow_reconcile(follow: _EnhancedFollow) -> bool:
+    if (
+        follow.stop_requested
+        or follow.terminal_reconciled
+        or follow.mode != "stream"
+        or follow.future is None
+        or follow.reconcile_timer is not None
+        or follow.reconcile_future is not None
+        or time.monotonic() >= follow.deadline
+    ):
+        return False
+    follow.reconcile_timer = asyncio.create_task(
+        asyncio.sleep(max(FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS, follow.reconcile_interval))
+    )
+    return True
+
+
+def _reset_enhanced_follow_reconcile_timer(follow: _EnhancedFollow) -> None:
+    follow.reconcile_interval = FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
+    timer = follow.reconcile_timer
+    follow.reconcile_timer = None
+    if timer is not None and not timer.done():
+        timer.cancel()
+    _schedule_enhanced_follow_reconcile(follow)
+
+
+def _start_enhanced_follow_reconcile(
+    follow: _EnhancedFollow,
+    *,
+    get_client: Callable[[], Any],
+) -> bool:
+    if (
+        follow.stop_requested
+        or follow.terminal_reconciled
+        or follow.mode != "stream"
+        or follow.future is None
+        or follow.reconcile_future is not None
+    ):
+        return False
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[bool, Any]] = loop.create_future()
+    client = get_client()
+    emitted = tuple(sorted(follow.emitted_message_ids))
+
+    def publish(result: tuple[bool, Any]) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def worker() -> None:
+        try:
+            result: tuple[bool, Any] = (
+                True,
+                client.conversation_follow_snapshot(
+                    follow.conversation_ref,
+                    emitted_message_ids=emitted,
+                    limit=FOLLOW_MESSAGE_LIMIT,
+                ),
+            )
+        except BaseException as exc:  # noqa: BLE001 - background reconciliation boundary.
+            result = (False, exc)
+        try:
+            loop.call_soon_threadsafe(publish, result)
+        except RuntimeError:
+            pass
+
+    follow.reconcile_future = future
+    threading.Thread(
+        target=worker,
+        name="gptty-resume-stream-reconcile",
+        daemon=True,
+    ).start()
+    return True
+
+
 def _start_enhanced_follow_stream(
     follow: _EnhancedFollow,
     *,
@@ -999,6 +1148,7 @@ def _start_enhanced_follow_stream(
         name="gptty-resume-stream-follow",
         daemon=True,
     ).start()
+    _schedule_enhanced_follow_reconcile(follow)
     return True
 
 
@@ -1022,6 +1172,7 @@ def _apply_enhanced_follow_stream_event(
         if normalized_message_id is not None:
             follow.emitted_message_ids.add(normalized_message_id)
         renderer.live_event(event)
+        _reset_enhanced_follow_reconcile_timer(follow)
         return
 
     if event_type not in {
@@ -1048,6 +1199,7 @@ def _apply_enhanced_follow_stream_event(
     if follow.stream_answer_message_id:
         follow.seen_messages[follow.stream_answer_message_id] = follow.stream_answer_text
     renderer.live_event(event)
+    _reset_enhanced_follow_reconcile_timer(follow)
 
 
 def _drain_enhanced_follow_stream_events(
@@ -1137,7 +1289,25 @@ def _apply_enhanced_follow_snapshot(
         return False
 
     events = snapshot.get("events")
-    event_items = [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+    raw_event_items = (
+        [event for event in events if isinstance(event, dict)]
+        if isinstance(events, list)
+        else []
+    )
+    event_items: list[dict[str, Any]] = []
+    for event in raw_event_items:
+        message_id = event.get("message_id")
+        normalized_message_id = (
+            message_id.strip()
+            if isinstance(message_id, str) and message_id.strip()
+            else None
+        )
+        if (
+            normalized_message_id is not None
+            and normalized_message_id in follow.emitted_message_ids
+        ):
+            continue
+        event_items.append(event)
     event_ids = {
         str(event.get("message_id")).strip()
         for event in event_items
@@ -1148,11 +1318,11 @@ def _apply_enhanced_follow_snapshot(
 
     emitted = snapshot.get("emitted_message_ids")
     if isinstance(emitted, (list, tuple, set, frozenset)):
-        follow.emitted_message_ids = {
+        follow.emitted_message_ids.update(
             str(message_id).strip()
             for message_id in emitted
             if str(message_id).strip()
-        }
+        )
 
     current = _snapshot_messages(snapshot)
     changed: list[Any] = []
