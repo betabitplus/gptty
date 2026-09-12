@@ -5,9 +5,10 @@ This checklist is for publishing `gptty-web` to PyPI.
 ## Before Tagging
 
 1. Confirm `pyproject.toml` has the intended version.
-2. Confirm `CHANGELOG.md` has an entry for that version.
-3. Confirm CI is green on `main`.
-4. Confirm package metadata builds cleanly:
+2. Confirm `CHANGELOG.md` has a dated entry for that version.
+3. If the release depends on new CWA behavior, confirm that CWA version is already public on PyPI and raise gptty's minimum CWA dependency to that version before the final tag. For staged gptty 0.1.2, this means waiting for CWA 0.3.1 and then changing the minimum from `>=0.3.0` to `>=0.3.1`.
+4. Confirm CI is green on `main`, including the macOS installed-WK gate.
+5. Confirm package metadata builds cleanly:
 
    ```bash
    python -m pip install --upgrade pip
@@ -16,7 +17,7 @@ This checklist is for publishing `gptty-web` to PyPI.
    python -m twine check dist/*
    ```
 
-5. Confirm the wheel installs and exposes the command:
+6. Confirm the wheel installs and exposes the command:
 
    ```bash
    python -m pip install dist/*.whl
@@ -43,8 +44,8 @@ The GitHub environment name must match the PyPI trusted publisher configuration.
 2. Create and push a tag that matches the package version:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.2
+   git push origin v0.1.2
    ```
 
 3. Create a GitHub Release from the tag.

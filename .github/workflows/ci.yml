@@ -49,3 +49,35 @@ jobs:
           python -m pip install dist/*.whl
           gptty --version
           gptty auth status --auth missing-auth-data.json || test "$?" -eq 1
+
+  macos-wk-installed:
+    runs-on: macos-latest
+    env:
+      CWA_CANDIDATE_REF: prerelease/wkwebview-main-hardening
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: betabitplus/chatgpt-web-adapter
+          ref: ${{ env.CWA_CANDIDATE_REF }}
+          path: .cwa-candidate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build exact candidate wheels
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir artifacts/cwa .cwa-candidate
+          python -m build --wheel --outdir artifacts/gptty .
+
+      - name: Install exact candidate wheels
+        run: |
+          python -m pip install --force-reinstall artifacts/cwa/*.whl artifacts/gptty/*.whl
+          python -m pip check
+
+      - name: Verify installed WK runtime
+        run: |
+          python tools/installed_wk_smoke.py
