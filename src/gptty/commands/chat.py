@@ -92,8 +92,15 @@ class _EnhancedFollow:
     seen_messages: dict[str, str]
     deadline: float
     next_interval: float = FOLLOW_MIN_INTERVAL_SECONDS
+    stream_topic_id: str | None = None
+    stream_answer_message_id: str | None = None
+    stream_answer_text: str = ""
+    stream_disabled: bool = False
+    mode: str | None = None
     timer: asyncio.Task[None] | None = None
     future: asyncio.Future[tuple[bool, Any]] | None = None
+    event_queue: asyncio.Queue[dict[str, Any]] | None = None
+    event_task: asyncio.Task[dict[str, Any]] | None = None
     stop_requested: bool = False
     stopped_by_user: bool = False
 
@@ -520,7 +527,9 @@ async def _enhanced_loop_core(
 
     while True:
         if active_follow is not None and time.monotonic() >= active_follow.deadline:
+            active_follow.stop_requested = True
             _cancel_enhanced_follow_timer(active_follow)
+            _cancel_enhanced_follow_event_task(active_follow)
             renderer.info("Stopped following after 2 hours; conversation remains attached.")
             active_follow = None
 
@@ -544,7 +553,9 @@ async def _enhanced_loop_core(
 
         if active is None and active_resume is None and commands.has_pending_resume:
             if active_follow is not None:
+                active_follow.stop_requested = True
                 _cancel_enhanced_follow_timer(active_follow)
+                _cancel_enhanced_follow_event_task(active_follow)
                 active_follow = None
             active_resume = _start_enhanced_resume(
                 get_client=get_client,
@@ -553,7 +564,11 @@ async def _enhanced_loop_core(
 
         if active_follow is not None and active is None and active_resume is None:
             if active_follow.future is None and active_follow.timer is None:
-                _schedule_enhanced_follow_timer(active_follow)
+                if not _start_enhanced_follow_stream(
+                    active_follow,
+                    get_client=get_client,
+                ):
+                    _schedule_enhanced_follow_timer(active_follow)
 
         if active is None and active_resume is None and active_follow is None:
             next_prompt: str | None = None
@@ -597,6 +612,8 @@ async def _enhanced_loop_core(
                 wait_for.add(active_follow.timer)
             if active_follow.future is not None:
                 wait_for.add(active_follow.future)
+            if active_follow.event_task is not None:
+                wait_for.add(active_follow.event_task)
         if not wait_for:
             return _EnhancedLoopOutcome(exit_code=0)
 
@@ -691,6 +708,25 @@ async def _enhanced_loop_core(
                     )
             accepting_input = True
 
+        if (
+            active_follow is not None
+            and active_follow.event_task is not None
+            and active_follow.event_task in done
+        ):
+            finished_event_task = active_follow.event_task
+            active_follow.event_task = None
+            try:
+                stream_event = finished_event_task.result()
+            except asyncio.CancelledError:
+                stream_event = None
+            if stream_event is not None:
+                _apply_enhanced_follow_stream_event(
+                    active_follow,
+                    stream_event,
+                    renderer=renderer,
+                )
+            _restart_enhanced_follow_event_task(active_follow)
+
         if active_follow is not None and active_follow.timer is not None and active_follow.timer in done:
             active_follow.timer = None
             if not active_follow.stop_requested:
@@ -698,10 +734,38 @@ async def _enhanced_loop_core(
 
         if active_follow is not None and active_follow.future is not None and active_follow.future in done:
             finished_follow = active_follow.future
+            follow_mode = active_follow.mode
             active_follow.future = None
+            active_follow.mode = None
             ok, payload = finished_follow.result()
             keep_following = True
-            if ok:
+
+            if follow_mode == "stream":
+                _drain_enhanced_follow_stream_events(
+                    active_follow,
+                    renderer=renderer,
+                )
+                _cancel_enhanced_follow_event_task(active_follow)
+                active_follow.event_queue = None
+                if ok and isinstance(payload, dict) and payload.get("stream_completed") is True:
+                    keep_following = _apply_enhanced_follow_snapshot(
+                        active_follow,
+                        payload,
+                        renderer=renderer,
+                    )
+                elif ok:
+                    if not active_follow.stop_requested:
+                        active_follow.stream_disabled = True
+                        renderer.warning(
+                            "Live stream ended before completion; falling back to canonical polling."
+                        )
+                else:
+                    active_follow.stream_disabled = True
+                    active_follow.next_interval = FOLLOW_MIN_INTERVAL_SECONDS
+                    renderer.warning(
+                        f"Live stream unavailable; falling back to canonical polling: {payload}"
+                    )
+            elif ok:
                 keep_following = _apply_enhanced_follow_snapshot(
                     active_follow,
                     payload,
@@ -713,8 +777,10 @@ async def _enhanced_loop_core(
                     payload,
                     renderer=renderer,
                 )
+
             if not keep_following:
                 _cancel_enhanced_follow_timer(active_follow)
+                _cancel_enhanced_follow_event_task(active_follow)
                 active_follow = None
             elif active_follow.stop_requested and pending_follow_command is None:
                 active_follow.stop_requested = False
@@ -802,13 +868,37 @@ def _seed_enhanced_follow(
     }
     messages = _snapshot_messages(snapshot)
     seen = {_message_identity(message): _message_text(message) for message in messages}
-    renderer.info("Following active response in background…")
+    stream_topic_id = snapshot.get("stream_topic_id")
+    if not isinstance(stream_topic_id, str) or not stream_topic_id.strip():
+        stream_topic_id = None
+    else:
+        stream_topic_id = stream_topic_id.strip()
+    stream_answer_message_id = snapshot.get("stream_answer_message_id")
+    if (
+        not isinstance(stream_answer_message_id, str)
+        or not stream_answer_message_id.strip()
+    ):
+        stream_answer_message_id = None
+    else:
+        stream_answer_message_id = stream_answer_message_id.strip()
+    stream_answer_text = snapshot.get("stream_answer_text")
+    if not isinstance(stream_answer_text, str):
+        stream_answer_text = ""
+
+    renderer.info(
+        "Following active response via live stream…"
+        if stream_topic_id
+        else "Following active response in background…"
+    )
     return _EnhancedFollow(
         conversation_ref=request.conversation_ref,
         emitted_message_ids=emitted,
         seen_messages=seen,
         deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
         next_interval=FOLLOW_MIN_INTERVAL_SECONDS,
+        stream_topic_id=stream_topic_id,
+        stream_answer_message_id=stream_answer_message_id,
+        stream_answer_text=stream_answer_text,
     )
 
 
@@ -826,6 +916,174 @@ def _schedule_enhanced_follow_timer(follow: _EnhancedFollow) -> bool:
         return False
     follow.timer = asyncio.create_task(asyncio.sleep(follow.next_interval))
     return True
+
+
+def _cancel_enhanced_follow_event_task(follow: _EnhancedFollow) -> None:
+    task = follow.event_task
+    follow.event_task = None
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _start_enhanced_follow_stream(
+    follow: _EnhancedFollow,
+    *,
+    get_client: Callable[[], Any],
+) -> bool:
+    topic_id = follow.stream_topic_id
+    if (
+        follow.stream_disabled
+        or not isinstance(topic_id, str)
+        or not topic_id
+        or follow.future is not None
+    ):
+        return False
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[tuple[bool, Any]] = loop.create_future()
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    client = get_client()
+    emitted = tuple(sorted(follow.emitted_message_ids))
+    remaining = max(1.0, follow.deadline - time.monotonic())
+
+    def publish(result: tuple[bool, Any]) -> None:
+        if not future.done():
+            future.set_result(result)
+
+    def publish_event(event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        queue.put_nowait(event)
+
+    def relay_event(event: Any) -> None:
+        try:
+            loop.call_soon_threadsafe(publish_event, event)
+        except RuntimeError:
+            pass
+
+    def should_stop() -> bool:
+        return follow.stop_requested or time.monotonic() >= follow.deadline
+
+    def worker() -> None:
+        try:
+            stream_follow = getattr(client, "conversation_follow_stream", None)
+            if not callable(stream_follow):
+                raise RuntimeError("live topic follow is unavailable")
+            result: tuple[bool, Any] = (
+                True,
+                stream_follow(
+                    follow.conversation_ref,
+                    topic_id=topic_id,
+                    emitted_message_ids=emitted,
+                    answer_message_id=follow.stream_answer_message_id,
+                    answer_text=follow.stream_answer_text,
+                    timeout=remaining,
+                    limit=FOLLOW_MESSAGE_LIMIT,
+                    on_event=relay_event,
+                    should_stop=should_stop,
+                ),
+            )
+        except BaseException as exc:  # noqa: BLE001 - background follow boundary.
+            result = (False, exc)
+        try:
+            loop.call_soon_threadsafe(publish, result)
+        except RuntimeError:
+            pass
+
+    follow.mode = "stream"
+    follow.future = future
+    follow.event_queue = queue
+    follow.event_task = asyncio.create_task(queue.get())
+    threading.Thread(
+        target=worker,
+        name="gptty-resume-stream-follow",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _apply_enhanced_follow_stream_event(
+    follow: _EnhancedFollow,
+    event: Any,
+    *,
+    renderer: PrettyRenderer,
+) -> None:
+    if not isinstance(event, dict):
+        return
+    event_type = event.get("type")
+    message_id = event.get("message_id")
+    normalized_message_id = (
+        message_id.strip()
+        if isinstance(message_id, str) and message_id.strip()
+        else None
+    )
+
+    if event_type == "canonical_intermediate_message":
+        if normalized_message_id is not None:
+            follow.emitted_message_ids.add(normalized_message_id)
+        renderer.live_event(event)
+        return
+
+    if event_type not in {
+        "assistant_text_snapshot",
+        "assistant_text_delta",
+        "assistant_text_revision",
+    }:
+        renderer.live_event(event)
+        return
+
+    if normalized_message_id is not None and normalized_message_id != follow.stream_answer_message_id:
+        follow.stream_answer_message_id = normalized_message_id
+        follow.stream_answer_text = ""
+
+    if event_type == "assistant_text_delta":
+        delta = event.get("delta")
+        if isinstance(delta, str) and delta:
+            follow.stream_answer_text += delta
+    else:
+        text = event.get("text")
+        if isinstance(text, str):
+            follow.stream_answer_text = text
+
+    if follow.stream_answer_message_id:
+        follow.seen_messages[follow.stream_answer_message_id] = follow.stream_answer_text
+    renderer.live_event(event)
+
+
+def _drain_enhanced_follow_stream_events(
+    follow: _EnhancedFollow,
+    *,
+    renderer: PrettyRenderer,
+) -> None:
+    task = follow.event_task
+    if task is not None and task.done() and not task.cancelled():
+        follow.event_task = None
+        try:
+            event = task.result()
+        except asyncio.CancelledError:
+            event = None
+        if event is not None:
+            _apply_enhanced_follow_stream_event(follow, event, renderer=renderer)
+
+    queue = follow.event_queue
+    if queue is None:
+        return
+    while True:
+        try:
+            event = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        _apply_enhanced_follow_stream_event(follow, event, renderer=renderer)
+
+
+def _restart_enhanced_follow_event_task(follow: _EnhancedFollow) -> None:
+    if (
+        follow.mode == "stream"
+        and follow.future is not None
+        and follow.event_queue is not None
+        and follow.event_task is None
+    ):
+        follow.event_task = asyncio.create_task(follow.event_queue.get())
 
 
 def _start_enhanced_follow_poll(
@@ -859,6 +1117,7 @@ def _start_enhanced_follow_poll(
         except RuntimeError:
             pass
 
+    follow.mode = "poll"
     follow.future = future
     threading.Thread(
         target=worker,

@@ -59,6 +59,10 @@ class FakeSdkClient:
         self.calls.append(("conversation_follow_snapshot", (url_or_id,), options))
         return "follow-snapshot-result"
 
+    def conversation_follow_stream(self, url_or_id: object, **options: object):
+        self.calls.append(("conversation_follow_stream", (url_or_id,), options))
+        return "follow-stream-result"
+
     def stop_generation(self, url_or_id: object = None, **options: object):
         self.calls.append(("stop_generation", (url_or_id,), options))
         return {"ok": True, "stopped": True, "conversationId": url_or_id}
@@ -142,6 +146,10 @@ class FakeProductRuntime:
     def conversation_follow_snapshot(self, url_or_id: object, **options: object):
         self.calls.append(("conversation_follow_snapshot", (url_or_id,), options))
         return "runtime-follow-snapshot-result"
+
+    def conversation_follow_stream(self, url_or_id: object, **options: object):
+        self.calls.append(("conversation_follow_stream", (url_or_id,), options))
+        return "runtime-follow-stream-result"
 
     def stop_generation(self, url_or_id: object = None, **options: object):
         self.calls.append(("stop_generation", (url_or_id,), options))
@@ -267,6 +275,7 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
     assert client.list_models() == "models-result"
     assert client.conversation_snapshot("abc", limit=10) == "snapshot-result"
     assert client.conversation_follow_snapshot("abc", emitted_message_ids=["m1"]) == "follow-snapshot-result"
+    assert client.conversation_follow_stream("abc", topic_id="topic-1") == "follow-stream-result"
     assert client.stop_generation("abc", timeout=3)["stopped"] is True
     assert client.temporary_lifecycle_snapshot()["state"] == "LIVE"
     assert client.end_temporary_chat() is True
@@ -281,6 +290,7 @@ def test_conversation_methods_delegate_to_sdk_client() -> None:
         ("list_models", (), {}),
         ("conversation_snapshot", ("abc",), {"limit": 10}),
         ("conversation_follow_snapshot", ("abc",), {"emitted_message_ids": ["m1"]}),
+        ("conversation_follow_stream", ("abc",), {"topic_id": "topic-1"}),
         ("stop_generation", ("abc",), {"timeout": 3}),
         ("temporary_lifecycle_snapshot", (), {}),
         ("end_temporary_chat", (), {}),
@@ -360,6 +370,7 @@ def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) ->
     assert client.attach_conversation("c1") == "runtime-attach-result"
     assert client.get_messages("c1", limit=4) == "runtime-messages-result"
     assert client.conversation_follow_snapshot("c1", emitted_message_ids=["m1"]) == "runtime-follow-snapshot-result"
+    assert client.conversation_follow_stream("c1", topic_id="topic-1") == "runtime-follow-stream-result"
     assert client.stop_generation("c1", timeout=2)["stopped"] is True
     status = client.wait_until_completed("c1", timeout=1, poll_interval=0.001)
 
@@ -368,8 +379,9 @@ def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) ->
     assert runtime.calls[0] == ("attach_conversation", ("c1",), {})
     assert runtime.calls[1] == ("get_messages", ("c1",), {"limit": 4})
     assert runtime.calls[2] == ("conversation_follow_snapshot", ("c1",), {"emitted_message_ids": ["m1"]})
-    assert runtime.calls[3] == ("stop_generation", ("c1",), {"timeout": 2})
-    assert runtime.calls[4:] == [
+    assert runtime.calls[3] == ("conversation_follow_stream", ("c1",), {"topic_id": "topic-1"})
+    assert runtime.calls[4] == ("stop_generation", ("c1",), {"timeout": 2})
+    assert runtime.calls[5:] == [
         ("get_status", ("c1",), {}),
         ("get_status", ("c1",), {}),
     ]

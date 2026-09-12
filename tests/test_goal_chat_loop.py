@@ -795,6 +795,165 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
     )
 
 
+def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeypatch) -> None:
+    class StreamFollowClient:
+        instances: list["StreamFollowClient"] = []
+        release_stream = threading.Event()
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.snapshot_count = 0
+            self.stream_count = 0
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.snapshot_count += 1
+            self.calls.append(("snapshot", ref))
+            assert limit is None
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                    {"message_id": "a1", "role": "assistant", "text": "partial"},
+                ],
+                "events": [],
+                "emitted_message_ids": ["old-event"],
+                "stream_topic_id": "conversation-turn-turn-1",
+                "turn_exchange_id": "turn-1",
+                "stream_answer_message_id": "a1",
+                "stream_answer_text": "partial",
+            }
+
+        def conversation_follow_stream(
+            self,
+            ref: str,
+            *,
+            topic_id,
+            emitted_message_ids,
+            answer_message_id,
+            answer_text,
+            timeout,
+            limit,
+            on_event,
+            should_stop,
+        ):
+            self.stream_count += 1
+            self.calls.append(("stream", ref))
+            assert topic_id == "conversation-turn-turn-1"
+            assert "old-event" in emitted_message_ids
+            assert answer_message_id == "a1"
+            assert answer_text == "partial"
+            assert limit == chat_module.FOLLOW_MESSAGE_LIMIT
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": "reasoning-live",
+                    "message_kind": "reasoning",
+                    "text": "live websocket thought",
+                }
+            )
+            assert self.release_stream.wait(timeout=2.0)
+            assert not should_stop()
+            on_event(
+                {
+                    "type": "assistant_text_delta",
+                    "message_id": "a1",
+                    "sequence": 1,
+                    "delta": " final",
+                }
+            )
+            return {
+                "stream_completed": True,
+                "status": SimpleNamespace(status="completed"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                    {"message_id": "a1", "role": "assistant", "text": "partial final"},
+                ],
+                "events": [],
+                "emitted_message_ids": ["old-event", "reasoning-live"],
+            }
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", ref))
+            return SimpleNamespace(
+                text="queued reply",
+                conversation_id=ref,
+                title="Stream follow chat",
+            )
+
+    StreamFollowClient.instances.clear()
+    StreamFollowClient.release_stream.clear()
+    _FakeRenderer.instances.clear()
+
+    def saw_stream_reasoning() -> bool:
+        return bool(_FakeRenderer.instances) and any(
+            event[0] == "live_event"
+            and isinstance(event[1], dict)
+            and event[1].get("message_id") == "reasoning-live"
+            for event in _FakeRenderer.instances[0].events
+        )
+
+    def queued_prompt_visible() -> bool:
+        visible = bool(_FakeRenderer.instances) and (
+            "info",
+            "Queued · 1",
+        ) in _FakeRenderer.instances[0].events
+        if visible:
+            StreamFollowClient.release_stream.set()
+        return visible
+
+    def queued_turn_sent() -> bool:
+        return bool(StreamFollowClient.instances) and any(
+            call[0] == "send_to_conversation"
+            for call in StreamFollowClient.instances[0].calls
+        )
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-stream",
+            (saw_stream_reasoning, "queued while streaming"),
+            (queued_prompt_visible, ""),
+            (queued_turn_sent, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=StreamFollowClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = StreamFollowClient.instances[0]
+    assert client.snapshot_count == 1
+    assert client.stream_count == 1
+    assert [call[0] for call in client.calls].count("snapshot") == 1
+    assert ("send_to_conversation", "conv-stream") in client.calls
+    renderer = _FakeRenderer.instances[0]
+    assert saw_stream_reasoning()
+    assert any(
+        event[0] == "live_event"
+        and isinstance(event[1], dict)
+        and event[1].get("type") == "assistant_text_delta"
+        and event[1].get("delta") == " final"
+        for event in renderer.events
+    )
+
+
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
     renderer = _FakeRenderer(StringIO(), SimpleNamespace())
     follow = chat_module._EnhancedFollow(
