@@ -147,6 +147,18 @@ class InteractiveCommands:
         self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
+        if isinstance(snapshot, dict) and snapshot.get("canonical_cache_stale") is True:
+            age_value = snapshot.get("canonical_cache_age_seconds")
+            if isinstance(age_value, (int, float)) and not isinstance(age_value, bool):
+                age_seconds = max(0, int(float(age_value)))
+                self.renderer.warning(
+                    "Canonical history is rate-limited; showing cached history "
+                    f"({age_seconds}s old)."
+                )
+            else:
+                self.renderer.warning(
+                    "Canonical history is rate-limited; showing cached history."
+                )
         status = _snapshot_status(snapshot)
         if status == "awaiting_tool_approval":
             self.renderer.warning("Conversation is waiting for tool approval.")

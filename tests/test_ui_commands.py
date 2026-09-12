@@ -187,6 +187,29 @@ def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> N
     assert [message.text for message in rendered] == ["question", "answer"]
 
 
+def test_resume_warns_when_history_comes_from_rate_limit_cache(tmp_path) -> None:
+    commands, renderer, _client, _state_path = make_commands(tmp_path)
+
+    commands.handle("/resume conv-cache")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.complete_resume(
+        request,
+        {
+            "status": SimpleNamespace(status="completed"),
+            "messages": [
+                {"message_id": "u1", "role": "user", "text": "cached question"},
+                {"message_id": "a1", "role": "assistant", "text": "cached answer"},
+            ],
+            "canonical_cache_stale": True,
+            "canonical_cache_age_seconds": 12.75,
+        },
+    )
+
+    warnings = [event[1] for event in renderer.events if event[0] == "warning"]
+    assert "Canonical history is rate-limited; showing cached history (12s old)." in warnings
+
+
 def test_resume_switches_while_already_attached_without_detach(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, _, client, state_path = make_commands(
