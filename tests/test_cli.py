@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import importlib.metadata
 from typing import Any
 
 import pytest
 
+import gptty
 import gptty.commands.ask as ask_command
 import gptty.commands.attach as attach_command
 import gptty.commands.chat as chat_command
@@ -19,6 +21,10 @@ from gptty.io import StdinReadError
 def _force_legacy_profile_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(profiles.PROFILE_ENV, raising=False)
     monkeypatch.setattr(profiles, "get_active_profile", lambda: None)
+
+
+def test_package_version_matches_distribution_metadata() -> None:
+    assert gptty.__version__ == importlib.metadata.version("gptty-web")
 
 
 def test_ask_uses_auto_stdin_mode_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
