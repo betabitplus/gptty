@@ -53,7 +53,10 @@ CHAT_HELP = """Commands:
 """
 
 LOCAL_QUIT_CODE = 97
-FOLLOW_INTERVAL_SECONDS = 5.0
+FOLLOW_MIN_INTERVAL_SECONDS = 15.0
+FOLLOW_MAX_IDLE_INTERVAL_SECONDS = 60.0
+FOLLOW_RATE_LIMIT_BACKOFF_SECONDS = 120.0
+FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
 FOLLOW_MESSAGE_LIMIT = 128
 
@@ -88,6 +91,7 @@ class _EnhancedFollow:
     emitted_message_ids: set[str]
     seen_messages: dict[str, str]
     deadline: float
+    next_interval: float = FOLLOW_MIN_INTERVAL_SECONDS
     timer: asyncio.Task[None] | None = None
     future: asyncio.Future[tuple[bool, Any]] | None = None
     stop_requested: bool = False
@@ -704,7 +708,11 @@ async def _enhanced_loop_core(
                     renderer=renderer,
                 )
             else:
-                renderer.warning(f"Live follow read failed; will retry: {payload}")
+                _backoff_enhanced_follow_after_error(
+                    active_follow,
+                    payload,
+                    renderer=renderer,
+                )
             if not keep_following:
                 _cancel_enhanced_follow_timer(active_follow)
                 active_follow = None
@@ -800,6 +808,7 @@ def _seed_enhanced_follow(
         emitted_message_ids=emitted,
         seen_messages=seen,
         deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
+        next_interval=FOLLOW_MIN_INTERVAL_SECONDS,
     )
 
 
@@ -815,7 +824,7 @@ def _schedule_enhanced_follow_timer(follow: _EnhancedFollow) -> bool:
         return False
     if time.monotonic() >= follow.deadline:
         return False
-    follow.timer = asyncio.create_task(asyncio.sleep(FOLLOW_INTERVAL_SECONDS))
+    follow.timer = asyncio.create_task(asyncio.sleep(follow.next_interval))
     return True
 
 
@@ -899,6 +908,14 @@ def _apply_enhanced_follow_snapshot(
     if changed:
         renderer.messages(normalize_messages(changed))
 
+    if event_items or changed:
+        follow.next_interval = FOLLOW_MIN_INTERVAL_SECONDS
+    else:
+        follow.next_interval = min(
+            FOLLOW_MAX_IDLE_INTERVAL_SECONDS,
+            max(FOLLOW_MIN_INTERVAL_SECONDS, follow.next_interval * 2.0),
+        )
+
     status = _snapshot_status(snapshot)
     if status == "completed":
         renderer.chat_link(follow.conversation_ref)
@@ -915,6 +932,32 @@ def _apply_enhanced_follow_snapshot(
         renderer.info(f"Follow stopped: status={status or 'unknown'}")
         return False
     return True
+
+
+def _backoff_enhanced_follow_after_error(
+    follow: _EnhancedFollow,
+    error: Any,
+    *,
+    renderer: PrettyRenderer,
+) -> None:
+    status_code = getattr(error, "status_code", None)
+    if status_code == 429:
+        follow.next_interval = min(
+            FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS,
+            max(FOLLOW_RATE_LIMIT_BACKOFF_SECONDS, follow.next_interval * 2.0),
+        )
+        renderer.warning(
+            f"Live follow rate limited; backing off {int(follow.next_interval)}s."
+        )
+        return
+
+    follow.next_interval = min(
+        FOLLOW_MAX_IDLE_INTERVAL_SECONDS,
+        max(FOLLOW_MIN_INTERVAL_SECONDS, follow.next_interval * 2.0),
+    )
+    renderer.warning(
+        f"Live follow read failed; retrying after {int(follow.next_interval)}s: {error}"
+    )
 
 
 def _handle_resume_loading_input(

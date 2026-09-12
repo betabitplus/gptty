@@ -552,7 +552,12 @@ class InteractiveCommands:
 
     def _choose_conversation(self, client: Any) -> str | None:
         try:
-            conversations = client.list_conversations()
+            recent_catalog = getattr(client, "list_recent_conversations", None)
+            conversations = (
+                recent_catalog(limit=100)
+                if callable(recent_catalog)
+                else client.list_conversations()
+            )
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Conversation list failed: {exc}")
             return None

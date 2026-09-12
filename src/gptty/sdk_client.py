@@ -31,6 +31,8 @@ class ChatGPTWebClientProtocol(Protocol):
 
     def list_conversations(self) -> Any: ...
 
+    def list_recent_conversations(self, *, limit: int = 100) -> Any: ...
+
     def list_models(self) -> Any: ...
 
     def conversation_snapshot(self, url_or_id: Any, **options: Any) -> Any: ...
@@ -122,6 +124,12 @@ class _ProductRuntimeClient:
 
     def list_conversations(self) -> Any:
         return self.runtime.list_conversations()
+
+    def list_recent_conversations(self, *, limit: int = 100) -> Any:
+        helper = getattr(self.runtime, "list_recent_conversations", None)
+        if callable(helper):
+            return helper(limit=limit)
+        return list(self.runtime.list_conversations())[:limit]
 
     def list_models(self) -> Any:
         return self.runtime.list_models()
@@ -259,6 +267,12 @@ class GpttyClient:
 
     def list_conversations(self) -> Any:
         return self._client.list_conversations()
+
+    def list_recent_conversations(self, *, limit: int = 100) -> Any:
+        helper = getattr(self._client, "list_recent_conversations", None)
+        if callable(helper):
+            return helper(limit=limit)
+        return list(self._client.list_conversations())[:limit]
 
     def list_models(self) -> Any:
         return self._client.list_models()

@@ -142,6 +142,30 @@ def finish_pending_resume(commands, client):
     return request
 
 
+def test_resume_picker_prefers_bounded_recent_catalog(tmp_path) -> None:
+    class RecentClient(FakeClient):
+        def list_recent_conversations(self, *, limit=100):
+            self.calls.append(("list_recent_conversations", limit))
+            return [
+                {"id": "conv-2", "title": "Second chat", "update_time": 2.0},
+                {"id": "conv-1", "title": "First chat", "update_time": 1.0},
+            ]
+
+        def list_conversations(self):
+            raise AssertionError("full catalog must not be used by /resume picker")
+
+    ui = FakeUI(choices=["conv-2"])
+    client = RecentClient()
+    commands, _renderer, _client, _state_path = make_commands(
+        tmp_path,
+        ui=ui,
+        client=client,
+    )
+
+    assert commands.handle("/resume") is None
+    assert client.calls == [("list_recent_conversations", 100)]
+
+
 def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> None:
     ui = FakeUI(choices=["conv-2"])
     commands, renderer, client, state_path = make_commands(tmp_path, ui=ui)

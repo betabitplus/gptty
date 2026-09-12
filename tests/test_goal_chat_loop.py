@@ -5,6 +5,7 @@ import threading
 from io import StringIO
 from types import SimpleNamespace
 
+from gptty.commands import chat as chat_module
 from gptty.commands.chat import run_chat
 from gptty.state import ChatState, GoalState, load_chat_state, save_chat_state
 
@@ -771,7 +772,7 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
     )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
-    monkeypatch.setattr("gptty.commands.chat.FOLLOW_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr("gptty.commands.chat.FOLLOW_MIN_INTERVAL_SECONDS", 0.001)
 
     code = run_chat(
         _args(tmp_path),
@@ -792,6 +793,90 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
         and any(getattr(message, "text", "") == "final answer" for message in event[1])
         for event in renderer.events
     )
+
+
+def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={
+            "u1": "question",
+            "a0": "first thought",
+        },
+        deadline=10_000.0,
+        next_interval=chat_module.FOLLOW_MIN_INTERVAL_SECONDS,
+    )
+
+    idle_snapshot = {
+        "status": SimpleNamespace(status="tool_running"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a0", "role": "assistant", "text": "first thought"},
+        ],
+        "events": [],
+        "emitted_message_ids": [],
+    }
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        idle_snapshot,
+        renderer=renderer,
+    )
+    assert follow.next_interval == 30.0
+
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        idle_snapshot,
+        renderer=renderer,
+    )
+    assert follow.next_interval == 60.0
+
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        idle_snapshot,
+        renderer=renderer,
+    )
+    assert follow.next_interval == 60.0
+
+    active_snapshot = {
+        **idle_snapshot,
+        "events": [
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "reasoning-2",
+                "message_kind": "reasoning",
+                "text": "new reasoning",
+            }
+        ],
+        "emitted_message_ids": ["reasoning-2"],
+    }
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        active_snapshot,
+        renderer=renderer,
+    )
+    assert follow.next_interval == 15.0
+
+    chat_module._backoff_enhanced_follow_after_error(
+        follow,
+        SimpleNamespace(status_code=429),
+        renderer=renderer,
+    )
+    assert follow.next_interval == 120.0
+
+    chat_module._backoff_enhanced_follow_after_error(
+        follow,
+        SimpleNamespace(status_code=429),
+        renderer=renderer,
+    )
+    assert follow.next_interval == 240.0
+
+    chat_module._backoff_enhanced_follow_after_error(
+        follow,
+        SimpleNamespace(status_code=429),
+        renderer=renderer,
+    )
+    assert follow.next_interval == 300.0
 
 
 def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeypatch) -> None:
