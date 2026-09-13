@@ -54,7 +54,6 @@ CHAT_HELP = """Commands:
 
 LOCAL_QUIT_CODE = 97
 FOLLOW_MIN_INTERVAL_SECONDS = 15.0
-FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS = 5.0
 FOLLOW_MAX_IDLE_INTERVAL_SECONDS = 60.0
 FOLLOW_RATE_LIMIT_BACKOFF_SECONDS = 120.0
 FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
@@ -102,10 +101,6 @@ class _EnhancedFollow:
     future: asyncio.Future[tuple[bool, Any]] | None = None
     event_queue: asyncio.Queue[dict[str, Any]] | None = None
     event_task: asyncio.Task[dict[str, Any]] | None = None
-    reconcile_timer: asyncio.Task[None] | None = None
-    reconcile_future: asyncio.Future[tuple[bool, Any]] | None = None
-    reconcile_interval: float = FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
-    terminal_reconciled: bool = False
     stop_requested: bool = False
     stopped_by_user: bool = False
 
@@ -134,7 +129,9 @@ class _PromptAwareStream:
 class _ThreadsafeRendererProxy:
     """Marshal PrettyRenderer method calls onto the asyncio/UI thread."""
 
-    def __init__(self, renderer: PrettyRenderer, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self, renderer: PrettyRenderer, loop: asyncio.AbstractEventLoop
+    ) -> None:
         self._renderer = renderer
         self._loop = loop
 
@@ -164,7 +161,11 @@ CONVERSATION_REF_FIELDS = (
 
 def extract_conversation_ref(response: Any) -> str | None:
     candidates = [response]
-    nested = response.get("conversation") if isinstance(response, dict) else getattr(response, "conversation", None)
+    nested = (
+        response.get("conversation")
+        if isinstance(response, dict)
+        else getattr(response, "conversation", None)
+    )
     if nested is not None:
         candidates.append(nested)
 
@@ -198,7 +199,11 @@ def response_text(response: Any) -> str:
 
 
 def response_title(response: Any) -> str | None:
-    value = response.get("title") if isinstance(response, dict) else getattr(response, "title", None)
+    value = (
+        response.get("title")
+        if isinstance(response, dict)
+        else getattr(response, "title", None)
+    )
     if not isinstance(value, str):
         return None
     title = " ".join(value.split())
@@ -206,13 +211,21 @@ def response_title(response: Any) -> str | None:
 
 
 def response_finish_reason(response: Any) -> str | None:
-    conversation = response.get("conversation") if isinstance(response, dict) else getattr(response, "conversation", None)
+    conversation = (
+        response.get("conversation")
+        if isinstance(response, dict)
+        else getattr(response, "conversation", None)
+    )
     if isinstance(conversation, dict):
         value = conversation.get("finish_reason")
     else:
         value = getattr(conversation, "finish_reason", None)
     if not isinstance(value, str):
-        value = response.get("finish_reason") if isinstance(response, dict) else getattr(response, "finish_reason", None)
+        value = (
+            response.get("finish_reason")
+            if isinstance(response, dict)
+            else getattr(response, "finish_reason", None)
+        )
     if not isinstance(value, str):
         return None
     normalized = value.strip().lower()
@@ -280,10 +293,14 @@ def run_chat(
         )
         prompt_patch_enabled = stdout is sys.stdout or stderr is sys.stderr
         renderer_stdout: TextIO = (
-            _PromptAwareStream(stdout, stream_name="stdout") if stdout is sys.stdout else stdout
+            _PromptAwareStream(stdout, stream_name="stdout")
+            if stdout is sys.stdout
+            else stdout
         )
         renderer_stderr: TextIO = (
-            _PromptAwareStream(stderr, stream_name="stderr") if stderr is sys.stderr else stderr
+            _PromptAwareStream(stderr, stream_name="stderr")
+            if stderr is sys.stderr
+            else stderr
         )
         renderer = PrettyRenderer(renderer_stdout, ui_settings)
         interactive_commands = InteractiveCommands(
@@ -335,7 +352,11 @@ def run_chat(
                 return result
 
     while True:
-        automatic_prompt = interactive_commands.pop_automatic_prompt() if interactive_commands is not None else None
+        automatic_prompt = (
+            interactive_commands.pop_automatic_prompt()
+            if interactive_commands is not None
+            else None
+        )
         automatic_turn = automatic_prompt is not None
 
         if automatic_turn:
@@ -346,7 +367,11 @@ def run_chat(
 
             try:
                 if ui is not None:
-                    attachment_count = interactive_commands.pending_media_count if interactive_commands is not None else 0
+                    attachment_count = (
+                        interactive_commands.pending_media_count
+                        if interactive_commands is not None
+                        else 0
+                    )
                     line = ui.read_prompt(attachment_count=attachment_count)
                 else:
                     line = input_stream.readline()
@@ -382,7 +407,13 @@ def run_chat(
                 if interactive_commands is not None:
                     result = interactive_commands.handle(prompt)
                 else:
-                    result = _handle_chat_command(prompt, state=state, state_path=state_path, stdout=stdout, stderr=stderr)
+                    result = _handle_chat_command(
+                        prompt,
+                        state=state,
+                        state_path=state_path,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
                 if result is not None:
                     if interactive_commands is not None:
                         interactive_commands.close()
@@ -392,10 +423,24 @@ def run_chat(
             if interactive_commands is not None:
                 prompt = interactive_commands.prepare_goal_user_prompt(prompt)
 
-        media = interactive_commands.pending_media if interactive_commands is not None else None
-        conversation_mode = interactive_commands.conversation_mode if interactive_commands is not None else "normal"
-        attached_ref = interactive_commands.conversation_ref if interactive_commands is not None else state.current_conversation
-        goal_turn = bool(interactive_commands is not None and interactive_commands.goal_active)
+        media = (
+            interactive_commands.pending_media
+            if interactive_commands is not None
+            else None
+        )
+        conversation_mode = (
+            interactive_commands.conversation_mode
+            if interactive_commands is not None
+            else "normal"
+        )
+        attached_ref = (
+            interactive_commands.conversation_ref
+            if interactive_commands is not None
+            else state.current_conversation
+        )
+        goal_turn = bool(
+            interactive_commands is not None and interactive_commands.goal_active
+        )
         turn_result: dict[str, Any] = {}
         turn_client = get_client()
         with turn_control_signals(enabled=renderer is not None) as turn_controls:
@@ -411,7 +456,8 @@ def run_chat(
                 media=media,
                 stream=not bool(getattr(args, "no_stream", False)),
                 lock_timeout=_lock_timeout(args),
-                explicit_lock_wait=bool(getattr(args, "wait_lock", False)) or getattr(args, "lock_timeout", None) is not None,
+                explicit_lock_wait=bool(getattr(args, "wait_lock", False))
+                or getattr(args, "lock_timeout", None) is not None,
                 stdout=stdout,
                 stderr=stderr,
                 renderer=renderer,
@@ -420,7 +466,8 @@ def run_chat(
                 attached_ref=attached_ref,
                 temporary_turn_recorder=(
                     interactive_commands.record_temporary_turn
-                    if interactive_commands is not None and conversation_mode == "temporary"
+                    if interactive_commands is not None
+                    and conversation_mode == "temporary"
                     else None
                 ),
                 notify_completion=not goal_turn,
@@ -440,7 +487,9 @@ def run_chat(
         if code != 0:
             if interactive_commands is not None:
                 if goal_turn:
-                    interactive_commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
+                    interactive_commands.handle_goal_interruption(
+                        f"chat turn failed with exit code {code}"
+                    )
                 interactive_commands.close()
             return code
         if interactive_commands is not None and media:
@@ -535,8 +584,9 @@ async def _enhanced_loop_core(
             active_follow.stop_requested = True
             _cancel_enhanced_follow_timer(active_follow)
             _cancel_enhanced_follow_event_task(active_follow)
-            _cancel_enhanced_follow_reconcile(active_follow)
-            renderer.info("Stopped following after 2 hours; conversation remains attached.")
+            renderer.info(
+                "Stopped following after 2 hours; conversation remains attached."
+            )
             active_follow = None
 
         if (
@@ -550,7 +600,10 @@ async def _enhanced_loop_core(
             result = commands.handle(command)
             if result is not None:
                 return _EnhancedLoopOutcome(exit_code=result)
-            if commands.has_pending_resume or commands.conversation_ref != active_follow.conversation_ref:
+            if (
+                commands.has_pending_resume
+                or commands.conversation_ref != active_follow.conversation_ref
+            ):
                 active_follow = None
             else:
                 if command.split(maxsplit=1)[0].lower() == "/stop":
@@ -562,7 +615,6 @@ async def _enhanced_loop_core(
                 active_follow.stop_requested = True
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
-                _cancel_enhanced_follow_reconcile(active_follow)
                 active_follow = None
             active_resume = _start_enhanced_resume(
                 get_client=get_client,
@@ -621,10 +673,6 @@ async def _enhanced_loop_core(
                 wait_for.add(active_follow.future)
             if active_follow.event_task is not None:
                 wait_for.add(active_follow.event_task)
-            if active_follow.reconcile_timer is not None:
-                wait_for.add(active_follow.reconcile_timer)
-            if active_follow.reconcile_future is not None:
-                wait_for.add(active_follow.reconcile_future)
         if not wait_for:
             return _EnhancedLoopOutcome(exit_code=0)
 
@@ -639,7 +687,9 @@ async def _enhanced_loop_core(
                 if active is not None:
                     active.controls.request_stop()
                 elif active_resume is not None:
-                    renderer.info("Conversation is still loading; use Ctrl-\\ or /exit to exit gptty.")
+                    renderer.info(
+                        "Conversation is still loading; use Ctrl-\\ or /exit to exit gptty."
+                    )
                 elif active_follow is not None:
                     pending_follow_command = "/stop"
                     active_follow.stop_requested = True
@@ -656,13 +706,19 @@ async def _enhanced_loop_core(
             else:
                 prompt = raw.strip()
                 if prompt:
-                    if active_follow is not None and active is None and active_resume is None:
+                    if (
+                        active_follow is not None
+                        and active is None
+                        and active_resume is None
+                    ):
                         if not prompt.startswith("/"):
                             queued_prompts.append(prompt)
                             renderer.info(f"Queued · {len(queued_prompts)}")
                         elif prompt.split(maxsplit=1)[0].lower() in {"/exit", "/quit"}:
                             result = commands.handle(prompt)
-                            return _EnhancedLoopOutcome(exit_code=0 if result is None else result)
+                            return _EnhancedLoopOutcome(
+                                exit_code=0 if result is None else result
+                            )
                         elif prompt == "/":
                             renderer.info(
                                 "While following: text queues · /stop · /exit · other commands run between follow reads"
@@ -740,63 +796,22 @@ async def _enhanced_loop_core(
 
         if (
             active_follow is not None
-            and active_follow.reconcile_timer is not None
-            and active_follow.reconcile_timer in done
+            and active_follow.timer is not None
+            and active_follow.timer in done
         ):
-            active_follow.reconcile_timer = None
-            _start_enhanced_follow_reconcile(active_follow, get_client=get_client)
-
-        if (
-            active_follow is not None
-            and active_follow.reconcile_future is not None
-            and active_follow.reconcile_future in done
-        ):
-            finished_reconcile = active_follow.reconcile_future
-            active_follow.reconcile_future = None
-            try:
-                reconcile_ok, reconcile_payload = finished_reconcile.result()
-            except asyncio.CancelledError:
-                reconcile_ok, reconcile_payload = False, None
-            if reconcile_ok:
-                keep_following = _apply_enhanced_follow_snapshot(
-                    active_follow,
-                    reconcile_payload,
-                    renderer=renderer,
-                )
-                if keep_following:
-                    active_follow.reconcile_interval = (
-                        FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
-                        if active_follow.next_interval == FOLLOW_MIN_INTERVAL_SECONDS
-                        else min(
-                            FOLLOW_MAX_IDLE_INTERVAL_SECONDS,
-                            max(
-                                FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS,
-                                active_follow.next_interval,
-                            ),
-                        )
-                    )
-                    _schedule_enhanced_follow_reconcile(active_follow)
-                else:
-                    active_follow.terminal_reconciled = True
-                    active_follow.stop_requested = True
-                    _cancel_enhanced_follow_reconcile(active_follow)
-            else:
-                renderer.warning(
-                    f"Live follow canonical reconciliation failed; retrying: {reconcile_payload}"
-                )
-                _schedule_enhanced_follow_reconcile(active_follow)
-
-        if active_follow is not None and active_follow.timer is not None and active_follow.timer in done:
             active_follow.timer = None
             if not active_follow.stop_requested:
                 _start_enhanced_follow_poll(active_follow, get_client=get_client)
 
-        if active_follow is not None and active_follow.future is not None and active_follow.future in done:
+        if (
+            active_follow is not None
+            and active_follow.future is not None
+            and active_follow.future in done
+        ):
             finished_follow = active_follow.future
             follow_mode = active_follow.mode
             active_follow.future = None
             active_follow.mode = None
-            _cancel_enhanced_follow_reconcile(active_follow)
             ok, payload = finished_follow.result()
             keep_following = True
 
@@ -807,9 +822,11 @@ async def _enhanced_loop_core(
                 )
                 _cancel_enhanced_follow_event_task(active_follow)
                 active_follow.event_queue = None
-                if active_follow.terminal_reconciled:
-                    keep_following = False
-                elif ok and isinstance(payload, dict) and payload.get("stream_completed") is True:
+                if (
+                    ok
+                    and isinstance(payload, dict)
+                    and payload.get("stream_completed") is True
+                ):
                     keep_following = _apply_enhanced_follow_snapshot(
                         active_follow,
                         payload,
@@ -849,7 +866,6 @@ async def _enhanced_loop_core(
             if not keep_following:
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
-                _cancel_enhanced_follow_reconcile(active_follow)
                 active_follow = None
             elif active_follow.stop_requested and pending_follow_command is None:
                 active_follow.stop_requested = False
@@ -1012,92 +1028,6 @@ def _cancel_enhanced_follow_event_task(follow: _EnhancedFollow) -> None:
         task.cancel()
 
 
-def _cancel_enhanced_follow_reconcile(follow: _EnhancedFollow) -> None:
-    timer = follow.reconcile_timer
-    follow.reconcile_timer = None
-    if timer is not None and not timer.done():
-        timer.cancel()
-    future = follow.reconcile_future
-    follow.reconcile_future = None
-    if future is not None and not future.done():
-        future.cancel()
-
-
-def _schedule_enhanced_follow_reconcile(follow: _EnhancedFollow) -> bool:
-    if (
-        follow.stop_requested
-        or follow.terminal_reconciled
-        or follow.mode != "stream"
-        or follow.future is None
-        or follow.reconcile_timer is not None
-        or follow.reconcile_future is not None
-        or time.monotonic() >= follow.deadline
-    ):
-        return False
-    follow.reconcile_timer = asyncio.create_task(
-        asyncio.sleep(max(FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS, follow.reconcile_interval))
-    )
-    return True
-
-
-def _reset_enhanced_follow_reconcile_timer(follow: _EnhancedFollow) -> None:
-    follow.reconcile_interval = FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS
-    timer = follow.reconcile_timer
-    follow.reconcile_timer = None
-    if timer is not None and not timer.done():
-        timer.cancel()
-    _schedule_enhanced_follow_reconcile(follow)
-
-
-def _start_enhanced_follow_reconcile(
-    follow: _EnhancedFollow,
-    *,
-    get_client: Callable[[], Any],
-) -> bool:
-    if (
-        follow.stop_requested
-        or follow.terminal_reconciled
-        or follow.mode != "stream"
-        or follow.future is None
-        or follow.reconcile_future is not None
-    ):
-        return False
-
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[tuple[bool, Any]] = loop.create_future()
-    client = get_client()
-    emitted = tuple(sorted(follow.emitted_message_ids))
-
-    def publish(result: tuple[bool, Any]) -> None:
-        if not future.done():
-            future.set_result(result)
-
-    def worker() -> None:
-        try:
-            result: tuple[bool, Any] = (
-                True,
-                client.conversation_follow_snapshot(
-                    follow.conversation_ref,
-                    emitted_message_ids=emitted,
-                    limit=FOLLOW_MESSAGE_LIMIT,
-                ),
-            )
-        except BaseException as exc:  # noqa: BLE001 - background reconciliation boundary.
-            result = (False, exc)
-        try:
-            loop.call_soon_threadsafe(publish, result)
-        except RuntimeError:
-            pass
-
-    follow.reconcile_future = future
-    threading.Thread(
-        target=worker,
-        name="gptty-resume-stream-reconcile",
-        daemon=True,
-    ).start()
-    return True
-
-
 def _start_enhanced_follow_stream(
     follow: _EnhancedFollow,
     *,
@@ -1172,7 +1102,6 @@ def _start_enhanced_follow_stream(
         name="gptty-resume-stream-follow",
         daemon=True,
     ).start()
-    _schedule_enhanced_follow_reconcile(follow)
     return True
 
 
@@ -1196,7 +1125,6 @@ def _apply_enhanced_follow_stream_event(
         if normalized_message_id is not None:
             follow.emitted_message_ids.add(normalized_message_id)
         renderer.live_event(event)
-        _reset_enhanced_follow_reconcile_timer(follow)
         return
 
     if event_type not in {
@@ -1207,7 +1135,10 @@ def _apply_enhanced_follow_stream_event(
         renderer.live_event(event)
         return
 
-    if normalized_message_id is not None and normalized_message_id != follow.stream_answer_message_id:
+    if (
+        normalized_message_id is not None
+        and normalized_message_id != follow.stream_answer_message_id
+    ):
         follow.stream_answer_message_id = normalized_message_id
         follow.stream_answer_text = ""
 
@@ -1221,9 +1152,10 @@ def _apply_enhanced_follow_stream_event(
             follow.stream_answer_text = text
 
     if follow.stream_answer_message_id:
-        follow.seen_messages[follow.stream_answer_message_id] = follow.stream_answer_text
+        follow.seen_messages[follow.stream_answer_message_id] = (
+            follow.stream_answer_text
+        )
     renderer.live_event(event)
-    _reset_enhanced_follow_reconcile_timer(follow)
 
 
 def _drain_enhanced_follow_stream_events(
@@ -1343,9 +1275,7 @@ def _apply_enhanced_follow_snapshot(
     emitted = snapshot.get("emitted_message_ids")
     if isinstance(emitted, (list, tuple, set, frozenset)):
         follow.emitted_message_ids.update(
-            str(message_id).strip()
-            for message_id in emitted
-            if str(message_id).strip()
+            str(message_id).strip() for message_id in emitted if str(message_id).strip()
         )
 
     current = _snapshot_messages(snapshot)
@@ -1486,13 +1416,19 @@ async def _finish_enhanced_turn(
     final_text = str(turn.result.get("text") or "")
     if incomplete_turn:
         renderer.turn_abort()
-        renderer.warning("ChatGPT stream ended without a final answer; returned control to gptty.")
+        renderer.warning(
+            "ChatGPT stream ended without a final answer; returned control to gptty."
+        )
     else:
         renderer.answer(final_text)
     if stopped_by_user:
         renderer.info("Stopped by user.")
     conversation_ref = turn.result.get("conversation_ref")
-    if not turn.result.get("is_temporary") and isinstance(conversation_ref, str) and conversation_ref.strip():
+    if (
+        not turn.result.get("is_temporary")
+        and isinstance(conversation_ref, str)
+        and conversation_ref.strip()
+    ):
         renderer.chat_link(conversation_ref.strip())
 
     if turn.result.get("stopped_by_user"):
@@ -1500,7 +1436,9 @@ async def _finish_enhanced_turn(
         queued_prompts.clear()
         commands.clear_automatic_prompts()
         if queued_count:
-            renderer.info(f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after Stop.")
+            renderer.info(
+                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after Stop."
+            )
 
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
     if incomplete_turn:
@@ -1512,7 +1450,9 @@ async def _finish_enhanced_turn(
                 f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after incomplete turn."
             )
         if turn.goal_turn:
-            commands.handle_goal_interruption("ChatGPT stream ended without a final answer")
+            commands.handle_goal_interruption(
+                "ChatGPT stream ended without a final answer"
+            )
     elif turn.goal_turn:
         commands.handle_goal_turn_result(turn.result)
         if turn.pause_goal_after_turn and commands.goal_active:
@@ -1592,7 +1532,9 @@ def _start_enhanced_turn(
             conversation_mode=conversation_mode,
             attached_ref=attached_ref,
             temporary_turn_recorder=(
-                commands.record_temporary_turn if conversation_mode == "temporary" else None
+                commands.record_temporary_turn
+                if conversation_mode == "temporary"
+                else None
             ),
             notify_completion=not goal_turn,
             result_out=turn_result,
@@ -1688,7 +1630,9 @@ def _handle_working_input(
             else:
                 commands.handle(prompt)
             return True
-        renderer.warning("While working, only /goal pause and /goal status are available.")
+        renderer.warning(
+            "While working, only /goal pause and /goal status are available."
+        )
         return True
 
     if name == "image":
@@ -1702,7 +1646,9 @@ def _handle_working_input(
         commands.handle(prompt)
         return True
 
-    renderer.warning(f"/{name} is unavailable while working; stop the current response first.")
+    renderer.warning(
+        f"/{name} is unavailable while working; stop the current response first."
+    )
     return True
 
 
@@ -1729,7 +1675,9 @@ def _handle_chat_command(
         print("Started a new chat.", file=stdout)
         return None
 
-    print(f"Unknown command: {command}. Type /help for available commands.", file=stderr)
+    print(
+        f"Unknown command: {command}. Type /help for available commands.", file=stderr
+    )
     return None
 
 
@@ -1799,7 +1747,11 @@ def _send_chat_prompt(
             "browser_native_write_completed",
         }:
             candidate = event.get("conversation_id") or event.get("conversationId")
-            if isinstance(candidate, str) and candidate.strip() and not candidate.strip().startswith("WEB:"):
+            if (
+                isinstance(candidate, str)
+                and candidate.strip()
+                and not candidate.strip().startswith("WEB:")
+            ):
                 write_conversation_ref = candidate.strip()
                 if not is_temporary and not active_ref:
                     active_ref = write_conversation_ref
@@ -1872,7 +1824,9 @@ def _send_chat_prompt(
             if is_temporary:
                 return client.send_temporary(prompt, **options)
             if send_conversation_ref:
-                return client.send_to_conversation(send_conversation_ref, prompt, **options)
+                return client.send_to_conversation(
+                    send_conversation_ref, prompt, **options
+                )
             return client.send(prompt, **options)
 
         if renderer is None:
@@ -1892,7 +1846,9 @@ def _send_chat_prompt(
                 except BaseException as exc:  # noqa: BLE001 - main thread owns Ctrl-C; worker must surface all exits.
                     outcome["error"] = exc
 
-            worker = threading.Thread(target=send_worker, name="gptty-chat-turn", daemon=True)
+            worker = threading.Thread(
+                target=send_worker, name="gptty-chat-turn", daemon=True
+            )
             worker.start()
             quit_wait_notice_shown = False
             while worker.is_alive():
@@ -1902,17 +1858,23 @@ def _send_chat_prompt(
                         persist_committed_conversation_for_local_quit()
                         local_quit_requested = True
                         renderer.turn_abort()
-                        renderer.info("Exited gptty; ChatGPT response continues in browser.")
+                        renderer.info(
+                            "Exited gptty; ChatGPT response continues in browser."
+                        )
                         return LOCAL_QUIT_CODE
                     if not quit_wait_notice_shown:
                         quit_wait_notice_shown = True
-                        renderer.info("Waiting for safe ChatGPT handoff before local exit…")
+                        renderer.info(
+                            "Waiting for safe ChatGPT handoff before local exit…"
+                        )
                 if not controls.consume_stop():
                     continue
                 if stopped_by_user:
                     local_quit_requested = True
                     renderer.turn_abort()
-                    renderer.info("ChatGPT is already stopped; exiting gptty without waiting for local readback.")
+                    renderer.info(
+                        "ChatGPT is already stopped; exiting gptty without waiting for local readback."
+                    )
                     return LOCAL_QUIT_CODE
                 renderer.info("Stopping ChatGPT…")
                 try:
@@ -1927,7 +1889,9 @@ def _send_chat_prompt(
                     else bool(getattr(stop_result, "stopped", False))
                 )
                 if not stopped:
-                    renderer.warning("No active ChatGPT response to stop yet; press Ctrl-C again to retry.")
+                    renderer.warning(
+                        "No active ChatGPT response to stop yet; press Ctrl-C again to retry."
+                    )
                     continue
 
                 stopped_by_user = True
@@ -1970,7 +1934,9 @@ def _send_chat_prompt(
                     }
                 elif state.current_conversation:
                     try:
-                        snapshot = client.conversation_snapshot(state.current_conversation)
+                        snapshot = client.conversation_snapshot(
+                            state.current_conversation
+                        )
                         response = _stopped_snapshot_response(
                             snapshot,
                             conversation_ref=state.current_conversation,
@@ -2011,7 +1977,9 @@ def _send_chat_prompt(
         if renderer is not None and not defer_final_rendering:
             if incomplete_turn:
                 renderer.turn_abort()
-                renderer.warning("ChatGPT stream ended without a final answer; returned control to gptty.")
+                renderer.warning(
+                    "ChatGPT stream ended without a final answer; returned control to gptty."
+                )
             else:
                 renderer.answer(rendered_text)
             if stopped_by_user:
@@ -2049,7 +2017,12 @@ def _send_chat_prompt(
                 print(f"gptty: {exc}", file=stderr)
                 return 1
 
-        if renderer is not None and not defer_final_rendering and not is_temporary and state.current_conversation:
+        if (
+            renderer is not None
+            and not defer_final_rendering
+            and not is_temporary
+            and state.current_conversation
+        ):
             renderer.chat_link(state.current_conversation)
 
         if recorder is not None:
@@ -2075,15 +2048,28 @@ def _send_chat_prompt(
             lock.release()
         if renderer is not None and not defer_final_rendering:
             renderer.turn_abort()
-        if renderer is not None and completed_successfully and not stopped_by_user and not incomplete_turn and notify_completion:
+        if (
+            renderer is not None
+            and completed_successfully
+            and not stopped_by_user
+            and not incomplete_turn
+            and notify_completion
+        ):
             notify_response_complete(
-                chat_title=response_title(response) or ("Temporary Chat" if is_temporary else None),
+                chat_title=response_title(response)
+                or ("Temporary Chat" if is_temporary else None),
                 final_response=rendered_text,
             )
 
 
-def _stopped_snapshot_response(snapshot: Any, *, conversation_ref: str) -> dict[str, str]:
-    raw_messages = snapshot.get("messages") if isinstance(snapshot, dict) else getattr(snapshot, "messages", None)
+def _stopped_snapshot_response(
+    snapshot: Any, *, conversation_ref: str
+) -> dict[str, str]:
+    raw_messages = (
+        snapshot.get("messages")
+        if isinstance(snapshot, dict)
+        else getattr(snapshot, "messages", None)
+    )
     try:
         messages = list(raw_messages) if raw_messages is not None else []
     except TypeError:
@@ -2091,10 +2077,18 @@ def _stopped_snapshot_response(snapshot: Any, *, conversation_ref: str) -> dict[
 
     text = ""
     for message in reversed(messages):
-        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
         if role != "assistant":
             continue
-        recipient = message.get("recipient") if isinstance(message, dict) else getattr(message, "recipient", None)
+        recipient = (
+            message.get("recipient")
+            if isinstance(message, dict)
+            else getattr(message, "recipient", None)
+        )
         if recipient not in {None, "", "all"}:
             continue
         normalized = normalize_messages([message])

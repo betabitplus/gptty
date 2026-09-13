@@ -100,7 +100,9 @@ def acquire_conversation_lock(
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            existing = read_conversation_lock(path, fallback_conversation=conversation_ref)
+            existing = read_conversation_lock(
+                path, fallback_conversation=conversation_ref
+            )
             if is_stale_lock(path, existing, stale_after=stale_after):
                 try:
                     path.unlink()
@@ -120,7 +122,9 @@ def acquire_conversation_lock(
         return ConversationLock(info=info, recovered_stale=recovered_stale)
 
 
-def read_conversation_lock(path: str | Path, *, fallback_conversation: str) -> ConversationLockInfo:
+def read_conversation_lock(
+    path: str | Path, *, fallback_conversation: str
+) -> ConversationLockInfo:
     lock_path = Path(path)
     try:
         data = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -147,8 +151,12 @@ def read_conversation_lock(path: str | Path, *, fallback_conversation: str) -> C
     )
 
 
-def is_stale_lock(path: str | Path, info: ConversationLockInfo, *, stale_after: float) -> bool:
+def is_stale_lock(
+    path: str | Path, info: ConversationLockInfo, *, stale_after: float
+) -> bool:
     if stale_after <= 0:
+        return True
+    if info.pid is not None and not _pid_is_alive(info.pid):
         return True
 
     started_at = _parse_started_at(info.started_at)
@@ -178,7 +186,10 @@ def render_lock_timeout(exc: ConversationLockError, *, stderr: TextIO) -> None:
     print("gptty: conversation still in progress", file=stderr)
     print(file=stderr)
     print("This conversation is still waiting for a reply.", file=stderr)
-    print("Try again after the current reply finishes, or send to another conversation.", file=stderr)
+    print(
+        "Try again after the current reply finishes, or send to another conversation.",
+        file=stderr,
+    )
     print(file=stderr)
     if exc.info.profile:
         print(f"Profile: {exc.info.profile}", file=stderr)
@@ -191,7 +202,10 @@ def render_stale_lock_recovered(lock: ConversationLock, *, stderr: TextIO) -> No
         return
     print("gptty: recovered previous session", file=stderr)
     print(file=stderr)
-    print("A previous command did not finish cleanly, so gptty cleared its local lock.", file=stderr)
+    print(
+        "A previous command did not finish cleanly, so gptty cleared its local lock.",
+        file=stderr,
+    )
     print(file=stderr)
     print("Continuing...", file=stderr)
 
@@ -202,6 +216,20 @@ def _serialize_info(info: ConversationLockInfo) -> dict[str, object]:
     if info.run_file is not None:
         data["run_file"] = str(info.run_file)
     return data
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _optional_str(value: object) -> str | None:

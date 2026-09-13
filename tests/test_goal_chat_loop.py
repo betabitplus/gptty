@@ -113,7 +113,9 @@ def _args(tmp_path):
     )
 
 
-def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notification(tmp_path, monkeypatch) -> None:
+def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notification(
+    tmp_path, monkeypatch
+) -> None:
     _GoalLoopClient.instances.clear()
     _FakeRenderer.instances.clear()
     _FakeSession.script = iter(
@@ -121,7 +123,8 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
             '/goal "Finish exactly this test goal"',
             (
                 lambda: bool(_FakeRenderer.instances)
-                and ("info", "Goal · complete · 2 turns") in _FakeRenderer.instances[0].events,
+                and ("info", "Goal · complete · 2 turns")
+                in _FakeRenderer.instances[0].events,
                 "/exit",
             ),
         ]
@@ -129,7 +132,10 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
     normal_notifications: list[dict[str, object]] = []
     goal_notifications: list[dict[str, object]] = []
 
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
     monkeypatch.setattr(
@@ -161,14 +167,19 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
     assert state.goal.turn_count == 2
     assert normal_notifications == []
     assert goal_notifications == [
-        {"chat_title": "Goal loop test", "final_response": "All agreed work is done and verified."}
+        {
+            "chat_title": "Goal loop test",
+            "final_response": "All agreed work is done and verified.",
+        }
     ]
     renderer = _FakeRenderer.instances[0]
     assert ("info", "Goal · continuing · next turn 2") in renderer.events
     assert ("info", "Goal · complete · 2 turns") in renderer.events
 
 
-def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(tmp_path) -> None:
+def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "state.json"
     save_chat_state(
         state_path,
@@ -200,11 +211,15 @@ def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(tmp_p
     assert created == []
 
 
-def test_goal_hard_chat_error_interrupts_without_auto_retry(tmp_path, monkeypatch) -> None:
+def test_goal_hard_chat_error_interrupts_without_auto_retry(
+    tmp_path, monkeypatch
+) -> None:
     class HardFailureClient:
         instances: list["HardFailureClient"] = []
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[str] = []
             self.__class__.instances.append(self)
 
@@ -215,7 +230,10 @@ def test_goal_hard_chat_error_interrupts_without_auto_retry(tmp_path, monkeypatc
     _FakeRenderer.instances.clear()
     _FakeSession.script = iter(['/goal "Do the full task"'])
     goal_notifications: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
     monkeypatch.setattr(
@@ -248,13 +266,17 @@ def test_goal_hard_chat_error_interrupts_without_auto_retry(tmp_path, monkeypatc
     assert "CHATGPT_CONVERSATION_LIMIT_EXCEEDED" in stderr.getvalue()
 
 
-def test_goal_queued_steering_replaces_pending_auto_continuation(tmp_path, monkeypatch) -> None:
+def test_goal_queued_steering_replaces_pending_auto_continuation(
+    tmp_path, monkeypatch
+) -> None:
     class SteeringClient:
         instances: list["SteeringClient"] = []
         first_started = threading.Event()
         release_first = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str, str | None]] = []
             self.__class__.instances.append(self)
 
@@ -293,12 +315,16 @@ def test_goal_queued_steering_replaces_pending_auto_continuation(tmp_path, monke
             (steering_ready, "Prioritize the release notes before finishing"),
             (
                 lambda: bool(_FakeRenderer.instances)
-                and ("info", "Goal · complete · 2 turns") in _FakeRenderer.instances[0].events,
+                and ("info", "Goal · complete · 2 turns")
+                in _FakeRenderer.instances[0].events,
                 "/exit",
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -322,13 +348,17 @@ def test_goal_queued_steering_replaces_pending_auto_continuation(tmp_path, monke
     assert state.goal.turn_count == 2
 
 
-def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(tmp_path, monkeypatch) -> None:
+def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
+    tmp_path, monkeypatch
+) -> None:
     class PauseClient:
         instances: list["PauseClient"] = []
         started = threading.Event()
         release = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[str] = []
             self.__class__.instances.append(self)
 
@@ -368,7 +398,10 @@ def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -390,16 +423,23 @@ def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
     assert state.goal.reason == "paused by user"
     assert state.goal.turn_count == 1
     renderer = _FakeRenderer.instances[0]
-    assert ("info", "Goal · pause pending · current turn will finish") in renderer.events
+    assert (
+        "info",
+        "Goal · pause pending · current turn will finish",
+    ) in renderer.events
 
 
-def test_stop_command_while_working_uses_active_turn_stop_path(tmp_path, monkeypatch) -> None:
+def test_stop_command_while_working_uses_active_turn_stop_path(
+    tmp_path, monkeypatch
+) -> None:
     class StopClient:
         instances: list["StopClient"] = []
         started = threading.Event()
         release = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str | None]] = []
             self.__class__.instances.append(self)
 
@@ -438,7 +478,10 @@ def test_stop_command_while_working_uses_active_turn_stop_path(tmp_path, monkeyp
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -463,13 +506,17 @@ def test_stop_command_while_working_uses_active_turn_stop_path(tmp_path, monkeyp
     assert ("info", "Cleared 1 queued prompt after Stop.") in renderer.events
 
 
-def test_incomplete_turn_returns_prompt_and_clears_queued_followup(tmp_path, monkeypatch) -> None:
+def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
+    tmp_path, monkeypatch
+) -> None:
     class IncompleteClient:
         instances: list["IncompleteClient"] = []
         started = threading.Event()
         release = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[str] = []
             self.__class__.instances.append(self)
 
@@ -487,7 +534,9 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(tmp_path, mon
             )
 
         def send_to_conversation(self, ref: str, prompt: str, **options):
-            raise AssertionError("queued follow-up must be cleared after incomplete turn")
+            raise AssertionError(
+                "queued follow-up must be cleared after incomplete turn"
+            )
 
     IncompleteClient.instances.clear()
     IncompleteClient.started.clear()
@@ -515,7 +564,10 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(tmp_path, mon
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
     notifications: list[dict[str, object]] = []
@@ -546,11 +598,15 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(tmp_path, mon
     assert notifications == []
 
 
-def test_goal_incomplete_turn_interrupts_without_auto_continue(tmp_path, monkeypatch) -> None:
+def test_goal_incomplete_turn_interrupts_without_auto_continue(
+    tmp_path, monkeypatch
+) -> None:
     class IncompleteGoalClient:
         instances: list["IncompleteGoalClient"] = []
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[str] = []
             self.__class__.instances.append(self)
 
@@ -583,7 +639,10 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(tmp_path, monkeyp
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -603,13 +662,17 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(tmp_path, monkeyp
     assert state.goal.reason == "ChatGPT stream ended without a final answer"
 
 
-def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, monkeypatch) -> None:
+def test_resume_loading_queues_text_without_concurrent_cwa_request(
+    tmp_path, monkeypatch
+) -> None:
     class SlowResumeClient:
         instances: list["SlowResumeClient"] = []
         snapshot_started = threading.Event()
         release_snapshot = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.snapshot_active = False
             self.__class__.instances.append(self)
@@ -643,11 +706,17 @@ def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, mon
     _FakeRenderer.instances.clear()
 
     def queued_send_finished() -> bool:
-        if _FakeRenderer.instances and ("info", "Queued · 1") in _FakeRenderer.instances[0].events:
+        if (
+            _FakeRenderer.instances
+            and ("info", "Queued · 1") in _FakeRenderer.instances[0].events
+        ):
             SlowResumeClient.release_snapshot.set()
         if not SlowResumeClient.instances:
             return False
-        return any(call[0] == "send_to_conversation" for call in SlowResumeClient.instances[0].calls)
+        return any(
+            call[0] == "send_to_conversation"
+            for call in SlowResumeClient.instances[0].calls
+        )
 
     _FakeSession.script = iter(
         [
@@ -656,7 +725,10 @@ def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, mon
             (queued_send_finished, "/exit"),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -674,14 +746,20 @@ def test_resume_loading_queues_text_without_concurrent_cwa_request(tmp_path, mon
         ("snapshot", "conv-resume"),
         ("send_to_conversation", "conv-resume"),
     ]
-    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-resume"
+    assert (
+        load_chat_state(tmp_path / "state.json").current_conversation == "conv-resume"
+    )
 
 
-def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path, monkeypatch) -> None:
+def test_unfinished_resume_follows_live_events_without_blocking_prompt(
+    tmp_path, monkeypatch
+) -> None:
     class LiveFollowClient:
         instances: list["LiveFollowClient"] = []
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.follow_count = 0
             self.__class__.instances.append(self)
@@ -701,7 +779,11 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
                     "status": SimpleNamespace(status="tool_running"),
                     "messages": [
                         {"message_id": "u1", "role": "user", "text": "question"},
-                        {"message_id": "a0", "role": "assistant", "text": "first thought"},
+                        {
+                            "message_id": "a0",
+                            "role": "assistant",
+                            "text": "first thought",
+                        },
                     ],
                     "events": [],
                     "emitted_message_ids": ["old-event"],
@@ -712,7 +794,11 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(tmp_path,
                     "status": SimpleNamespace(status="tool_running"),
                     "messages": [
                         {"message_id": "u1", "role": "user", "text": "question"},
-                        {"message_id": "a0", "role": "assistant", "text": "first thought"},
+                        {
+                            "message_id": "a0",
+                            "role": "assistant",
+                            "text": "first thought",
+                        },
                     ],
                     "events": [
                         {
@@ -858,12 +944,16 @@ def test_resume_seed_renders_only_current_turn_intermediate_events() -> None:
     assert rendered_ids == ["current-tool", "current-reasoning"]
 
 
-def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeypatch) -> None:
+def test_unfinished_resume_prefers_live_stream_without_polling(
+    tmp_path, monkeypatch
+) -> None:
     class StreamFollowClient:
         instances: list["StreamFollowClient"] = []
         release_stream = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.snapshot_count = 0
             self.stream_count = 0
@@ -963,10 +1053,14 @@ def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeyp
         )
 
     def queued_prompt_visible() -> bool:
-        visible = bool(_FakeRenderer.instances) and (
-            "info",
-            "Queued · 1",
-        ) in _FakeRenderer.instances[0].events
+        visible = (
+            bool(_FakeRenderer.instances)
+            and (
+                "info",
+                "Queued · 1",
+            )
+            in _FakeRenderer.instances[0].events
+        )
         if visible:
             StreamFollowClient.release_stream.set()
         return visible
@@ -1017,14 +1111,16 @@ def test_unfinished_resume_prefers_live_stream_without_polling(tmp_path, monkeyp
     )
 
 
-def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
+def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
     tmp_path, monkeypatch
 ) -> None:
     class SilentStreamClient:
         instances: list["SilentStreamClient"] = []
         release_stream = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.snapshot_count = 0
             self.stream_count = 0
@@ -1039,36 +1135,15 @@ def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
         ):
             self.snapshot_count += 1
             self.calls.append(("snapshot", ref))
-            if self.snapshot_count == 1:
-                assert limit is None
-                return {
-                    "status": SimpleNamespace(status="tool_running"),
-                    "messages": [
-                        {"message_id": "u1", "role": "user", "text": "question"},
-                    ],
-                    "events": [],
-                    "emitted_message_ids": ["old-event"],
-                    "stream_topic_id": "conversation-turn-turn-silent",
-                    "turn_exchange_id": "turn-silent",
-                    "stream_answer_message_id": None,
-                    "stream_answer_text": "",
-                }
-            assert limit == chat_module.FOLLOW_MESSAGE_LIMIT
-            assert "old-event" in emitted_message_ids
+            assert self.snapshot_count == 1
+            assert limit is None
             return {
                 "status": SimpleNamespace(status="tool_running"),
                 "messages": [
                     {"message_id": "u1", "role": "user", "text": "question"},
                 ],
-                "events": [
-                    {
-                        "type": "canonical_intermediate_message",
-                        "message_id": "reasoning-reconciled",
-                        "message_kind": "reasoning",
-                        "text": "visible only through canonical reconciliation",
-                    }
-                ],
-                "emitted_message_ids": ["old-event", "reasoning-reconciled"],
+                "events": [],
+                "emitted_message_ids": ["old-event"],
                 "stream_topic_id": "conversation-turn-turn-silent",
                 "turn_exchange_id": "turn-silent",
                 "stream_answer_message_id": None,
@@ -1112,22 +1187,22 @@ def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
     SilentStreamClient.instances.clear()
     SilentStreamClient.release_stream.clear()
     _FakeRenderer.instances.clear()
+    silence_started = time.monotonic()
 
-    def saw_reconciled_reasoning() -> bool:
-        visible = bool(_FakeRenderer.instances) and any(
-            event[0] == "live_event"
-            and isinstance(event[1], dict)
-            and event[1].get("message_id") == "reasoning-reconciled"
-            for event in _FakeRenderer.instances[0].events
-        )
-        if visible:
-            SilentStreamClient.release_stream.set()
-        return visible
+    def stream_remained_poll_free() -> bool:
+        if not SilentStreamClient.instances:
+            return False
+        client = SilentStreamClient.instances[0]
+        if client.stream_count != 1 or time.monotonic() - silence_started < 0.15:
+            return False
+        assert client.snapshot_count == 1
+        SilentStreamClient.release_stream.set()
+        return True
 
     _FakeSession.script = iter(
         [
             "/resume conv-silent",
-            (saw_reconciled_reasoning, "/exit"),
+            (stream_remained_poll_free, "/exit"),
         ]
     )
     monkeypatch.setattr(
@@ -1136,10 +1211,6 @@ def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
     )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
-    monkeypatch.setattr(
-        "gptty.commands.chat.FOLLOW_STREAM_RECONCILE_INTERVAL_SECONDS",
-        0.001,
-    )
 
     code = run_chat(
         _args(tmp_path),
@@ -1152,9 +1223,8 @@ def test_unfinished_resume_reconciles_canonical_when_live_stream_is_silent(
     assert code == 0
     client = SilentStreamClient.instances[0]
     assert client.stream_count == 1
-    assert client.snapshot_count >= 2
+    assert client.snapshot_count == 1
     assert ("stream", "conv-silent") in client.calls
-    assert saw_reconciled_reasoning()
 
 
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
@@ -1241,13 +1311,17 @@ def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
     assert follow.next_interval == 300.0
 
 
-def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeypatch) -> None:
+def test_exit_during_resume_loading_does_not_wait_for_snapshot(
+    tmp_path, monkeypatch
+) -> None:
     class BlockingResumeClient:
         instances: list["BlockingResumeClient"] = []
         snapshot_started = threading.Event()
         release_snapshot = threading.Event()
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.__class__.instances.append(self)
 
@@ -1267,7 +1341,10 @@ def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeyp
             (lambda: BlockingResumeClient.snapshot_started.is_set(), "/exit"),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
@@ -1287,11 +1364,15 @@ def test_exit_during_resume_loading_does_not_wait_for_snapshot(tmp_path, monkeyp
     assert load_chat_state(tmp_path / "state.json").current_conversation is None
 
 
-def test_unfinished_resume_returns_to_prompt_without_polling(tmp_path, monkeypatch) -> None:
+def test_unfinished_resume_returns_to_prompt_without_polling(
+    tmp_path, monkeypatch
+) -> None:
     class UnfinishedResumeClient:
         instances: list["UnfinishedResumeClient"] = []
 
-        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
             self.calls: list[tuple[str, str]] = []
             self.__class__.instances.append(self)
 
@@ -1313,14 +1394,18 @@ def test_unfinished_resume_returns_to_prompt_without_polling(tmp_path, monkeypat
             (
                 lambda: bool(_FakeRenderer.instances)
                 and any(
-                    event[0] == "warning" and "unfinished turn (status=tool_running)" in str(event[1])
+                    event[0] == "warning"
+                    and "unfinished turn (status=tool_running)" in str(event[1])
                     for event in _FakeRenderer.instances[0].events
                 ),
                 "/exit",
             ),
         ]
     )
-    monkeypatch.setattr("gptty.commands.chat.should_use_enhanced_ui", lambda **kwargs: (True, SimpleNamespace()))
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 

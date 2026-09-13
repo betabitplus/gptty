@@ -31,7 +31,9 @@ def test_acquire_conversation_lock_creates_and_releases_file(tmp_path) -> None:
 
 
 def test_acquire_conversation_lock_fails_when_existing_lock_is_active(tmp_path) -> None:
-    lock = acquire_conversation_lock(conversation_ref="conv-1", lock_dir=tmp_path, command="send")
+    lock = acquire_conversation_lock(
+        conversation_ref="conv-1", lock_dir=tmp_path, command="send"
+    )
 
     try:
         with pytest.raises(ConversationLockError) as exc_info:
@@ -47,8 +49,37 @@ def test_acquire_conversation_lock_fails_when_existing_lock_is_active(tmp_path) 
     assert exc_info.value.info.conversation_ref == "conv-1"
 
 
+def test_acquire_conversation_lock_recovers_dead_owner_immediately(
+    tmp_path, monkeypatch
+) -> None:
+    first = acquire_conversation_lock(
+        conversation_ref="conv-dead",
+        lock_dir=tmp_path,
+        command="send",
+    )
+    assert first.info.lock_path.exists()
+
+    monkeypatch.setattr("gptty.locks._pid_is_alive", lambda _pid: False)
+    second = acquire_conversation_lock(
+        conversation_ref="conv-dead",
+        lock_dir=tmp_path,
+        command="send",
+        timeout=0,
+        stale_after=6 * 60 * 60,
+    )
+
+    assert second.recovered_stale is True
+    assert (
+        second.info.pid != first.info.pid
+        or second.info.started_at != first.info.started_at
+    )
+    second.release()
+
+
 def test_acquire_conversation_lock_clears_stale_lock(tmp_path) -> None:
-    first = acquire_conversation_lock(conversation_ref="conv-1", lock_dir=tmp_path, command="send")
+    first = acquire_conversation_lock(
+        conversation_ref="conv-1", lock_dir=tmp_path, command="send"
+    )
     path = first.info.lock_path
     assert path == conversation_lock_path(tmp_path, "conv-1")
 
@@ -73,7 +104,9 @@ def test_render_lock_error_uses_in_progress_copy(tmp_path) -> None:
 
     try:
         with pytest.raises(ConversationLockError) as exc_info:
-            acquire_conversation_lock(conversation_ref="conv-1", lock_dir=tmp_path, timeout=0)
+            acquire_conversation_lock(
+                conversation_ref="conv-1", lock_dir=tmp_path, timeout=0
+            )
     finally:
         first.release()
 
@@ -88,11 +121,15 @@ def test_render_lock_error_uses_in_progress_copy(tmp_path) -> None:
 
 
 def test_render_lock_timeout_includes_waited_time(tmp_path) -> None:
-    first = acquire_conversation_lock(conversation_ref="conv-1", lock_dir=tmp_path, command="send")
+    first = acquire_conversation_lock(
+        conversation_ref="conv-1", lock_dir=tmp_path, command="send"
+    )
 
     try:
         with pytest.raises(ConversationLockError) as exc_info:
-            acquire_conversation_lock(conversation_ref="conv-1", lock_dir=tmp_path, timeout=0)
+            acquire_conversation_lock(
+                conversation_ref="conv-1", lock_dir=tmp_path, timeout=0
+            )
     finally:
         first.release()
 
