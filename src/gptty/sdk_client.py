@@ -108,7 +108,15 @@ class _ProductRuntimeClient:
         submit = getattr(self.runtime, "submit", None)
         await_final = getattr(self.runtime, "await_final", None)
         explicit_model = runtime_options.get("model")
-        if callable(submit) and callable(await_final) and not explicit_model:
+        live_observation_requested = callable(runtime_options.get("on_event")) or callable(
+            runtime_options.get("on_token")
+        )
+        if (
+            callable(submit)
+            and callable(await_final)
+            and not explicit_model
+            and not live_observation_requested
+        ):
             submit_kwargs = dict(runtime_options)
             if conversation is not None:
                 submit_kwargs["conversation"] = conversation

@@ -134,10 +134,15 @@ class _ThreadsafeRendererProxy:
     """Marshal PrettyRenderer method calls onto the asyncio/UI thread."""
 
     def __init__(
-        self, renderer: PrettyRenderer, loop: asyncio.AbstractEventLoop
+        self,
+        renderer: PrettyRenderer,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        application: Any | None,
     ) -> None:
         self._renderer = renderer
         self._loop = loop
+        self._application = application
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._renderer, name)
@@ -145,8 +150,22 @@ class _ThreadsafeRendererProxy:
             return value
 
         def publish(*args: Any, **kwargs: Any) -> None:
+            callback = partial(value, *args, **kwargs)
+
+            def render_now() -> None:
+                try:
+                    app_context = getattr(self._application, "context", None)
+                    if app_context is not None and self._application.is_running:
+                        app_context.copy().run(callback)
+                    else:
+                        callback()
+                except (RuntimeError, EOFError):
+                    # The prompt application may already be shutting down. Fall
+                    # back to the renderer directly while the loop still exists.
+                    callback()
+
             try:
-                self._loop.call_soon_threadsafe(partial(value, *args, **kwargs))
+                self._loop.call_soon_threadsafe(render_now)
             except RuntimeError:
                 # The loop may already be closed during local quit/shutdown.
                 pass
@@ -1532,7 +1551,11 @@ def _start_enhanced_turn(
     renderer.turn_start(show_elapsed=False)
 
     loop = asyncio.get_running_loop()
-    threaded_renderer = _ThreadsafeRendererProxy(renderer, loop)
+    threaded_renderer = _ThreadsafeRendererProxy(
+        renderer,
+        loop,
+        application=getattr(ui, "application", None),
+    )
 
     def stop_confirmed(ref: str | None) -> None:
         loop.call_soon_threadsafe(commands.pause_goal_after_user_stop, ref)
@@ -1877,6 +1900,11 @@ def _send_chat_prompt(
             )
             worker.start()
             quit_wait_notice_shown = False
+            stop_pending = False
+            stop_notice_shown = False
+            stop_requires_conversation_ref = (
+                getattr(client, "browser_authority_backend", None) == "wkwebview"
+            )
             while worker.is_alive():
                 worker.join(timeout=0.1)
                 if controls.quit_requested.is_set():
@@ -1893,20 +1921,33 @@ def _send_chat_prompt(
                         renderer.info(
                             "Waiting for safe ChatGPT handoff before local exit…"
                         )
-                if not controls.consume_stop():
+                stop_requested_now = controls.consume_stop()
+                if stop_requested_now:
+                    if stopped_by_user:
+                        local_quit_requested = True
+                        renderer.turn_abort()
+                        renderer.info(
+                            "ChatGPT is already stopped; exiting gptty without waiting for local readback."
+                        )
+                        return LOCAL_QUIT_CODE
+                    stop_pending = True
+                    if not stop_notice_shown:
+                        stop_notice_shown = True
+                        renderer.info("Stopping ChatGPT…")
+
+                if not stop_pending:
                     continue
-                if stopped_by_user:
-                    local_quit_requested = True
-                    renderer.turn_abort()
-                    renderer.info(
-                        "ChatGPT is already stopped; exiting gptty without waiting for local readback."
-                    )
-                    return LOCAL_QUIT_CODE
-                renderer.info("Stopping ChatGPT…")
+
+                stop_target = active_ref or write_conversation_ref
+                if stop_requires_conversation_ref and not stop_target:
+                    continue
+
                 try:
-                    stop_result = client.stop_generation(active_ref, timeout=30.0)
+                    stop_result = client.stop_generation(stop_target, timeout=30.0)
                 except Exception as exc:  # noqa: BLE001 - interactive stop is best-effort at this boundary.
                     renderer.warning(f"Stop failed: {exc}")
+                    stop_pending = False
+                    stop_notice_shown = False
                     continue
 
                 stopped = (
@@ -1918,8 +1959,11 @@ def _send_chat_prompt(
                     renderer.warning(
                         "No active ChatGPT response to stop yet; press Ctrl-C again to retry."
                     )
+                    stop_pending = False
+                    stop_notice_shown = False
                     continue
 
+                stop_pending = False
                 stopped_by_user = True
                 stop_ref = (
                     stop_result.get("conversationId")

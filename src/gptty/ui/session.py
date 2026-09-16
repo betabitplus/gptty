@@ -114,6 +114,10 @@ class InteractiveSession:
         return await self._session.prompt_async(f"{marker}❯ ", refresh_interval=1.0)
 
     @property
+    def application(self) -> Any:
+        return self._session.app
+
+    @property
     def active_turn_controls(self) -> TurnControlSignals | None:
         return self._turn_controls
 
