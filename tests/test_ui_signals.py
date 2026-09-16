@@ -4,7 +4,11 @@ import signal
 
 import pytest
 
-from gptty.ui.signals import turn_control_signals
+from gptty.ui.signals import (
+    TurnControlSignals,
+    routed_turn_control_signals,
+    turn_control_signals,
+)
 
 
 def test_turn_control_signals_map_ctrl_keys_and_restore_handlers() -> None:
@@ -27,3 +31,16 @@ def test_turn_control_signals_map_ctrl_keys_and_restore_handlers() -> None:
 
     assert signal.getsignal(signal.SIGINT) == previous_sigint
     assert signal.getsignal(sigquit) == previous_sigquit
+
+
+def test_routed_turn_control_signals_routes_real_sigint_to_active_turn() -> None:
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    controls = TurnControlSignals()
+    active: TurnControlSignals | None = controls
+
+    with routed_turn_control_signals(enabled=True, controls=lambda: active):
+        signal.raise_signal(signal.SIGINT)
+        assert controls.stop_requested.is_set()
+        assert controls.wake.is_set()
+
+    assert signal.getsignal(signal.SIGINT) == previous_sigint

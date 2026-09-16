@@ -164,6 +164,19 @@ class FakeProductRuntime:
         return {"state": "LIVE", "conversation_id": "temp-runtime"}
 
 
+class SplitFakeProductRuntime(FakeProductRuntime):
+    def submit(self, prompt: str, **options: object) -> object:
+        self.calls.append(("submit", (prompt,), options))
+        callback = options.get("on_event")
+        if callable(callback):
+            callback({"type": "browser_native_write_completed", "conversation_id": "c-split"})
+        return SimpleNamespace(submission_id="submission-1")
+
+    def await_final(self, submission: object) -> str:
+        self.calls.append(("await_final", (submission,), {}))
+        return "runtime-split-result"
+
+
 def test_gptty_client_keeps_auth_and_timeout() -> None:
     sdk = FakeSdkClient()
 
@@ -350,6 +363,28 @@ def test_product_runtime_client_maps_cli_send_surface() -> None:
             },
         ),
     ]
+
+
+def test_product_runtime_client_uses_split_submit_before_finality_when_available() -> None:
+    runtime = SplitFakeProductRuntime()
+    client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
+    events: list[dict[str, object]] = []
+
+    result = client.send_to_conversation(
+        "c1",
+        "continue",
+        model_profile="DEEP",
+        on_event=events.append,
+    )
+
+    assert result == "runtime-split-result"
+    assert events == [
+        {"type": "browser_native_write_completed", "conversation_id": "c-split"}
+    ]
+    assert runtime.calls[0][0] == "submit"
+    assert runtime.calls[0][2]["conversation"] == "c1"
+    assert runtime.calls[0][2]["model_profile"] == "DEEP"
+    assert runtime.calls[1][0] == "await_final"
 
 
 def test_product_runtime_client_passes_real_model_slug_unchanged() -> None:

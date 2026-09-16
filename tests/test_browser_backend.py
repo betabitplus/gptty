@@ -40,8 +40,9 @@ def test_command_client_boundary_forwards_selected_backend() -> None:
     }
 
 
-def test_product_runtime_client_only_uses_new_cwa_kwarg_when_selected(monkeypatch) -> None:
+def test_product_runtime_client_uses_cwa_wk_provider_when_selected(monkeypatch) -> None:
     import chatgpt_web_adapter
+    from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 
     calls: list[dict] = []
 
@@ -61,6 +62,8 @@ def test_product_runtime_client_only_uses_new_cwa_kwarg_when_selected(monkeypatc
     assert default_client.runtime is not None
     assert wk_client.runtime is not None
     assert "browser_authority_backend" not in calls[0]
-    assert calls[1]["browser_authority_backend"] == "wkwebview"
+    assert isinstance(calls[1]["provider"], WKWebViewTurnProvider)
+    assert calls[1]["browser_authority_policy"] == "TURN_SCOPED"
+    assert "browser_authority_backend" not in calls[1]
 
 

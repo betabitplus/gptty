@@ -74,14 +74,50 @@ class _ProductRuntimeClient:
             "auth_file": self.auth_file,
             "client_timeout": self.timeout,
         }
-        if self.browser_authority_backend is not None:
-            runtime_options["browser_authority_backend"] = self.browser_authority_backend
+        from chatgpt_web_adapter.browser_authority_backend import (
+            resolve_browser_authority_backend,
+        )
+
+        resolved_backend = resolve_browser_authority_backend(
+            self.browser_authority_backend
+        )
+        if resolved_backend == "wkwebview":
+            from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
+
+            # Keep WK transport ownership in CWA. In particular, Temporary Chat
+            # must use CWA's lifecycle lease, protected-write proxy, and finality
+            # fence instead of a second gptty-specific implementation.
+            runtime_options["provider"] = WKWebViewTurnProvider()
+            runtime_options["browser_authority_policy"] = "TURN_SCOPED"
+        else:
+            runtime_options["browser_authority_backend"] = resolved_backend
         return assemble_product_runtime(**runtime_options)
 
     def send(self, prompt: str, **options: Any) -> Any:
+        return self._send_normal(prompt, conversation=None, options=options)
+
+    def _send_normal(
+        self,
+        prompt: str,
+        *,
+        conversation: Any,
+        options: dict[str, Any],
+    ) -> Any:
         runtime_options = _runtime_send_options(options)
         timeout = float(runtime_options.pop("timeout", self.timeout))
-        return self.runtime.send(prompt, timeout=timeout, **runtime_options)
+        submit = getattr(self.runtime, "submit", None)
+        await_final = getattr(self.runtime, "await_final", None)
+        explicit_model = runtime_options.get("model")
+        if callable(submit) and callable(await_final) and not explicit_model:
+            submit_kwargs = dict(runtime_options)
+            if conversation is not None:
+                submit_kwargs["conversation"] = conversation
+            submission = submit(prompt, timeout=timeout, **submit_kwargs)
+            return await_final(submission)
+        send_kwargs = dict(runtime_options)
+        if conversation is not None:
+            send_kwargs["conversation"] = conversation
+        return self.runtime.send(prompt, timeout=timeout, **send_kwargs)
 
     def send_temporary(self, prompt: str, **options: Any) -> Any:
         runtime_options = _runtime_send_options(options)
@@ -99,14 +135,7 @@ class _ProductRuntimeClient:
         prompt: str,
         **options: Any,
     ) -> Any:
-        runtime_options = _runtime_send_options(options)
-        timeout = float(runtime_options.pop("timeout", self.timeout))
-        return self.runtime.send(
-            prompt,
-            conversation=url_or_id,
-            timeout=timeout,
-            **runtime_options,
-        )
+        return self._send_normal(prompt, conversation=url_or_id, options=options)
 
     def attach_conversation(self, url_or_id: Any, **options: Any) -> Any:
         return self.runtime.attach_conversation(url_or_id, **options)

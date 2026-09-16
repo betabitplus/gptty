@@ -74,14 +74,14 @@ class InteractiveSession:
         def _newline(event: Any) -> None:
             event.current_buffer.insert_text("\n")
 
-        @bindings.add(Keys.ControlC)
+        @bindings.add(Keys.ControlC, eager=True)
         def _control_c(event: Any) -> None:
             if self._turn_controls is not None:
                 self._turn_controls.request_stop()
                 return
             event.app.exit(exception=KeyboardInterrupt())
 
-        @bindings.add(Keys.ControlBackslash)
+        @bindings.add(Keys.ControlBackslash, eager=True)
         def _control_backslash(event: Any) -> None:
             if self._turn_controls is not None:
                 self._turn_controls.request_quit()
@@ -112,6 +112,10 @@ class InteractiveSession:
     async def read_prompt_async(self, *, attachment_count: int = 0) -> str:
         marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
         return await self._session.prompt_async(f"{marker}❯ ", refresh_interval=1.0)
+
+    @property
+    def active_turn_controls(self) -> TurnControlSignals | None:
+        return self._turn_controls
 
     def set_active_turn(
         self,

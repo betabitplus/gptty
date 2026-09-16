@@ -42,7 +42,11 @@ from ._client import build_client
 from ..ui.notifications import notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
-from ..ui.signals import TurnControlSignals, turn_control_signals
+from ..ui.signals import (
+    TurnControlSignals,
+    routed_turn_control_signals,
+    turn_control_signals,
+)
 from ..ui.state import history_path, ui_settings_path
 
 CHAT_HELP = """Commands:
@@ -512,21 +516,25 @@ def _run_enhanced_loop(
     stderr: TextIO,
     patch_stdout_enabled: bool,
 ) -> _EnhancedLoopOutcome:
-    return asyncio.run(
-        _run_enhanced_loop_async(
-            args=args,
-            state=state,
-            state_path=state_path,
-            get_client=get_client,
-            ui=ui,
-            renderer=renderer,
-            commands=commands,
-            queued_prompts=queued_prompts,
-            stdout=stdout,
-            stderr=stderr,
-            patch_stdout_enabled=patch_stdout_enabled,
+    with routed_turn_control_signals(
+        enabled=True,
+        controls=lambda: ui.active_turn_controls,
+    ):
+        return asyncio.run(
+            _run_enhanced_loop_async(
+                args=args,
+                state=state,
+                state_path=state_path,
+                get_client=get_client,
+                ui=ui,
+                renderer=renderer,
+                commands=commands,
+                queued_prompts=queued_prompts,
+                stdout=stdout,
+                stderr=stderr,
+                patch_stdout_enabled=patch_stdout_enabled,
+            )
         )
-    )
 
 
 async def _run_enhanced_loop_async(

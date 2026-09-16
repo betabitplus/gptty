@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import signal
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -54,6 +54,62 @@ def turn_control_signals(*, enabled: bool) -> Iterator[TurnControlSignals]:
         signal.signal(sigquit, request_quit)
     try:
         yield controls
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        if sigquit is not None and previous_sigquit is not None:
+            signal.signal(sigquit, previous_sigquit)
+
+
+def _delegate_signal_handler(handler: object, signum: int, frame: object) -> None:
+    if callable(handler):
+        handler(signum, frame)
+        return
+    if handler == signal.SIG_IGN:
+        return
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+
+
+@contextmanager
+def routed_turn_control_signals(
+    *,
+    enabled: bool,
+    controls: Callable[[], TurnControlSignals | None],
+) -> Iterator[None]:
+    """Route terminal signals to the currently active enhanced turn.
+
+    prompt_toolkit normally consumes Ctrl-C/Ctrl-\\ as key bindings. Some PTYs
+    and terminal modes instead deliver SIGINT/SIGQUIT directly to the process;
+    this fallback preserves the same semantics without changing idle behavior.
+    """
+    sigquit = getattr(signal, "SIGQUIT", None)
+    if not enabled or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigquit = signal.getsignal(sigquit) if sigquit is not None else None
+
+    def request_stop(signum: int, frame: object) -> None:
+        active = controls()
+        if active is not None:
+            active.request_stop()
+            return
+        _delegate_signal_handler(previous_sigint, signum, frame)
+
+    def request_quit(signum: int, frame: object) -> None:
+        active = controls()
+        if active is not None:
+            active.request_quit()
+            return
+        if previous_sigquit is not None:
+            _delegate_signal_handler(previous_sigquit, signum, frame)
+
+    signal.signal(signal.SIGINT, request_stop)
+    if sigquit is not None:
+        signal.signal(sigquit, request_quit)
+    try:
+        yield
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         if sigquit is not None and previous_sigquit is not None:
