@@ -1287,6 +1287,20 @@ def _apply_enhanced_follow_snapshot(
         )
 
     current = _snapshot_messages(snapshot)
+    status = _snapshot_status(snapshot)
+    corrected_final_identity: str | None = None
+    corrected_final_text = ""
+    if status == "completed" and follow.stream_answer_message_id:
+        for message in reversed(current):
+            identity = _message_identity(message)
+            if identity != follow.stream_answer_message_id:
+                continue
+            text = _message_text(message)
+            if text and text != follow.stream_answer_text:
+                corrected_final_identity = identity
+                corrected_final_text = text
+            break
+
     changed: list[Any] = []
     for message in current:
         identity = _message_identity(message)
@@ -1295,11 +1309,16 @@ def _apply_enhanced_follow_snapshot(
         follow.seen_messages[identity] = text
         if previous == text or identity in event_ids:
             continue
+        if identity == corrected_final_identity:
+            continue
         changed.append(message)
     if changed:
         renderer.messages(normalize_messages(changed))
+    if corrected_final_identity is not None:
+        renderer.answer(corrected_final_text)
+        follow.stream_answer_text = corrected_final_text
 
-    if event_items or changed:
+    if event_items or changed or corrected_final_identity is not None:
         follow.next_interval = FOLLOW_MIN_INTERVAL_SECONDS
     else:
         follow.next_interval = min(
@@ -1307,7 +1326,6 @@ def _apply_enhanced_follow_snapshot(
             max(FOLLOW_MIN_INTERVAL_SECONDS, follow.next_interval * 2.0),
         )
 
-    status = _snapshot_status(snapshot)
     if status == "completed":
         renderer.chat_link(follow.conversation_ref)
         if not follow.stopped_by_user:

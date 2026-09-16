@@ -1227,6 +1227,50 @@ def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
     assert ("stream", "conv-silent") in client.calls
 
 
+def test_resume_follow_replaces_corrupt_stream_final_with_canonical_snapshot(
+    monkeypatch,
+) -> None:
+    notifications: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        chat_module,
+        "notify_response_complete",
+        lambda **kwargs: notifications.append(kwargs),
+    )
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={"assistant-final": "broken pieces"},
+        deadline=10_000.0,
+        stream_answer_message_id="assistant-final",
+        stream_answer_text="broken pieces",
+    )
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {
+                "message_id": "assistant-final",
+                "role": "assistant",
+                "text": "complete canonical answer",
+            }
+        ],
+        "events": [],
+        "emitted_message_ids": [],
+        "stream_terminal_reconciled": True,
+    }
+
+    assert not chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        snapshot,
+        renderer=renderer,
+    )
+
+    assert ("answer", "complete canonical answer") in renderer.events
+    assert not any(event[0] == "messages" for event in renderer.events)
+    assert follow.stream_answer_text == "complete canonical answer"
+    assert notifications[-1]["final_response"] == "complete canonical answer"
+
+
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
     renderer = _FakeRenderer(StringIO(), SimpleNamespace())
     follow = chat_module._EnhancedFollow(
