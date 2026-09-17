@@ -164,6 +164,12 @@ class PrettyRenderer:
                 self.thinking(rendered)
             return
 
+        if kind == "commentary":
+            rendered = text or label
+            if rendered:
+                self.commentary(rendered)
+            return
+
         if kind == "tool_call" and self.settings.tools != "hidden":
             name, detail = render_tool_call_parts(tool=tool_name, text=text, label=label)
             if name:
@@ -174,6 +180,10 @@ class PrettyRenderer:
             error = _tool_result_error(text)
             if error:
                 self.warning(f"{tool_name or 'tool'} failed · {error}")
+            elif label and self.settings.tools != "hidden":
+                # ChatGPT Web exposes concise successful tool/activity status text.
+                # Preserve that user-visible information without dumping raw results.
+                self.activity(label)
             return
 
         if kind == "activity":
@@ -186,6 +196,11 @@ class PrettyRenderer:
         self.console.print(Text("Thinking", style="dim italic"))
         self.console.print(Text(text, style="dim"))
         self.state.last_block = "thinking"
+
+    def commentary(self, text: str) -> None:
+        self._gap_before("commentary")
+        self.console.print(Text(text))
+        self.state.last_block = "commentary"
 
     def tool(self, tool_name: str, label: str = "") -> None:
         self._gap_before("tool")

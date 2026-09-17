@@ -57,7 +57,7 @@ def test_renderer_live_tool_calls_use_compact_formatter() -> None:
     assert "Searching LOCAL_QUIT_CODE" not in text
 
 
-def test_renderer_surfaces_tool_result_errors_but_hides_successes() -> None:
+def test_renderer_surfaces_tool_result_labels_and_errors_without_raw_success_payload() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))
 
@@ -66,7 +66,8 @@ def test_renderer_surfaces_tool_result_errors_but_hides_successes() -> None:
             "type": "canonical_intermediate_message",
             "message_kind": "tool_result",
             "tool_name": "api_tool.call_tool",
-            "text": '{"ok":true,"message":"done"}',
+            "label": "Workspace inspection complete",
+            "text": '{"ok":true,"message":"raw success payload"}',
         }
     )
     renderer.live_event(
@@ -79,7 +80,8 @@ def test_renderer_surfaces_tool_result_errors_but_hides_successes() -> None:
     )
 
     text = out.getvalue()
-    assert "done" not in text
+    assert "Workspace inspection complete" in text
+    assert "raw success payload" not in text
     assert "api_tool.call_tool failed · Workspace not found" in text
 
 
@@ -135,6 +137,24 @@ def test_renderer_can_hide_thinking_and_tools() -> None:
     text = out.getvalue()
     assert "hidden" not in text
     assert "visible" in text
+
+
+def test_renderer_keeps_commentary_visible_when_thinking_is_hidden() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False, thinking=False, tools="hidden"))
+
+    renderer.turn_start()
+    renderer.live_event(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "commentary",
+            "text": "Visible progress update.",
+        }
+    )
+
+    text = out.getvalue()
+    assert "Visible progress update." in text
+    assert "Thinking" not in text
 
 
 def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:

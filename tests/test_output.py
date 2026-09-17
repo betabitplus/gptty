@@ -166,6 +166,13 @@ def test_render_canonical_intermediate_blocks() -> None:
     assert render_live_event(
         {
             "type": "canonical_intermediate_message",
+            "message_kind": "commentary",
+            "text": "Visible progress update.",
+        }
+    ) == "Visible progress update."
+    assert render_live_event(
+        {
+            "type": "canonical_intermediate_message",
             "message_kind": "tool_call",
             "tool_name": "api_tool.call_tool",
             "label": "Reading README…",
@@ -180,7 +187,7 @@ def test_render_canonical_intermediate_blocks() -> None:
             "label": "README read",
             "text": '{"ok":true}',
         }
-    ) is None
+    ) == "[activity] README read"
     assert render_live_event(
         {
             "type": "canonical_intermediate_message",
@@ -266,15 +273,16 @@ def test_render_tool_calls_use_compact_useful_details() -> None:
     ) == "[tool] web.run · Searching the web"
 
 
-def test_render_tool_results_only_surfaces_errors() -> None:
+def test_render_tool_results_surfaces_labels_and_errors_without_raw_success_payload() -> None:
     assert render_live_event(
         {
             "type": "canonical_intermediate_message",
             "message_kind": "tool_result",
             "tool_name": "api_tool.call_tool",
-            "text": '{"ok":true,"message":"done"}',
+            "label": "Workspace inspection complete",
+            "text": '{"ok":true,"message":"raw success payload"}',
         }
-    ) is None
+    ) == "[activity] Workspace inspection complete"
     assert render_live_event(
         {
             "type": "canonical_intermediate_message",

@@ -145,6 +145,8 @@ def render_live_event(event: Any) -> str | None:
         tool = tool_name.strip() if isinstance(tool_name, str) else ""
         if kind == "assistant_progress" and text:
             return f"[thinking]\n{text}"
+        if kind == "commentary":
+            return text or label or None
         if kind == "reasoning":
             rendered = text or label
             return f"[thinking]\n{rendered}" if rendered else None
@@ -152,7 +154,9 @@ def render_live_event(event: Any) -> str | None:
             return _render_tool_call(tool=tool, text=text, label=label)
         if kind == "tool_result":
             error = _tool_result_error(text)
-            return f"[tool error] {tool or 'tool'} · {error}" if error else None
+            if error:
+                return f"[tool error] {tool or 'tool'} · {error}"
+            return f"[activity] {label}" if label else None
         if kind == "activity":
             return f"[activity] {text or label}" if text or label else None
         return None
