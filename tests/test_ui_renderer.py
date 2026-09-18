@@ -199,6 +199,13 @@ def test_renderer_surfaces_stream_health_transitions() -> None:
             "final_text_seen": True,
         }
     )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 605.0,
+            "last_tool_error": "corrupt patch at line 13",
+        }
+    )
 
     text = out.getvalue()
     assert "Server quiet" in text
@@ -207,6 +214,9 @@ def test_renderer_surfaces_stream_health_transitions() -> None:
     assert "Server resumed after 05:06" in text
     assert "Answer text received · terminal proof pending for 02:05" in text
     assert "Finality STALLED · answer text received but no terminal proof for 05:05" in text
+    assert "Backend STALLED after tool error" in text
+    assert "corrupt patch at line 13" in text
+    assert "Ctrl-C + new turn recommended" in text
 
 
 def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:

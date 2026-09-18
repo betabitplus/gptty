@@ -169,11 +169,19 @@ class PrettyRenderer:
         if event_type == "stream_handoff_server_stalled":
             idle = event.get("server_idle_seconds")
             seconds = float(idle) if isinstance(idle, (int, float)) else 0.0
+            tool_error = event.get("last_tool_error")
             if event.get("final_text_seen") is True:
                 self.warning(
                     "Finality STALLED"
                     " · answer text received but no terminal proof"
                     f" for {_format_elapsed(seconds)}"
+                )
+            elif isinstance(tool_error, str) and tool_error.strip():
+                self.warning(
+                    "Backend STALLED after tool error"
+                    f" · {tool_error.strip()}"
+                    f" · server silent {_format_elapsed(seconds)}"
+                    " · Ctrl-C + new turn recommended"
                 )
             else:
                 self.warning(

@@ -25,7 +25,7 @@ from ..locks import (
     render_lock_timeout,
     render_stale_lock_recovered,
 )
-from ..output import normalize_messages, render_live_event
+from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
@@ -80,6 +80,7 @@ class _TurnHealth:
     reconnect_attempt: int = 0
     delivery_recoveries: int = 0
     answer_progress_seen: bool = False
+    last_tool_error: str = ""
 
     def observe(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -90,6 +91,14 @@ class _TurnHealth:
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
             self.answer_progress_seen = False
+            message_kind = event.get("message_kind")
+            text = event.get("text")
+            tool_error = (
+                _tool_result_error(text)
+                if message_kind == "tool_result" and isinstance(text, str)
+                else ""
+            )
+            self.last_tool_error = tool_error
             self.state = "working"
             return
         if event_type in {
@@ -100,6 +109,7 @@ class _TurnHealth:
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
             self.answer_progress_seen = True
+            self.last_tool_error = ""
             self.state = "working"
             return
         if event_type == "stream_handoff_ws_reconnecting":
@@ -1233,6 +1243,7 @@ def _apply_enhanced_follow_stream_event(
             event = {
                 **event,
                 "final_text_seen": follow.health.answer_progress_seen,
+                "last_tool_error": follow.health.last_tool_error or None,
             }
     message_id = event.get("message_id")
     normalized_message_id = (
@@ -1752,6 +1763,12 @@ def _working_status(
                 " · answer text received"
                 f" · no terminal proof {_format_status_duration(health.server_idle_seconds)}"
             )
+        elif health.last_tool_error:
+            status = (
+                "STALLED after tool error"
+                f" · server silent {_format_status_duration(health.server_idle_seconds)}"
+                " · Ctrl-C + new turn recommended"
+            )
         else:
             status = (
                 "STALLED backend"
@@ -1960,6 +1977,7 @@ def _send_chat_prompt(
                 event = {
                     **event,
                     "final_text_seen": turn_health.answer_progress_seen,
+                    "last_tool_error": turn_health.last_tool_error or None,
                 }
         if (
             recorder is not None
@@ -1975,6 +1993,7 @@ def _send_chat_prompt(
                 silent_seconds=event.get("silent_seconds"),
                 catchup_count=event.get("catchup_count"),
                 last_offset=event.get("last_offset"),
+                last_tool_error=event.get("last_tool_error"),
             )
         if event_type in {
             "browser_native_write_identity_resolved",

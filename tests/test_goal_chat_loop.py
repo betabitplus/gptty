@@ -191,6 +191,36 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
     )
 
 
+def test_turn_health_marks_stall_after_failed_tool_result(monkeypatch) -> None:
+    now = 700.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(last_server_progress_at=690.0)
+
+    health.observe(
+        {
+            "type": "canonical_intermediate_message",
+            "message_kind": "tool_result",
+            "text": (
+                '{"codexpro_tool":"apply_patch",'
+                '"error":"CodexProError: error: corrupt patch at line 13",'
+                '"is_error":true}'
+            ),
+        }
+    )
+    health.observe(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 605.0,
+        }
+    )
+
+    assert health.last_tool_error == "CodexProError: error: corrupt patch at line 13"
+    assert chat_module._working_status(100.0, 0, health=health) == (
+        "STALLED after tool error · server silent 10:05"
+        " · Ctrl-C + new turn recommended"
+    )
+
+
 def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notification(
     tmp_path, monkeypatch
 ) -> None:
