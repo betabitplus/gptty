@@ -73,6 +73,70 @@ class _EnhancedLoopOutcome:
 
 
 @dataclass
+class _TurnHealth:
+    last_server_progress_at: float
+    state: str = "working"
+    server_idle_seconds: float = 0.0
+    reconnect_attempt: int = 0
+    delivery_recoveries: int = 0
+    answer_progress_seen: bool = False
+
+    def observe(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        now = time.monotonic()
+        if event_type == "canonical_intermediate_message":
+            self.last_server_progress_at = now
+            self.server_idle_seconds = 0.0
+            self.answer_progress_seen = False
+            self.state = "working"
+            return
+        if event_type in {
+            "assistant_text_snapshot",
+            "assistant_text_delta",
+            "assistant_text_revision",
+        }:
+            self.last_server_progress_at = now
+            self.server_idle_seconds = 0.0
+            self.answer_progress_seen = True
+            self.state = "working"
+            return
+        if event_type == "stream_handoff_ws_reconnecting":
+            attempt = event.get("attempt")
+            if isinstance(attempt, int) and not isinstance(attempt, bool):
+                self.reconnect_attempt = attempt
+            idle = event.get("server_idle_seconds")
+            if isinstance(idle, (int, float)) and not isinstance(idle, bool):
+                self.server_idle_seconds = max(self.server_idle_seconds, float(idle))
+            if self.state not in {"quiet", "stalled"}:
+                self.state = "reconnecting"
+            return
+        if event_type == "stream_handoff_delivery_recovered":
+            self.delivery_recoveries += 1
+            self.last_server_progress_at = now
+            self.server_idle_seconds = 0.0
+            self.state = "working"
+            return
+        if event_type == "stream_handoff_server_quiet":
+            idle = event.get("server_idle_seconds")
+            if isinstance(idle, (int, float)) and not isinstance(idle, bool):
+                self.server_idle_seconds = float(idle)
+            self.state = "quiet"
+            return
+        if event_type == "stream_handoff_server_stalled":
+            idle = event.get("server_idle_seconds")
+            if isinstance(idle, (int, float)) and not isinstance(idle, bool):
+                self.server_idle_seconds = float(idle)
+            self.state = "stalled"
+            return
+        if event_type == "stream_handoff_server_resumed":
+            self.last_server_progress_at = now
+            self.server_idle_seconds = 0.0
+            self.state = "working"
+
+
+@dataclass
 class _EnhancedTurn:
     task: asyncio.Task[int]
     controls: TurnControlSignals
@@ -80,6 +144,7 @@ class _EnhancedTurn:
     goal_turn: bool
     media: list[str]
     started_at: float
+    health: _TurnHealth
     pause_goal_after_turn: bool = False
     exit_after_turn: bool = False
 
@@ -96,6 +161,7 @@ class _EnhancedFollow:
     emitted_message_ids: set[str]
     seen_messages: dict[str, str]
     deadline: float
+    health: _TurnHealth | None = None
     next_interval: float = FOLLOW_MIN_INTERVAL_SECONDS
     stream_topic_id: str | None = None
     stream_answer_message_id: str | None = None
@@ -1034,6 +1100,10 @@ def _seed_enhanced_follow(
         emitted_message_ids=emitted,
         seen_messages=seen,
         deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
+        health=_TurnHealth(
+            last_server_progress_at=time.monotonic(),
+            answer_progress_seen=bool(stream_answer_text),
+        ),
         next_interval=FOLLOW_MIN_INTERVAL_SECONDS,
         stream_topic_id=stream_topic_id,
         stream_answer_message_id=stream_answer_message_id,
@@ -1154,6 +1224,16 @@ def _apply_enhanced_follow_stream_event(
     if not isinstance(event, dict):
         return
     event_type = event.get("type")
+    if follow.health is not None:
+        follow.health.observe(event)
+        if event_type in {
+            "stream_handoff_server_quiet",
+            "stream_handoff_server_stalled",
+        }:
+            event = {
+                **event,
+                "final_text_seen": follow.health.answer_progress_seen,
+            }
     message_id = event.get("message_id")
     normalized_message_id = (
         message_id.strip()
@@ -1575,6 +1655,7 @@ def _start_enhanced_turn(
     turn_result: dict[str, Any] = {}
     controls = TurnControlSignals()
     started_at = time.monotonic()
+    health = _TurnHealth(last_server_progress_at=started_at)
     renderer.turn_start(show_elapsed=False)
 
     loop = asyncio.get_running_loop()
@@ -1616,6 +1697,7 @@ def _start_enhanced_turn(
             result_out=turn_result,
             on_stop_confirmed=stop_confirmed if goal_turn else None,
             defer_final_rendering=True,
+            turn_health=health,
         )
     )
     active = _EnhancedTurn(
@@ -1625,6 +1707,7 @@ def _start_enhanced_turn(
         goal_turn=goal_turn,
         media=media,
         started_at=started_at,
+        health=health,
     )
     _refresh_active_turn_ui(ui, active, queued_prompts)
     return active
@@ -1637,14 +1720,63 @@ def _refresh_active_turn_ui(
 ) -> None:
     ui.set_active_turn(
         active.controls,
-        working_status=lambda: _working_status(active.started_at, len(queued_prompts)),
+        working_status=lambda: _working_status(
+            active.started_at,
+            len(queued_prompts),
+            health=active.health,
+        ),
     )
 
 
-def _working_status(started_at: float, queued_count: int) -> str:
-    elapsed = max(0, int(time.monotonic() - started_at))
-    minutes, seconds = divmod(elapsed, 60)
-    status = f"working {minutes:02d}:{seconds:02d}"
+def _format_status_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, seconds = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes:02d}:{seconds:02d}"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+
+def _working_status(
+    started_at: float,
+    queued_count: int,
+    *,
+    health: _TurnHealth | None = None,
+) -> str:
+    elapsed = max(0.0, time.monotonic() - started_at)
+    elapsed_label = _format_status_duration(elapsed)
+    if health is not None and health.state == "stalled":
+        if health.answer_progress_seen:
+            status = (
+                "STALLED finality"
+                " · answer text received"
+                f" · no terminal proof {_format_status_duration(health.server_idle_seconds)}"
+            )
+        else:
+            status = (
+                "STALLED backend"
+                f" · server silent {_format_status_duration(health.server_idle_seconds)}"
+                " · read-only recovery active"
+            )
+    elif health is not None and health.state == "quiet":
+        if health.answer_progress_seen:
+            status = (
+                "answer text received"
+                f" · terminal proof pending {_format_status_duration(health.server_idle_seconds)}"
+            )
+        else:
+            status = (
+                f"server quiet {_format_status_duration(health.server_idle_seconds)}"
+                " · checking delivery"
+            )
+    elif health is not None and health.state == "reconnecting":
+        status = f"reconnecting delivery · attempt {health.reconnect_attempt}"
+    else:
+        status = f"working {elapsed_label}"
+        if health is not None:
+            progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
+            if progress_age >= 30.0:
+                status += f" · server { _format_status_duration(progress_age) } ago"
     if queued_count:
         status += f" · queued {queued_count}"
     return status
@@ -1780,6 +1912,7 @@ def _send_chat_prompt(
     result_out: dict[str, Any] | None = None,
     on_stop_confirmed: Callable[[str | None], None] | None = None,
     defer_final_rendering: bool = False,
+    turn_health: _TurnHealth | None = None,
 ) -> int:
     if result_out is not None:
         result_out.clear()
@@ -1818,6 +1951,31 @@ def _send_chat_prompt(
     def on_event(event: dict[str, Any]) -> None:
         nonlocal active_ref, write_conversation_ref
         event_type = event.get("type")
+        if turn_health is not None:
+            turn_health.observe(event)
+            if event_type in {
+                "stream_handoff_server_quiet",
+                "stream_handoff_server_stalled",
+            }:
+                event = {
+                    **event,
+                    "final_text_seen": turn_health.answer_progress_seen,
+                }
+        if (
+            recorder is not None
+            and isinstance(event_type, str)
+            and event_type.startswith("stream_handoff_")
+        ):
+            recorder.event(
+                "stream_health",
+                event_type=event_type,
+                reason=event.get("reason"),
+                attempt=event.get("attempt"),
+                server_idle_seconds=event.get("server_idle_seconds"),
+                silent_seconds=event.get("silent_seconds"),
+                catchup_count=event.get("catchup_count"),
+                last_offset=event.get("last_offset"),
+            )
         if event_type in {
             "browser_native_write_identity_resolved",
             "browser_native_write_completed",

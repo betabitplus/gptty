@@ -113,6 +113,84 @@ def _args(tmp_path):
     )
 
 
+def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch) -> None:
+    now = 500.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(last_server_progress_at=470.0)
+
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "working 00:50 · server 00:30 ago"
+    )
+
+    health.observe(
+        {
+            "type": "stream_handoff_ws_reconnecting",
+            "attempt": 3,
+            "server_idle_seconds": 45.0,
+        }
+    )
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "reconnecting delivery · attempt 3"
+    )
+
+    health.observe(
+        {
+            "type": "stream_handoff_server_quiet",
+            "server_idle_seconds": 125.0,
+        }
+    )
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "server quiet 02:05 · checking delivery"
+    )
+
+    health.observe(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 305.0,
+        }
+    )
+    assert chat_module._working_status(450.0, 1, health=health) == (
+        "STALLED backend · server silent 05:05 · read-only recovery active · queued 1"
+    )
+
+    now = 501.0
+    health.observe(
+        {
+            "type": "stream_handoff_server_resumed",
+            "silent_seconds": 306.0,
+        }
+    )
+    assert health.state == "working"
+    assert chat_module._working_status(450.0, 0, health=health) == "working 00:51"
+
+    health.observe(
+        {
+            "type": "assistant_text_delta",
+            "message_id": "answer-1",
+            "delta": "Final answer",
+        }
+    )
+    health.observe(
+        {
+            "type": "stream_handoff_server_quiet",
+            "server_idle_seconds": 125.0,
+        }
+    )
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "answer text received · terminal proof pending 02:05"
+    )
+
+    health.observe(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 305.0,
+        }
+    )
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "STALLED finality · answer text received · no terminal proof 05:05"
+    )
+
+
 def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notification(
     tmp_path, monkeypatch
 ) -> None:
@@ -1334,6 +1412,50 @@ def test_attached_follow_renders_late_intermediate_before_deferred_final() -> No
     assert rendered[-2][0] == "live_event"
     assert rendered[-2][1]["message_id"] == "late-commentary"
     assert rendered[-1] == ("answer", "complete final answer")
+
+
+def test_attached_follow_marks_finality_stall_after_final_text() -> None:
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    health = chat_module._TurnHealth(last_server_progress_at=time.monotonic())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={},
+        deadline=10_000.0,
+        health=health,
+        stream_answer_message_id="assistant-final",
+        defer_stream_answer_until_terminal=True,
+    )
+
+    chat_module._apply_enhanced_follow_stream_event(
+        follow,
+        {
+            "type": "assistant_text_delta",
+            "message_id": "assistant-final",
+            "sequence": 1,
+            "delta": "complete final answer",
+        },
+        renderer=renderer,
+    )
+    chat_module._apply_enhanced_follow_stream_event(
+        follow,
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 305.0,
+        },
+        renderer=renderer,
+    )
+
+    health_event = next(
+        event[1]
+        for event in renderer.events
+        if event[0] == "live_event"
+        and isinstance(event[1], dict)
+        and event[1].get("type") == "stream_handoff_server_stalled"
+    )
+    assert health.answer_progress_seen is True
+    assert health.state == "stalled"
+    assert health_event["final_text_seen"] is True
 
 
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:

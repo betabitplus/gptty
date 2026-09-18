@@ -140,6 +140,53 @@ class PrettyRenderer:
     def live_event(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
+        event_type = event.get("type")
+        if event_type == "stream_handoff_delivery_recovered":
+            count = event.get("catchup_count")
+            recovered = (
+                f" · replayed {count} events"
+                if isinstance(count, int) and not isinstance(count, bool)
+                else ""
+            )
+            self.info(f"Delivery recovered{recovered}")
+            return
+        if event_type == "stream_handoff_server_quiet":
+            idle = event.get("server_idle_seconds")
+            seconds = float(idle) if isinstance(idle, (int, float)) else 0.0
+            if event.get("final_text_seen") is True:
+                self.warning(
+                    "Answer text received"
+                    f" · terminal proof pending for {_format_elapsed(seconds)}"
+                    " · checking read-only"
+                )
+            else:
+                self.warning(
+                    "Server quiet"
+                    f" · no new ChatGPT events for {_format_elapsed(seconds)}"
+                    " · checking delivery read-only"
+                )
+            return
+        if event_type == "stream_handoff_server_stalled":
+            idle = event.get("server_idle_seconds")
+            seconds = float(idle) if isinstance(idle, (int, float)) else 0.0
+            if event.get("final_text_seen") is True:
+                self.warning(
+                    "Finality STALLED"
+                    " · answer text received but no terminal proof"
+                    f" for {_format_elapsed(seconds)}"
+                )
+            else:
+                self.warning(
+                    "Backend STALLED"
+                    f" · no new ChatGPT events for {_format_elapsed(seconds)}"
+                    " · delivery reconnects are still active"
+                )
+            return
+        if event_type == "stream_handoff_server_resumed":
+            silent = event.get("silent_seconds")
+            seconds = float(silent) if isinstance(silent, (int, float)) else 0.0
+            self.info(f"Server resumed after {_format_elapsed(seconds)}")
+            return
         previous_text = self._answer_state.text
         previous_message_id = self._answer_state.message_id
         if self._answer_state.apply(event):

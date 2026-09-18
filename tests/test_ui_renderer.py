@@ -157,6 +157,58 @@ def test_renderer_keeps_commentary_visible_when_thinking_is_hidden() -> None:
     assert "Thinking" not in text
 
 
+def test_renderer_surfaces_stream_health_transitions() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_quiet",
+            "server_idle_seconds": 125.0,
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 305.0,
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_delivery_recovered",
+            "catchup_count": 7,
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_resumed",
+            "silent_seconds": 306.0,
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_quiet",
+            "server_idle_seconds": 125.0,
+            "final_text_seen": True,
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 305.0,
+            "final_text_seen": True,
+        }
+    )
+
+    text = out.getvalue()
+    assert "Server quiet" in text
+    assert "Backend STALLED" in text
+    assert "Delivery recovered · replayed 7 events" in text
+    assert "Server resumed after 05:06" in text
+    assert "Answer text received · terminal proof pending for 02:05" in text
+    assert "Finality STALLED · answer text received but no terminal proof for 05:05" in text
+
+
 def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))
