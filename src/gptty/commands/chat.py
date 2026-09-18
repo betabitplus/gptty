@@ -5,6 +5,7 @@ import shlex
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -2037,7 +2038,16 @@ def _send_chat_prompt(
             if error is not None:
                 if isinstance(error, Exception):
                     if recorder is not None:
-                        recorder.fail(str(error))
+                        recorder.fail(
+                            str(error),
+                            traceback_text="".join(
+                                traceback.format_exception(
+                                    type(error),
+                                    error,
+                                    error.__traceback__,
+                                )
+                            ),
+                        )
                     renderer.turn_abort()
                     print(f"gptty: chat request failed: {error}", file=stderr)
                     return 1

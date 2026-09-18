@@ -31,6 +31,30 @@ def test_start_run_writes_summary_and_events(tmp_path) -> None:
     ]
 
 
+def test_fail_persists_traceback_in_summary_and_event(tmp_path) -> None:
+    recorder = start_run(
+        profile=None,
+        state_path=tmp_path / "gptty_state.json",
+        command="chat",
+        conversation_ref="conv-1",
+    )
+
+    recorder.fail(
+        "boom",
+        traceback_text="Traceback (most recent call last):\nValueError: boom\n",
+    )
+
+    summary = read_run_summary(recorder.run_file)
+    events = read_run_events(recorder.events_file, from_start=True)
+
+    assert summary["status"] == "failed"
+    assert summary["error"] == "boom"
+    assert "ValueError: boom" in summary["traceback"]
+    assert events[-1]["type"] == "failed"
+    assert events[-1]["message"] == "boom"
+    assert "ValueError: boom" in events[-1]["traceback"]
+
+
 def test_render_run_status_includes_recent_text(tmp_path) -> None:
     recorder = start_run(
         profile=None,

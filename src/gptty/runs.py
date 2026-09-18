@@ -54,11 +54,16 @@ class RunRecorder:
         self.summary["completed_at"] = utc_now()
         self.event("completed")
 
-    def fail(self, message: str) -> None:
+    def fail(self, message: str, *, traceback_text: str | None = None) -> None:
         self.summary["status"] = "failed"
         self.summary["error"] = message
+        if isinstance(traceback_text, str) and traceback_text.strip():
+            self.summary["traceback"] = traceback_text
         self.summary["completed_at"] = utc_now()
-        self.event("failed", message=message)
+        event_data: dict[str, Any] = {"message": message}
+        if isinstance(traceback_text, str) and traceback_text.strip():
+            event_data["traceback"] = traceback_text
+        self.event("failed", **event_data)
 
 
 def run_dir(*, profile: str | None, state_path: str | Path) -> Path:
