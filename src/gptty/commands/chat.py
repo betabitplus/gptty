@@ -1759,32 +1759,36 @@ def _working_status(
     if health is not None and health.state == "stalled":
         if health.answer_progress_seen:
             status = (
-                "STALLED finality"
+                "FINALITY UNCONFIRMED"
                 " · answer text received"
-                f" · no terminal proof {_format_status_duration(health.server_idle_seconds)}"
+                f" · no observable server events {_format_status_duration(health.server_idle_seconds)}"
+                " · do not resend yet"
             )
         elif health.last_tool_error:
             status = (
-                "STALLED after tool error"
-                f" · server silent {_format_status_duration(health.server_idle_seconds)}"
-                " · Ctrl-C + new turn recommended"
+                "PROLONGED SILENCE"
+                f" · no observable server events {_format_status_duration(health.server_idle_seconds)}"
+                " · last visible tool failed"
+                " · turn may still recover"
             )
         else:
             status = (
-                "STALLED backend"
-                f" · server silent {_format_status_duration(health.server_idle_seconds)}"
-                " · read-only recovery active"
+                "PROLONGED SILENCE"
+                f" · no observable server events {_format_status_duration(health.server_idle_seconds)}"
+                " · turn may still be working"
+                " · do not resend yet"
             )
     elif health is not None and health.state == "quiet":
         if health.answer_progress_seen:
             status = (
                 "answer text received"
-                f" · terminal proof pending {_format_status_duration(health.server_idle_seconds)}"
+                f" · finality unconfirmed {_format_status_duration(health.server_idle_seconds)}"
             )
         else:
             status = (
                 f"server quiet {_format_status_duration(health.server_idle_seconds)}"
-                " · checking delivery"
+                " · no observable progress"
+                " · waiting safely"
             )
     elif health is not None and health.state == "reconnecting":
         status = f"reconnecting delivery · attempt {health.reconnect_attempt}"

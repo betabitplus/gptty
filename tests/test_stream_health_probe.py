@@ -48,37 +48,74 @@ def test_classify_detects_stale_registry_and_terminal_finality_stall() -> None:
         "process": {"pid": 123, "alive": False},
         "terminal": {
             "available": True,
-            "last_status": "STALLED finality · answer text received",
+            "last_status": "FINALITY UNCONFIRMED · answer text received",
         },
     }
 
     assert probe._classify(report) == [
         "stale_active_stream_registry",
-        "terminal_finality_stalled",
+        "terminal_finality_unconfirmed",
     ]
 
 
 
-def test_browser_repair_guard_requires_timeout_target_and_unfinished_server() -> None:
-    browser = {
-        "available": True,
-        "target_open": True,
-        "delivery_timeout": True,
+def test_browser_repair_guard_requires_read_only_reload_decision() -> None:
+    report = {
+        "decision": {
+            "action": "reload_browser_read_only",
+            "safe_to_send_new_turn": False,
+        }
     }
-    server = {"unfinished": True}
-    should_repair = (
-        browser.get("available") is True
-        and browser.get("target_open") is True
-        and browser.get("delivery_timeout") is True
-        and server.get("unfinished") is True
-    )
-    assert should_repair is True
+    assert probe._should_repair_browser(report) is True
 
-    server["unfinished"] = False
-    should_repair = (
-        browser.get("available") is True
-        and browser.get("target_open") is True
-        and browser.get("delivery_timeout") is True
-        and server.get("unfinished") is True
-    )
-    assert should_repair is False
+    report["decision"]["action"] = "wait"
+    assert probe._should_repair_browser(report) is False
+
+
+
+def test_decision_never_allows_resend_while_server_turn_is_unfinished() -> None:
+    report = {
+        "server": {"status": "running", "unfinished": True},
+        "browser": {"target_open": True, "delivery_timeout": False},
+        "active_stream": {"pid": 123},
+    }
+
+    decision = probe._decision(report)
+
+    assert decision["action"] == "wait"
+    assert decision["safe_to_send_new_turn"] is False
+    assert decision["safe_to_stop_generation"] is False
+
+
+def test_decision_prefers_read_only_recovery_over_new_turn() -> None:
+    report = {
+        "server": {"status": "tool_running", "unfinished": True},
+        "browser": {
+            "target_open": True,
+            "delivery_timeout": True,
+        },
+        "active_stream": None,
+    }
+
+    decision = probe._decision(report)
+
+    assert decision["action"] == "reload_browser_read_only"
+    assert decision["safe_to_send_new_turn"] is False
+    assert "do not click Retry" in decision["reason"]
+
+
+def test_decision_allows_new_turn_only_after_canonical_completion() -> None:
+    report = {
+        "server": {"status": "completed", "unfinished": False},
+        "browser": {},
+        "active_stream": None,
+    }
+
+    decision = probe._decision(report)
+
+    assert decision == {
+        "action": "done",
+        "safe_to_send_new_turn": True,
+        "safe_to_stop_generation": False,
+        "reason": "The observed turn is canonically completed.",
+    }

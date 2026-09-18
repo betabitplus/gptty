@@ -156,14 +156,14 @@ class PrettyRenderer:
             if event.get("final_text_seen") is True:
                 self.warning(
                     "Answer text received"
-                    f" · terminal proof pending for {_format_elapsed(seconds)}"
-                    " · checking read-only"
+                    f" · finality still unconfirmed after {_format_elapsed(seconds)}"
+                    " · waiting read-only"
                 )
             else:
                 self.warning(
                     "Server quiet"
-                    f" · no new ChatGPT events for {_format_elapsed(seconds)}"
-                    " · checking delivery read-only"
+                    f" · no observable ChatGPT events for {_format_elapsed(seconds)}"
+                    " · this does not prove the turn stopped"
                 )
             return
         if event_type == "stream_handoff_server_stalled":
@@ -172,28 +172,30 @@ class PrettyRenderer:
             tool_error = event.get("last_tool_error")
             if event.get("final_text_seen") is True:
                 self.warning(
-                    "Finality STALLED"
-                    " · answer text received but no terminal proof"
-                    f" for {_format_elapsed(seconds)}"
+                    "Finality unconfirmed"
+                    " · answer text received"
+                    f" · no observable server events for {_format_elapsed(seconds)}"
+                    " · do not resend yet"
                 )
             elif isinstance(tool_error, str) and tool_error.strip():
                 self.warning(
-                    "Backend STALLED after tool error"
-                    f" · {tool_error.strip()}"
-                    f" · server silent {_format_elapsed(seconds)}"
-                    " · Ctrl-C + new turn recommended"
+                    "Prolonged server silence"
+                    f" · no observable events for {_format_elapsed(seconds)}"
+                    f" · last visible tool failed: {tool_error.strip()}"
+                    " · turn may still recover"
                 )
             else:
                 self.warning(
-                    "Backend STALLED"
-                    f" · no new ChatGPT events for {_format_elapsed(seconds)}"
-                    " · delivery reconnects are still active"
+                    "Prolonged server silence"
+                    f" · no observable events for {_format_elapsed(seconds)}"
+                    " · turn may still be working invisibly"
+                    " · do not resend yet"
                 )
             return
         if event_type == "stream_handoff_server_resumed":
             silent = event.get("silent_seconds")
             seconds = float(silent) if isinstance(silent, (int, float)) else 0.0
-            self.info(f"Server resumed after {_format_elapsed(seconds)}")
+            self.info(f"Visibility restored after {_format_elapsed(seconds)}")
             return
         previous_text = self._answer_state.text
         previous_message_id = self._answer_state.message_id

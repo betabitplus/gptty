@@ -140,7 +140,7 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
         }
     )
     assert chat_module._working_status(450.0, 0, health=health) == (
-        "server quiet 02:05 · checking delivery"
+        "server quiet 02:05 · no observable progress · waiting safely"
     )
 
     health.observe(
@@ -150,7 +150,8 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
         }
     )
     assert chat_module._working_status(450.0, 1, health=health) == (
-        "STALLED backend · server silent 05:05 · read-only recovery active · queued 1"
+        "PROLONGED SILENCE · no observable server events 05:05"
+        " · turn may still be working · do not resend yet · queued 1"
     )
 
     now = 501.0
@@ -177,7 +178,7 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
         }
     )
     assert chat_module._working_status(450.0, 0, health=health) == (
-        "answer text received · terminal proof pending 02:05"
+        "answer text received · finality unconfirmed 02:05"
     )
 
     health.observe(
@@ -187,7 +188,8 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
         }
     )
     assert chat_module._working_status(450.0, 0, health=health) == (
-        "STALLED finality · answer text received · no terminal proof 05:05"
+        "FINALITY UNCONFIRMED · answer text received"
+        " · no observable server events 05:05 · do not resend yet"
     )
 
 
@@ -215,10 +217,13 @@ def test_turn_health_marks_stall_after_failed_tool_result(monkeypatch) -> None:
     )
 
     assert health.last_tool_error == "CodexProError: error: corrupt patch at line 13"
-    assert chat_module._working_status(100.0, 0, health=health) == (
-        "STALLED after tool error · server silent 10:05"
-        " · Ctrl-C + new turn recommended"
+    status = chat_module._working_status(100.0, 0, health=health)
+    assert status == (
+        "PROLONGED SILENCE · no observable server events 10:05"
+        " · last visible tool failed · turn may still recover"
     )
+    assert "Ctrl-C" not in status
+    assert "new turn" not in status
 
 
 def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notification(

@@ -209,14 +209,16 @@ def test_renderer_surfaces_stream_health_transitions() -> None:
 
     text = out.getvalue()
     assert "Server quiet" in text
-    assert "Backend STALLED" in text
+    assert "Prolonged server silence" in text
     assert "Delivery recovered · replayed 7 events" in text
-    assert "Server resumed after 05:06" in text
-    assert "Answer text received · terminal proof pending for 02:05" in text
-    assert "Finality STALLED · answer text received but no terminal proof for 05:05" in text
-    assert "Backend STALLED after tool error" in text
+    assert "Visibility restored after 05:06" in text
+    assert "Answer text received · finality still unconfirmed after 02:05" in text
+    assert "Finality unconfirmed · answer text received" in text
+    assert "05:05" in text
+    assert "do not resend yet" in text
+    assert "Prolonged server silence" in text
     assert "corrupt patch at line 13" in text
-    assert "Ctrl-C + new turn recommended" in text
+    assert "turn may still recover" in text
 
 
 def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:
@@ -254,3 +256,22 @@ def test_renderer_revision_falls_back_to_canonical_final() -> None:
     assert "Response revised while streaming; canonical final follows." in text
     assert "answer · final" in text
     assert text.rstrip().endswith("revised final")
+
+
+def test_renderer_never_recommends_destructive_action_from_silence_alone() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.live_event(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 1238.736,
+            "last_tool_error": "corrupt patch at line 13",
+        }
+    )
+
+    rendered = out.getvalue()
+    assert "turn may still recover" in rendered
+    assert "Ctrl-C" not in rendered
+    assert "new turn" not in rendered
+    assert "resend" not in rendered.lower()

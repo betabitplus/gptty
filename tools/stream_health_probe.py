@@ -251,12 +251,72 @@ def _classify(report: dict[str, Any]) -> list[str]:
 
     terminal = report.get("terminal") or {}
     status = str(terminal.get("last_status") or "")
-    if "STALLED finality" in status:
-        findings.append("terminal_finality_stalled")
-    elif "STALLED backend" in status:
-        findings.append("terminal_backend_stalled")
+    if "FINALITY UNCONFIRMED" in status:
+        findings.append("terminal_finality_unconfirmed")
+    elif "PROLONGED SILENCE" in status:
+        findings.append("terminal_prolonged_silence")
 
     return findings or ["no_known_stream_health_fault_detected"]
+
+
+def _decision(report: dict[str, Any]) -> dict[str, Any]:
+    server = report.get("server") or {}
+    browser = report.get("browser") or {}
+    registry = report.get("active_stream") or {}
+    status = server.get("status")
+    unfinished = server.get("unfinished") is True
+
+    if unfinished:
+        if browser.get("delivery_timeout") is True and browser.get("target_open") is True:
+            action = "reload_browser_read_only"
+            reason = (
+                "Browser delivery is stale, but the server turn is still unfinished. "
+                "Reloading the same tab is non-destructive; do not click Retry."
+            )
+        elif not registry:
+            action = "resume_read_only_follower"
+            reason = (
+                "The server turn is still unfinished and no local follower is attached. "
+                "Attach read-only instead of starting another turn."
+            )
+        else:
+            action = "wait"
+            reason = (
+                "No observable progress does not prove the turn stopped. "
+                "The server still reports an unfinished turn."
+            )
+        return {
+            "action": action,
+            "safe_to_send_new_turn": False,
+            "safe_to_stop_generation": False,
+            "reason": reason,
+        }
+
+    if status == "completed":
+        return {
+            "action": "done",
+            "safe_to_send_new_turn": True,
+            "safe_to_stop_generation": False,
+            "reason": "The observed turn is canonically completed.",
+        }
+
+    return {
+        "action": "inspect",
+        "safe_to_send_new_turn": False,
+        "safe_to_stop_generation": False,
+        "reason": (
+            "Server liveness is not proven either way. "
+            "Do not infer death from silence alone."
+        ),
+    }
+
+
+def _should_repair_browser(report: dict[str, Any]) -> bool:
+    decision = report.get("decision")
+    return (
+        isinstance(decision, dict)
+        and decision.get("action") == "reload_browser_read_only"
+    )
 
 
 def main() -> int:
@@ -303,6 +363,36 @@ def main() -> int:
             report["browser"] = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
     report["findings"] = _classify(report)
+    report["decision"] = _decision(report)
+
+    if args.repair_browser and _should_repair_browser(report):
+        repair = _agent_browser_reload()
+        report["browser_repair"] = repair
+        if repair.get("ok") is True:
+            time.sleep(2.0)
+            try:
+                report["browser_after_repair"] = _browser_snapshot(conversation_id)
+            except Exception as exc:  # noqa: BLE001 - diagnostic boundary
+                report["browser_after_repair"] = {
+                    "available": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            repaired_report = {
+                **report,
+                "browser": report["browser_after_repair"],
+            }
+            report["findings_after_repair"] = _classify(repaired_report)
+            report["decision_after_repair"] = _decision(repaired_report)
+    else:
+        report["browser_repair"] = {
+            "attempted": False,
+            "reason": (
+                "disabled"
+                if not args.repair_browser
+                else "repair guard not satisfied"
+            ),
+        }
+
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
