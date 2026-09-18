@@ -16,6 +16,7 @@ from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import StdoutProxy, patch_stdout
 
+from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..locks import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     ConversationLockError,
@@ -81,13 +82,32 @@ class _TurnHealth:
     delivery_recoveries: int = 0
     answer_progress_seen: bool = False
     last_tool_error: str = ""
+    codexpro_tracker: CodexProActivityTracker | None = None
+    conversation_ref: str | None = None
 
     def observe(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
         now = time.monotonic()
+        if event_type in {
+            "browser_native_write_identity_resolved",
+            "browser_native_write_completed",
+        }:
+            candidate = event.get("conversation_id") or event.get("conversationId")
+            if isinstance(candidate, str) and candidate.strip():
+                self.conversation_ref = candidate.strip()
         if event_type == "canonical_intermediate_message":
+            if (
+                self.codexpro_tracker is not None
+                and self.conversation_ref
+                and event.get("message_kind") == "tool_call"
+            ):
+                try:
+                    self.codexpro_tracker.observe_tool_call(self.conversation_ref, event)
+                except Exception:
+                    # Observability must never break a live ChatGPT turn.
+                    pass
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
             self.answer_progress_seen = False
@@ -144,6 +164,14 @@ class _TurnHealth:
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
             self.state = "working"
+
+    def codexpro_snapshot(self) -> CodexProActivitySnapshot:
+        if self.codexpro_tracker is None:
+            return CodexProActivitySnapshot()
+        try:
+            return self.codexpro_tracker.snapshot(self.conversation_ref)
+        except Exception:
+            return CodexProActivitySnapshot()
 
 
 @dataclass
@@ -684,6 +712,9 @@ async def _enhanced_loop_core(
     stdout: TextIO,
     stderr: TextIO,
 ) -> _EnhancedLoopOutcome:
+    activity_tracker = CodexProActivityTracker(
+        mapping_path=state_path.parent / "codexpro-session-map.json"
+    )
     active: _EnhancedTurn | None = None
     active_resume: _EnhancedResume | None = None
     active_follow: _EnhancedFollow | None = None
@@ -754,6 +785,7 @@ async def _enhanced_loop_core(
                 active = _start_enhanced_turn(
                     args=args,
                     state=state,
+                    activity_tracker=activity_tracker,
                     state_path=state_path,
                     get_client=get_client,
                     ui=ui,
@@ -874,6 +906,7 @@ async def _enhanced_loop_core(
                         finished_resume.request,
                         payload,
                         renderer=renderer,
+                        activity_tracker=activity_tracker,
                     )
             else:
                 commands.fail_resume(finished_resume.request, payload)
@@ -1052,6 +1085,7 @@ def _seed_enhanced_follow(
     snapshot: Any,
     *,
     renderer: PrettyRenderer,
+    activity_tracker: CodexProActivityTracker | None = None,
 ) -> _EnhancedFollow | None:
     if not isinstance(snapshot, dict) or "emitted_message_ids" not in snapshot:
         return None
@@ -1081,6 +1115,12 @@ def _seed_enhanced_follow(
     stream_answer_text = snapshot.get("stream_answer_text")
     if not isinstance(stream_answer_text, str):
         stream_answer_text = ""
+    health = _TurnHealth(
+        last_server_progress_at=time.monotonic(),
+        answer_progress_seen=bool(stream_answer_text),
+        codexpro_tracker=activity_tracker,
+        conversation_ref=request.conversation_ref,
+    )
 
     renderer.info(
         "Following active response via live stream…"
@@ -1104,16 +1144,14 @@ def _seed_enhanced_follow(
                 else None
             )
             if normalized_message_id in current_turn_event_ids:
+                health.observe(event)
                 renderer.live_event(event)
     return _EnhancedFollow(
         conversation_ref=request.conversation_ref,
         emitted_message_ids=emitted,
         seen_messages=seen,
         deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
-        health=_TurnHealth(
-            last_server_progress_at=time.monotonic(),
-            answer_progress_seen=bool(stream_answer_text),
-        ),
+        health=health,
         next_interval=FOLLOW_MIN_INTERVAL_SECONDS,
         stream_topic_id=stream_topic_id,
         stream_answer_message_id=stream_answer_message_id,
@@ -1643,6 +1681,7 @@ def _start_enhanced_turn(
     *,
     args: Any,
     state: ChatState,
+    activity_tracker: CodexProActivityTracker | None,
     state_path: Path,
     get_client: Callable[[], Any],
     ui: InteractiveSession,
@@ -1666,7 +1705,11 @@ def _start_enhanced_turn(
     turn_result: dict[str, Any] = {}
     controls = TurnControlSignals()
     started_at = time.monotonic()
-    health = _TurnHealth(last_server_progress_at=started_at)
+    health = _TurnHealth(
+        last_server_progress_at=started_at,
+        codexpro_tracker=activity_tracker,
+        conversation_ref=commands.conversation_ref or state.current_conversation,
+    )
     renderer.turn_start(show_elapsed=False)
 
     loop = asyncio.get_running_loop()
@@ -1748,6 +1791,34 @@ def _format_status_duration(seconds: float) -> str:
     return f"{hours:d}:{minutes:02d}:{seconds:02d}"
 
 
+def _codexpro_status_suffix(snapshot: CodexProActivitySnapshot) -> str:
+    if not snapshot.bound:
+        return ""
+    if snapshot.inflight:
+        tool = snapshot.inflight_tool or snapshot.last_tool or "tool"
+        heartbeat_age = snapshot.last_heartbeat_age_seconds
+        if heartbeat_age is not None and heartbeat_age <= 45.0:
+            return (
+                f" · CodexPro exact: {tool} running"
+                f" · heartbeat {_format_status_duration(heartbeat_age)} ago"
+            )
+        if (
+            heartbeat_age is None
+            and snapshot.last_event_age_seconds is not None
+            and snapshot.last_event_age_seconds <= 20.0
+        ):
+            return (
+                f" · CodexPro exact: {tool} in flight"
+                f" · started {_format_status_duration(snapshot.last_event_age_seconds)} ago"
+            )
+    if snapshot.last_event_age_seconds is not None:
+        return (
+            " · CodexPro exact activity "
+            f"{_format_status_duration(snapshot.last_event_age_seconds)} ago"
+        )
+    return " · CodexPro session mapped"
+
+
 def _working_status(
     started_at: float,
     queued_count: int,
@@ -1756,6 +1827,7 @@ def _working_status(
 ) -> str:
     elapsed = max(0.0, time.monotonic() - started_at)
     elapsed_label = _format_status_duration(elapsed)
+    codexpro = health.codexpro_snapshot() if health is not None else CodexProActivitySnapshot()
     if health is not None and health.state == "stalled":
         if health.answer_progress_seen:
             status = (
@@ -1798,6 +1870,10 @@ def _working_status(
             progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
             if progress_age >= 30.0:
                 status += f" · server { _format_status_duration(progress_age) } ago"
+    if health is not None:
+        progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
+        if health.state in {"quiet", "stalled"} or progress_age >= 30.0:
+            status += _codexpro_status_suffix(codexpro)
     if queued_count:
         status += f" · queued {queued_count}"
     return status

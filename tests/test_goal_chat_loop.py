@@ -1687,3 +1687,36 @@ def test_unfinished_resume_returns_to_prompt_without_polling(
     client = UnfinishedResumeClient.instances[0]
     assert client.calls == [("snapshot", "conv-stale")]
     assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"
+
+
+def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
+    class Tracker:
+        def snapshot(self, _conversation_ref):
+            return chat_module.CodexProActivitySnapshot(
+                bound=True,
+                last_event_age_seconds=7.0,
+                last_tool="bash",
+                inflight=True,
+                inflight_tool="bash",
+                last_heartbeat_age_seconds=7.0,
+            )
+
+    now = 900.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(
+        last_server_progress_at=600.0,
+        codexpro_tracker=Tracker(),
+        conversation_ref="conversation-1",
+    )
+    health.observe(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 300.0,
+        }
+    )
+
+    status = chat_module._working_status(500.0, 0, health=health)
+    assert "PROLONGED SILENCE" in status
+    assert "CodexPro exact: bash running" in status
+    assert "heartbeat 00:07 ago" in status
+    assert "do not resend yet" in status
