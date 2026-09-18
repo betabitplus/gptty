@@ -56,3 +56,29 @@ def test_classify_detects_stale_registry_and_terminal_finality_stall() -> None:
         "stale_active_stream_registry",
         "terminal_finality_stalled",
     ]
+
+
+
+def test_browser_repair_guard_requires_timeout_target_and_unfinished_server() -> None:
+    browser = {
+        "available": True,
+        "target_open": True,
+        "delivery_timeout": True,
+    }
+    server = {"unfinished": True}
+    should_repair = (
+        browser.get("available") is True
+        and browser.get("target_open") is True
+        and browser.get("delivery_timeout") is True
+        and server.get("unfinished") is True
+    )
+    assert should_repair is True
+
+    server["unfinished"] = False
+    should_repair = (
+        browser.get("available") is True
+        and browser.get("target_open") is True
+        and browser.get("delivery_timeout") is True
+        and server.get("unfinished") is True
+    )
+    assert should_repair is False

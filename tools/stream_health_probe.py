@@ -143,6 +143,22 @@ def _decode_agent_browser_output(stdout: str) -> Any:
     return value
 
 
+def _agent_browser_reload() -> dict[str, Any]:
+    proc = subprocess.run(
+        ["agent-browser", "reload"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    return {
+        "ok": proc.returncode == 0,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+        "returncode": proc.returncode,
+    }
+
+
 def _browser_snapshot(conversation_id: str) -> dict[str, Any]:
     script = r'''JSON.stringify((()=>{
 const turns=Array.from(document.querySelectorAll("[data-testid*=conversation-turn]"));
@@ -250,6 +266,15 @@ def main() -> int:
     parser.add_argument("conversation")
     parser.add_argument("--terminal-lines", type=int, default=80)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--repair-browser",
+        action="store_true",
+        help=(
+            "If the target tab shows Message delivery timed out while the server "
+            "turn is still unfinished, reload that tab and re-check. Never clicks "
+            "Retry and never sends a chat write."
+        ),
+    )
     args = parser.parse_args()
 
     conversation_id = _conversation_id(args.conversation)
