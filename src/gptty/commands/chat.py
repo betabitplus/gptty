@@ -100,6 +100,7 @@ class _EnhancedFollow:
     stream_topic_id: str | None = None
     stream_answer_message_id: str | None = None
     stream_answer_text: str = ""
+    defer_stream_answer_until_terminal: bool = False
     stream_disabled: bool = False
     mode: str | None = None
     timer: asyncio.Task[None] | None = None
@@ -1037,6 +1038,10 @@ def _seed_enhanced_follow(
         stream_topic_id=stream_topic_id,
         stream_answer_message_id=stream_answer_message_id,
         stream_answer_text=stream_answer_text,
+        # Attached follow can join after earlier commentary/tool events. Because
+        # terminal reconciliation may recover those missed events, rendering the
+        # final answer eagerly can put older progress after the final text.
+        defer_stream_answer_until_terminal=True,
     )
 
 
@@ -1190,7 +1195,8 @@ def _apply_enhanced_follow_stream_event(
         follow.seen_messages[follow.stream_answer_message_id] = (
             follow.stream_answer_text
         )
-    renderer.live_event(event)
+    if not follow.defer_stream_answer_until_terminal:
+        renderer.live_event(event)
 
 
 def _drain_enhanced_follow_stream_events(
@@ -1317,13 +1323,18 @@ def _apply_enhanced_follow_snapshot(
     status = _snapshot_status(snapshot)
     corrected_final_identity: str | None = None
     corrected_final_text = ""
+    deferred_final_identity: str | None = None
+    deferred_final_text = ""
     if status == "completed" and follow.stream_answer_message_id:
         for message in reversed(current):
             identity = _message_identity(message)
             if identity != follow.stream_answer_message_id:
                 continue
             text = _message_text(message)
-            if text and text != follow.stream_answer_text:
+            if follow.defer_stream_answer_until_terminal and text:
+                deferred_final_identity = identity
+                deferred_final_text = text
+            elif text and text != follow.stream_answer_text:
                 corrected_final_identity = identity
                 corrected_final_text = text
             break
@@ -1336,16 +1347,24 @@ def _apply_enhanced_follow_snapshot(
         follow.seen_messages[identity] = text
         if previous == text or identity in event_ids:
             continue
-        if identity == corrected_final_identity:
+        if identity in {deferred_final_identity, corrected_final_identity}:
             continue
         changed.append(message)
     if changed:
         renderer.messages(normalize_messages(changed))
-    if corrected_final_identity is not None:
+    if deferred_final_identity is not None:
+        renderer.answer(deferred_final_text)
+        follow.stream_answer_text = deferred_final_text
+    elif corrected_final_identity is not None:
         renderer.answer(corrected_final_text)
         follow.stream_answer_text = corrected_final_text
 
-    if event_items or changed or corrected_final_identity is not None:
+    if (
+        event_items
+        or changed
+        or deferred_final_identity is not None
+        or corrected_final_identity is not None
+    ):
         follow.next_interval = FOLLOW_MIN_INTERVAL_SECONDS
     else:
         follow.next_interval = min(

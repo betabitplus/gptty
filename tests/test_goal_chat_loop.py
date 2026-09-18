@@ -1102,13 +1102,13 @@ def test_unfinished_resume_prefers_live_stream_without_polling(
     assert ("send_to_conversation", "conv-stream") in client.calls
     renderer = _FakeRenderer.instances[0]
     assert saw_stream_reasoning()
-    assert any(
+    assert not any(
         event[0] == "live_event"
         and isinstance(event[1], dict)
         and event[1].get("type") == "assistant_text_delta"
-        and event[1].get("delta") == " final"
         for event in renderer.events
     )
+    assert ("answer", "partial final") in renderer.events
 
 
 def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
@@ -1269,6 +1269,71 @@ def test_resume_follow_replaces_corrupt_stream_final_with_canonical_snapshot(
     assert not any(event[0] == "messages" for event in renderer.events)
     assert follow.stream_answer_text == "complete canonical answer"
     assert notifications[-1]["final_response"] == "complete canonical answer"
+
+
+def test_attached_follow_renders_late_intermediate_before_deferred_final() -> None:
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={},
+        deadline=10_000.0,
+        stream_answer_message_id="assistant-final",
+        defer_stream_answer_until_terminal=True,
+    )
+
+    chat_module._apply_enhanced_follow_stream_event(
+        follow,
+        {
+            "type": "assistant_text_delta",
+            "message_id": "assistant-final",
+            "sequence": 1,
+            "delta": "complete final answer",
+        },
+        renderer=renderer,
+    )
+
+    assert follow.stream_answer_text == "complete final answer"
+    assert not any(
+        event[0] == "live_event"
+        and isinstance(event[1], dict)
+        and event[1].get("type") == "assistant_text_delta"
+        for event in renderer.events
+    )
+
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {
+                "message_id": "assistant-final",
+                "role": "assistant",
+                "text": "complete final answer",
+            }
+        ],
+        "events": [
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "late-commentary",
+                "message_kind": "commentary",
+                "text": "older progress that the live topic missed",
+            }
+        ],
+        "emitted_message_ids": ["late-commentary"],
+        "stream_terminal_reconciled": True,
+    }
+
+    assert not chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        snapshot,
+        renderer=renderer,
+    )
+
+    rendered = [
+        event for event in renderer.events if event[0] in {"live_event", "answer"}
+    ]
+    assert rendered[-2][0] == "live_event"
+    assert rendered[-2][1]["message_id"] == "late-commentary"
+    assert rendered[-1] == ("answer", "complete final answer")
 
 
 def test_resume_follow_adapts_poll_budget_and_backs_off_on_rate_limit() -> None:
