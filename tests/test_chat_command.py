@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sys
 import threading
 from argparse import Namespace
 from io import StringIO
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+import gptty.commands.chat as chat_mod
 from gptty.commands.chat import (
     LOCAL_QUIT_CODE,
     _send_chat_prompt,
@@ -69,6 +71,38 @@ def make_args(tmp_path, **overrides: Any) -> Namespace:
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def test_prompt_aware_stream_preserves_prompt_toolkit_partial_buffer(monkeypatch) -> None:
+    class FakeStdoutProxy:
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+            self.flush_calls = 0
+
+        def write(self, text: str) -> int:
+            self.writes.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            self.flush_calls += 1
+
+    base = StringIO()
+    proxy = FakeStdoutProxy()
+    monkeypatch.setattr(chat_mod, "StdoutProxy", FakeStdoutProxy)
+    monkeypatch.setattr(sys, "stdout", proxy)
+
+    stream = chat_mod._PromptAwareStream(base, stream_name="stdout")
+    assert stream.write_stream_fragment("partial answer") == len("partial answer")
+
+    assert proxy.writes == ["partial answer"]
+    assert proxy.flush_calls == 0
+
+    stream.flush()
+    assert proxy.flush_calls == 1
+
+    monkeypatch.setattr(sys, "stdout", base)
+    assert stream.write_stream_fragment("direct") == len("direct")
+    assert base.getvalue() == "direct"
 
 
 def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:

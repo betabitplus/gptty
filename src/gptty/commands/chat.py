@@ -13,7 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
-from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.patch_stdout import StdoutProxy, patch_stdout
 
 from ..locks import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -122,6 +122,13 @@ class _PromptAwareStream:
 
     def write(self, text: str) -> int:
         return self._target().write(text)
+
+    def write_stream_fragment(self, text: str) -> int:
+        target = self._target()
+        written = target.write(text)
+        if not isinstance(target, StdoutProxy):
+            target.flush()
+        return written
 
     def flush(self) -> None:
         self._target().flush()

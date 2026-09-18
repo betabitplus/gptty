@@ -236,6 +236,13 @@ class PrettyRenderer:
         self.console.print(Text("Response revised while streaming; canonical final follows.", style="dim"))
         self._answer_stream_suppressed = True
 
+    def _write_answer_fragment(self, text: str) -> None:
+        writer = getattr(self.stdout, "write_stream_fragment", None)
+        if callable(writer):
+            writer(text)
+            return
+        self.console.print(Text(text), end="")
+
     def _render_stream_answer_event(
         self,
         event: dict[str, Any],
@@ -255,18 +262,18 @@ class PrettyRenderer:
         if event_type == "assistant_text_delta":
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
-                self.console.print(Text(delta), end="")
+                self._write_answer_fragment(delta)
             return
 
         text = self._answer_state.text
         if not previous_text or previous_message_id is None:
             if text:
-                self.console.print(Text(text), end="")
+                self._write_answer_fragment(text)
             return
         if message_id == previous_message_id and text.startswith(previous_text):
             suffix = text[len(previous_text) :]
             if suffix:
-                self.console.print(Text(suffix), end="")
+                self._write_answer_fragment(suffix)
             return
         self._suppress_revised_stream()
 
