@@ -17,6 +17,7 @@ from typing import Any, TextIO
 from prompt_toolkit.patch_stdout import StdoutProxy, patch_stdout
 
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
+from ..stream_delivery import StreamDeliveryJournal
 from ..locks import (
     DEFAULT_LOCK_TIMEOUT_SECONDS,
     ConversationLockError,
@@ -83,7 +84,9 @@ class _TurnHealth:
     answer_progress_seen: bool = False
     last_tool_error: str = ""
     codexpro_tracker: CodexProActivityTracker | None = None
+    delivery_journal: StreamDeliveryJournal | None = None
     conversation_ref: str | None = None
+    reconnect_reason: str = ""
 
     def observe(self, event: Any) -> None:
         if not isinstance(event, dict):
@@ -97,6 +100,12 @@ class _TurnHealth:
             candidate = event.get("conversation_id") or event.get("conversationId")
             if isinstance(candidate, str) and candidate.strip():
                 self.conversation_ref = candidate.strip()
+        if self.delivery_journal is not None:
+            try:
+                self.delivery_journal.observe(self.conversation_ref, event)
+            except Exception:
+                # Delivery diagnostics must never interfere with a live turn.
+                pass
         if event_type == "canonical_intermediate_message":
             if (
                 self.codexpro_tracker is not None
@@ -136,16 +145,23 @@ class _TurnHealth:
             attempt = event.get("attempt")
             if isinstance(attempt, int) and not isinstance(attempt, bool):
                 self.reconnect_attempt = attempt
+            reason = event.get("reason")
+            self.reconnect_reason = reason.strip() if isinstance(reason, str) else ""
             idle = event.get("server_idle_seconds")
             if isinstance(idle, (int, float)) and not isinstance(idle, bool):
                 self.server_idle_seconds = max(self.server_idle_seconds, float(idle))
             if self.state not in {"quiet", "stalled"}:
                 self.state = "reconnecting"
             return
+        if event_type == "stream_handoff_ws_subscribed":
+            if self.state == "reconnecting":
+                self.state = "working"
+            return
         if event_type == "stream_handoff_delivery_recovered":
             self.delivery_recoveries += 1
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
+            self.reconnect_reason = ""
             self.state = "working"
             return
         if event_type == "stream_handoff_server_quiet":
@@ -163,6 +179,7 @@ class _TurnHealth:
         if event_type == "stream_handoff_server_resumed":
             self.last_server_progress_at = now
             self.server_idle_seconds = 0.0
+            self.reconnect_reason = ""
             self.state = "working"
 
     def codexpro_snapshot(self) -> CodexProActivitySnapshot:
@@ -715,6 +732,9 @@ async def _enhanced_loop_core(
     activity_tracker = CodexProActivityTracker(
         mapping_path=state_path.parent / "codexpro-session-map.json"
     )
+    delivery_journal = StreamDeliveryJournal(
+        state_path.parent / "stream-delivery.jsonl"
+    )
     active: _EnhancedTurn | None = None
     active_resume: _EnhancedResume | None = None
     active_follow: _EnhancedFollow | None = None
@@ -786,6 +806,7 @@ async def _enhanced_loop_core(
                     args=args,
                     state=state,
                     activity_tracker=activity_tracker,
+                    delivery_journal=delivery_journal,
                     state_path=state_path,
                     get_client=get_client,
                     ui=ui,
@@ -907,6 +928,7 @@ async def _enhanced_loop_core(
                         payload,
                         renderer=renderer,
                         activity_tracker=activity_tracker,
+                        delivery_journal=delivery_journal,
                     )
             else:
                 commands.fail_resume(finished_resume.request, payload)
@@ -1086,6 +1108,7 @@ def _seed_enhanced_follow(
     *,
     renderer: PrettyRenderer,
     activity_tracker: CodexProActivityTracker | None = None,
+    delivery_journal: StreamDeliveryJournal | None = None,
 ) -> _EnhancedFollow | None:
     if not isinstance(snapshot, dict) or "emitted_message_ids" not in snapshot:
         return None
@@ -1119,6 +1142,7 @@ def _seed_enhanced_follow(
         last_server_progress_at=time.monotonic(),
         answer_progress_seen=bool(stream_answer_text),
         codexpro_tracker=activity_tracker,
+        delivery_journal=delivery_journal,
         conversation_ref=request.conversation_ref,
     )
 
@@ -1682,6 +1706,7 @@ def _start_enhanced_turn(
     args: Any,
     state: ChatState,
     activity_tracker: CodexProActivityTracker | None,
+    delivery_journal: StreamDeliveryJournal | None,
     state_path: Path,
     get_client: Callable[[], Any],
     ui: InteractiveSession,
@@ -1708,6 +1733,7 @@ def _start_enhanced_turn(
     health = _TurnHealth(
         last_server_progress_at=started_at,
         codexpro_tracker=activity_tracker,
+        delivery_journal=delivery_journal,
         conversation_ref=commands.conversation_ref or state.current_conversation,
     )
     renderer.turn_start(show_elapsed=False)
@@ -1863,7 +1889,10 @@ def _working_status(
                 " · waiting safely"
             )
     elif health is not None and health.state == "reconnecting":
-        status = f"reconnecting delivery · attempt {health.reconnect_attempt}"
+        if health.reconnect_reason == "topic_idle":
+            status = f"checking delivery · idle lease · attempt {health.reconnect_attempt}"
+        else:
+            status = f"reconnecting delivery · attempt {health.reconnect_attempt}"
     else:
         status = f"working {elapsed_label}"
         if health is not None:

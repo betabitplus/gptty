@@ -1720,3 +1720,46 @@ def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
     assert "CodexPro exact: bash running" in status
     assert "heartbeat 00:07 ago" in status
     assert "do not resend yet" in status
+
+
+def test_working_status_labels_idle_reconnect_as_delivery_check(monkeypatch) -> None:
+    now = 700.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(last_server_progress_at=690.0)
+    health.observe(
+        {
+            "type": "stream_handoff_ws_reconnecting",
+            "reason": "topic_idle",
+            "attempt": 3,
+            "server_idle_seconds": 12.0,
+        }
+    )
+
+    status = chat_module._working_status(650.0, 0, health=health)
+    assert status == "checking delivery · idle lease · attempt 3"
+
+    health.observe(
+        {
+            "type": "stream_handoff_ws_subscribed",
+            "catchup_count": 0,
+            "last_offset": "1000-0",
+        }
+    )
+    assert health.state == "working"
+
+
+def test_working_status_keeps_transport_error_as_reconnecting(monkeypatch) -> None:
+    now = 700.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(last_server_progress_at=690.0)
+    health.observe(
+        {
+            "type": "stream_handoff_ws_reconnecting",
+            "reason": "transport",
+            "attempt": 2,
+            "server_idle_seconds": 1.0,
+        }
+    )
+
+    status = chat_module._working_status(650.0, 0, health=health)
+    assert status == "reconnecting delivery · attempt 2"
