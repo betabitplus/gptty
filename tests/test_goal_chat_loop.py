@@ -171,6 +171,10 @@ def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch
             "delta": "Final answer",
         }
     )
+    now = 507.0
+    assert chat_module._working_status(450.0, 0, health=health) == (
+        "answer text received · finality unconfirmed 00:06 · do not resend yet"
+    )
     health.observe(
         {
             "type": "stream_handoff_server_quiet",

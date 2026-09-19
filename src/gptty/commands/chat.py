@@ -66,6 +66,7 @@ FOLLOW_RATE_LIMIT_BACKOFF_SECONDS = 120.0
 FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
 FOLLOW_MESSAGE_LIMIT = 128
+ANSWER_FINALITY_PENDING_SECONDS = 5.0
 
 
 @dataclass
@@ -1924,7 +1925,16 @@ def _working_status(
         status = f"working {elapsed_label}"
         if health is not None:
             progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
-            if progress_age >= 30.0:
+            if (
+                health.answer_progress_seen
+                and progress_age >= ANSWER_FINALITY_PENDING_SECONDS
+            ):
+                status = (
+                    "answer text received"
+                    f" · finality unconfirmed {_format_status_duration(progress_age)}"
+                    " · do not resend yet"
+                )
+            elif progress_age >= 30.0:
                 status += f" · server { _format_status_duration(progress_age) } ago"
     if health is not None:
         progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
