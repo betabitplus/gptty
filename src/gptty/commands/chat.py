@@ -1648,6 +1648,10 @@ async def _finish_enhanced_turn(
         renderer.answer(final_text)
     if stopped_by_user:
         renderer.info("Stopped by user.")
+        if queued_prompts:
+            renderer.info(
+                f"Queued · {len(queued_prompts)} · will send next"
+            )
     conversation_ref = turn.result.get("conversation_ref")
     if (
         not turn.result.get("is_temporary")
@@ -1657,13 +1661,7 @@ async def _finish_enhanced_turn(
         renderer.chat_link(conversation_ref.strip())
 
     if turn.result.get("stopped_by_user"):
-        queued_count = len(queued_prompts)
-        queued_prompts.clear()
         commands.clear_automatic_prompts()
-        if queued_count:
-            renderer.info(
-                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after Stop."
-            )
 
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
     if incomplete_turn:

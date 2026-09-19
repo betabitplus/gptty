@@ -542,7 +542,7 @@ def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
     ) in renderer.events
 
 
-def test_stop_command_while_working_uses_active_turn_stop_path(
+def test_stop_command_while_working_preserves_and_sends_queued_prompt(
     tmp_path, monkeypatch
 ) -> None:
     class StopClient:
@@ -566,6 +566,14 @@ def test_stop_command_while_working_uses_active_turn_stop_path(
                 title="Stop command test",
             )
 
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt))
+            return SimpleNamespace(
+                text="Queued follow-up sent",
+                conversation_id=ref,
+                title="Stop command test",
+            )
+
         def stop_generation(self, ref=None, **options):
             self.calls.append(("stop_generation", ref))
             self.__class__.release.set()
@@ -578,7 +586,7 @@ def test_stop_command_while_working_uses_active_turn_stop_path(
     _FakeSession.script = iter(
         [
             "Produce a long response",
-            (StopClient.started.is_set, "Queued follow-up must not run"),
+            (StopClient.started.is_set, "Queued follow-up should run"),
             (
                 lambda: bool(_FakeRenderer.instances)
                 and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
@@ -586,7 +594,8 @@ def test_stop_command_while_working_uses_active_turn_stop_path(
             ),
             (
                 lambda: bool(_FakeRenderer.instances)
-                and ("info", "Stopped by user.") in _FakeRenderer.instances[0].events,
+                and ("answer", "Queued follow-up sent")
+                in _FakeRenderer.instances[0].events,
                 "/exit",
             ),
         ]
@@ -610,13 +619,15 @@ def test_stop_command_while_working_uses_active_turn_stop_path(
     client = StopClient.instances[0]
     assert client.calls[0] == ("send", "Produce a long response")
     assert client.calls[1] == ("stop_generation", None)
+    assert client.calls[2] == ("send_to_conversation", "Queued follow-up should run")
     state = load_chat_state(tmp_path / "state.json")
     assert state.current_conversation == "conv-stop-command"
     renderer = _FakeRenderer.instances[0]
     assert ("info", "Stopping ChatGPT…") in renderer.events
     assert ("info", "ChatGPT stopped; finalizing local readback…") in renderer.events
     assert ("info", "Stopped by user.") in renderer.events
-    assert ("info", "Cleared 1 queued prompt after Stop.") in renderer.events
+    assert ("info", "Queued · 1 · will send next") in renderer.events
+    assert ("answer", "Queued follow-up sent") in renderer.events
 
 
 def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
