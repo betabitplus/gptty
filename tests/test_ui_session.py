@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from io import StringIO
+import os
+import signal
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
@@ -11,6 +13,7 @@ from gptty.ui.session import (
     COMMANDS,
     InteractiveSession,
     _text_width,
+    _wrap_replay_lines,
     should_use_enhanced_ui,
 )
 from gptty.ui.signals import TurnControlSignals
@@ -75,6 +78,161 @@ def test_pretty_on_never_forces_prompt_toolkit_into_non_tty(tmp_path) -> None:
     )
 
     assert enabled is False
+
+
+def test_wrap_replay_lines_uses_terminal_display_width() -> None:
+    assert _wrap_replay_lines(["abcdefgh", "界界界", ""], 4) == [
+        "abcd",
+        "efgh",
+        "界界",
+        "界",
+        "",
+    ]
+
+
+def test_wrap_replay_lines_redraws_rich_rule_for_new_width() -> None:
+    line = "──────────── working ────────────"
+
+    wrapped = _wrap_replay_lines([line], 20)
+
+    assert wrapped == ["───── working ──────"]
+    assert _text_width(wrapped[0]) == 20
+
+
+def test_posix_session_uses_sigwinch_without_redundant_size_polling(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+    )
+
+    if os.name != "nt" and hasattr(signal, "SIGWINCH"):
+        assert session.application.terminal_size_polling_interval is None
+
+
+def test_resize_replays_recent_transcript_before_redraw(tmp_path, monkeypatch) -> None:
+    output = ResizableDummyOutput(80)
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=output,
+    )
+    requested_limits: list[int] = []
+    session.set_resize_replay(
+        lambda max_lines: requested_limits.append(max_lines) or ["one", "two"]
+    )
+    app = session.application
+    events: list[object] = []
+
+    monkeypatch.setattr(
+        app.renderer,
+        "erase",
+        lambda **kwargs: events.append(("erase", kwargs)),
+    )
+    monkeypatch.setattr(app.output, "erase_screen", lambda: events.append("erase_screen"))
+    monkeypatch.setattr(
+        app.output,
+        "cursor_goto",
+        lambda row, column: events.append(("cursor_goto", row, column)),
+    )
+    monkeypatch.setattr(app.output, "write", lambda text: events.append(("write", text)))
+    monkeypatch.setattr(app.output, "flush", lambda: events.append("flush"))
+    monkeypatch.setattr(
+        app.renderer,
+        "reset",
+        lambda **kwargs: events.append(("reset", kwargs)),
+    )
+    monkeypatch.setattr(
+        app.renderer,
+        "report_absolute_cursor_row",
+        lambda row: events.append(("cursor_row", row)),
+    )
+    monkeypatch.setattr(app, "_redraw", lambda: events.append("redraw"))
+
+    session._on_resize()
+
+    assert requested_limits == [21]
+    assert events == [
+        ("erase", {"leave_alternate_screen": False}),
+        "erase_screen",
+        ("cursor_goto", 0, 0),
+        "flush",
+        ("reset", {"leave_alternate_screen": False}),
+        ("write", "one\ntwo"),
+        ("write", "\n"),
+        "flush",
+        ("cursor_row", 3),
+        "redraw",
+    ]
+
+
+def test_resize_during_run_in_terminal_defers_and_coalesces_replay(
+    tmp_path, monkeypatch
+) -> None:
+    output = ResizableDummyOutput(80)
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=output,
+    )
+    session.set_resize_replay(lambda _max_lines: ["one"])
+    app = session.application
+    events: list[object] = []
+    callbacks: list[object] = []
+
+    class Future:
+        def add_done_callback(self, callback) -> None:
+            callbacks.append(callback)
+
+    app._running_in_terminal = True
+    app._running_in_terminal_f = Future()
+    monkeypatch.setattr(
+        app.renderer,
+        "erase",
+        lambda **kwargs: events.append(("erase", kwargs)),
+    )
+    monkeypatch.setattr(app.output, "erase_screen", lambda: events.append("erase_screen"))
+    monkeypatch.setattr(
+        app.output,
+        "cursor_goto",
+        lambda row, column: events.append(("cursor_goto", row, column)),
+    )
+    monkeypatch.setattr(app.output, "write", lambda text: events.append(("write", text)))
+    monkeypatch.setattr(app.output, "flush", lambda: events.append("flush"))
+    monkeypatch.setattr(
+        app.renderer,
+        "reset",
+        lambda **kwargs: events.append(("reset", kwargs)),
+    )
+    monkeypatch.setattr(
+        app.renderer,
+        "report_absolute_cursor_row",
+        lambda row: events.append(("cursor_row", row)),
+    )
+    monkeypatch.setattr(app, "_redraw", lambda: events.append("redraw"))
+
+    session._on_resize()
+    session._on_resize()
+
+    assert events == []
+    assert len(callbacks) == 1
+    assert session._resize_replay_pending is True
+
+    app._running_in_terminal = False
+    callbacks[0](None)
+
+    assert session._resize_replay_pending is False
+    assert events == [
+        ("erase", {"leave_alternate_screen": False}),
+        "erase_screen",
+        ("cursor_goto", 0, 0),
+        "flush",
+        ("reset", {"leave_alternate_screen": False}),
+        ("write", "one"),
+        ("write", "\n"),
+        "flush",
+        ("cursor_row", 2),
+        "redraw",
+    ]
 
 
 def test_prompt_session_reads_input_and_persists_history(tmp_path) -> None:

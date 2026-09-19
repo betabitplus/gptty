@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import StdoutProxy, patch_stdout
+from rich.text import Text as RichText
 
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
@@ -235,26 +236,83 @@ class _EnhancedFollow:
     stopped_by_user: bool = False
 
 
+class _TranscriptReplayBuffer:
+    """Keep a bounded, plain-text tail for clean terminal resize redraws."""
+
+    def __init__(self, *, max_lines: int = 400) -> None:
+        self._max_lines = max(1, int(max_lines))
+        self._lines: deque[str] = deque(maxlen=self._max_lines)
+        self._fragments: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _plain_line(value: str) -> str:
+        try:
+            value = RichText.from_ansi(value).plain
+        except Exception:  # pragma: no cover - defensive fallback for malformed escapes.
+            pass
+        return value.rstrip("\r ")
+
+    def feed(self, stream_name: str, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            pending = self._fragments.get(stream_name, "") + text
+            parts = pending.split("\n")
+            self._fragments[stream_name] = parts.pop()
+            for part in parts:
+                self._lines.append(self._plain_line(part))
+
+    def snapshot(self, max_lines: int) -> list[str]:
+        limit = max(1, int(max_lines))
+        with self._lock:
+            lines = list(self._lines)
+            for stream_name in ("stdout", "stderr"):
+                fragment = self._fragments.get(stream_name, "")
+                if fragment:
+                    lines.append(self._plain_line(fragment))
+        return lines[-limit:]
+
+
 class _PromptAwareStream:
     """Write through prompt_toolkit's patched stdio only while its app is active."""
 
-    def __init__(self, base: TextIO, *, stream_name: str) -> None:
+    def __init__(
+        self,
+        base: TextIO,
+        *,
+        stream_name: str,
+        replay_buffer: _TranscriptReplayBuffer | None = None,
+    ) -> None:
         self._base = base
         self._stream_name = stream_name
+        self._replay_buffer = replay_buffer
 
     def _target(self) -> TextIO:
         current = getattr(sys, self._stream_name)
         return current if current is not self._base else self._base
 
     def write(self, text: str) -> int:
+        if self._replay_buffer is not None:
+            self._replay_buffer.feed(self._stream_name, text)
         return self._target().write(text)
 
     def write_stream_fragment(self, text: str) -> int:
+        if self._replay_buffer is not None:
+            self._replay_buffer.feed(self._stream_name, text)
         target = self._target()
         written = target.write(text)
         if not isinstance(target, StdoutProxy):
             target.flush()
         return written
+
+    def record_prompt(self, text: str) -> None:
+        if self._replay_buffer is None or not text:
+            return
+        lines = text.rstrip().splitlines() or [""]
+        rendered = [f"❯ {lines[0]}"]
+        rendered.extend(f"  {line}" for line in lines[1:])
+        self._replay_buffer.feed("stdout", "\n".join(rendered) + "\n")
 
     def flush(self) -> None:
         self._target().flush()
@@ -448,16 +506,29 @@ def run_chat(
             settings=ui_settings,
         )
         prompt_patch_enabled = stdout is sys.stdout or stderr is sys.stderr
+        replay_buffer = (
+            _TranscriptReplayBuffer() if prompt_patch_enabled else None
+        )
         renderer_stdout: TextIO = (
-            _PromptAwareStream(stdout, stream_name="stdout")
+            _PromptAwareStream(
+                stdout,
+                stream_name="stdout",
+                replay_buffer=replay_buffer,
+            )
             if stdout is sys.stdout
             else stdout
         )
         renderer_stderr: TextIO = (
-            _PromptAwareStream(stderr, stream_name="stderr")
+            _PromptAwareStream(
+                stderr,
+                stream_name="stderr",
+                replay_buffer=replay_buffer,
+            )
             if stderr is sys.stderr
             else stderr
         )
+        if replay_buffer is not None:
+            ui.set_resize_replay(replay_buffer.snapshot)
         renderer = PrettyRenderer(renderer_stdout, ui_settings)
         interactive_commands = InteractiveCommands(
             state=state,
@@ -875,6 +946,9 @@ async def _enhanced_loop_core(
                 active.controls.request_quit()
                 accepting_input = False
             else:
+                recorder = getattr(stdout, "record_prompt", None)
+                if callable(recorder) and raw:
+                    recorder(raw)
                 prompt = raw.strip()
                 if prompt:
                     if (
@@ -1185,7 +1259,12 @@ def _seed_enhanced_follow(
             )
             if normalized_message_id in current_turn_event_ids:
                 health.observe(event)
-                renderer.live_event(event)
+                # complete_resume() has already rendered snapshot messages. If
+                # canonical history contains this same intermediate message,
+                # replaying the event here produces a visible duplicate on
+                # attach. Only render seed events that history did not show.
+                if normalized_message_id not in seen:
+                    renderer.live_event(event)
     now = time.monotonic()
     return _EnhancedFollow(
         conversation_ref=request.conversation_ref,
@@ -1462,6 +1541,10 @@ def _apply_enhanced_follow_snapshot(
         if isinstance(events, list)
         else []
     )
+    # Preserve the IDs that were rendered before this snapshot. The snapshot's
+    # emitted_message_ids are merged below and may include newly discovered
+    # events that still need rendering in this reconciliation pass.
+    previously_emitted_message_ids = set(follow.emitted_message_ids)
     event_items: list[dict[str, Any]] = []
     for event in raw_event_items:
         message_id = event.get("message_id")
@@ -1472,7 +1555,7 @@ def _apply_enhanced_follow_snapshot(
         )
         if (
             normalized_message_id is not None
-            and normalized_message_id in follow.emitted_message_ids
+            and normalized_message_id in previously_emitted_message_ids
         ):
             continue
         event_items.append(event)
@@ -1516,7 +1599,11 @@ def _apply_enhanced_follow_snapshot(
         text = _message_text(message)
         previous = follow.seen_messages.get(identity)
         follow.seen_messages[identity] = text
-        if previous == text or identity in event_ids:
+        if (
+            previous == text
+            or identity in event_ids
+            or identity in previously_emitted_message_ids
+        ):
             continue
         if identity in {deferred_final_identity, corrected_final_identity}:
             continue

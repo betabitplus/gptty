@@ -1077,6 +1077,46 @@ def test_resume_seed_renders_only_current_turn_intermediate_events() -> None:
     assert rendered_ids == ["current-tool", "current-reasoning"]
 
 
+def test_resume_seed_does_not_replay_current_event_already_in_history() -> None:
+    _FakeRenderer.instances.clear()
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    snapshot = {
+        "status": SimpleNamespace(status="tool_running"),
+        "messages": [
+            {
+                "message_id": "current-progress",
+                "role": "assistant",
+                "text": "progress already shown by resume history",
+            }
+        ],
+        "events": [
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "current-progress",
+                "message_kind": "commentary",
+                "turn_exchange_id": "turn-current",
+                "text": "progress already shown by resume history",
+            }
+        ],
+        "emitted_message_ids": ["current-progress"],
+        "current_turn_event_ids": ["current-progress"],
+        "stream_topic_id": "conversation-turn-turn-current",
+        "turn_exchange_id": "turn-current",
+        "stream_answer_message_id": None,
+        "stream_answer_text": "",
+    }
+
+    follow = chat_module._seed_enhanced_follow(
+        SimpleNamespace(conversation_ref="conv-current"),
+        snapshot,
+        renderer=renderer,
+    )
+
+    assert follow is not None
+    assert follow.emitted_message_ids == {"current-progress"}
+    assert not any(event[0] == "live_event" for event in renderer.events)
+
+
 def test_unfinished_resume_prefers_live_stream_without_polling(
     tmp_path, monkeypatch
 ) -> None:
@@ -1819,6 +1859,47 @@ def test_resume_follow_replaces_corrupt_stream_final_with_canonical_snapshot(
     assert not any(event[0] == "messages" for event in renderer.events)
     assert follow.stream_answer_text == "complete canonical answer"
     assert notifications[-1]["final_response"] == "complete canonical answer"
+
+
+def test_attached_follow_does_not_replay_previously_rendered_intermediate_as_message() -> None:
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids={"progress-b"},
+        seen_messages={},
+        deadline=10_000.0,
+        stream_answer_message_id="assistant-final",
+        stream_answer_text="complete final answer",
+        defer_stream_answer_until_terminal=True,
+    )
+
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {
+                "message_id": "progress-b",
+                "role": "assistant",
+                "text": "progress already rendered live",
+            },
+            {
+                "message_id": "assistant-final",
+                "role": "assistant",
+                "text": "complete final answer",
+            },
+        ],
+        "events": [],
+        "emitted_message_ids": ["progress-b"],
+        "stream_terminal_reconciled": True,
+    }
+
+    assert not chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        snapshot,
+        renderer=renderer,
+    )
+
+    assert not any(event[0] == "messages" for event in renderer.events)
+    assert ("answer", "complete final answer") in renderer.events
 
 
 def test_attached_follow_renders_late_intermediate_before_deferred_final() -> None:

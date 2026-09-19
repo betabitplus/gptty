@@ -105,6 +105,29 @@ def test_prompt_aware_stream_preserves_prompt_toolkit_partial_buffer(monkeypatch
     assert base.getvalue() == "direct"
 
 
+def test_transcript_replay_buffer_keeps_plain_bounded_tail() -> None:
+    replay = chat_mod._TranscriptReplayBuffer(max_lines=3)
+
+    replay.feed("stdout", "\x1b[2mone\x1b[0m   \n")
+    replay.feed("stderr", "two\n")
+    replay.feed("stdout", "three\nfour")
+
+    assert replay.snapshot(3) == ["two", "three", "four"]
+
+
+def test_prompt_aware_stream_records_submitted_prompt_for_resize_replay() -> None:
+    replay = chat_mod._TranscriptReplayBuffer(max_lines=8)
+    stream = chat_mod._PromptAwareStream(
+        StringIO(),
+        stream_name="stdout",
+        replay_buffer=replay,
+    )
+
+    stream.record_prompt("hello\nworld")
+
+    assert replay.snapshot(8) == ["❯ hello", "  world"]
+
+
 def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
     stdout = StringIO()

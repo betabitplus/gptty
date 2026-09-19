@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -64,6 +66,39 @@ def _clip_toolbar(value: str, width: int) -> str:
     return "".join(chars) + "…"
 
 
+def _wrap_replay_lines(lines: list[str], width: int) -> list[str]:
+    width = max(1, int(width))
+    wrapped: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        if line.count("─") >= max(8, len(line) // 2):
+            label = line.strip("─ ")
+            if not label:
+                wrapped.append("─" * width)
+            elif width <= _text_width(label) + 2:
+                wrapped.append(_clip_toolbar(label, width))
+            else:
+                padding = width - _text_width(label) - 2
+                left = padding // 2
+                right = padding - left
+                wrapped.append("─" * left + f" {label} " + "─" * right)
+            continue
+        chunk: list[str] = []
+        used = 0
+        for char in line:
+            char_width = max(0, get_cwidth(char))
+            if chunk and used + char_width > width:
+                wrapped.append("".join(chunk))
+                chunk = []
+                used = 0
+            chunk.append(char)
+            used += char_width
+        wrapped.append("".join(chunk))
+    return wrapped
+
+
 def _fit_toolbar(candidates: tuple[str, ...], width: int | None) -> str:
     if not candidates:
         return ""
@@ -112,6 +147,10 @@ class InteractiveSession:
         self._prompt_output = prompt_output
         self._turn_controls: TurnControlSignals | None = None
         self._working_status: Callable[[], str] | None = None
+        self._resize_replay: Callable[[int], list[str]] | None = None
+        self._default_on_resize: Callable[[], None] | None = None
+        self._resize_replay_pending = False
+        self._resize_replay_handle: asyncio.TimerHandle | None = None
         self._session: PromptSession[str]
         self._build_session()
 
@@ -159,6 +198,99 @@ class InteractiveSession:
         if self._prompt_output is not None:
             kwargs["output"] = self._prompt_output
         self._session = PromptSession(**kwargs)
+        if os.name != "nt" and hasattr(signal, "SIGWINCH"):
+            # prompt_toolkit also polls terminal size every 0.5s by default.
+            # On POSIX main-thread TTYs SIGWINCH is authoritative; keeping both
+            # produces a second resize callback after the first redraw.
+            self._session.app.terminal_size_polling_interval = None
+        self._default_on_resize = self._session.app._on_resize
+        self._session.app._on_resize = self._on_resize
+
+    def set_resize_replay(self, provider: Callable[[int], list[str]] | None) -> None:
+        self._resize_replay = provider
+
+    def _on_resize(self) -> None:
+        default = self._default_on_resize
+        provider = self._resize_replay
+        if provider is None:
+            if default is not None:
+                default()
+            return
+
+        app = self._session.app
+        if getattr(app, "_running_in_terminal", False):
+            future = getattr(app, "_running_in_terminal_f", None)
+            if future is not None and not self._resize_replay_pending:
+                self._resize_replay_pending = True
+
+                def replay_after_terminal(_future: object) -> None:
+                    self._resize_replay_pending = False
+                    if not getattr(app, "is_done", False):
+                        self._schedule_resize_replay()
+
+                future.add_done_callback(replay_after_terminal)
+            return
+
+        self._schedule_resize_replay()
+
+    def _schedule_resize_replay(self) -> None:
+        handle = self._resize_replay_handle
+        if handle is not None and not handle.cancelled():
+            handle.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._perform_resize_replay()
+            return
+        self._resize_replay_handle = loop.call_later(
+            0.075,
+            self._perform_resize_replay,
+        )
+
+    def _perform_resize_replay(self) -> None:
+        self._resize_replay_handle = None
+        default = self._default_on_resize
+        provider = self._resize_replay
+        if provider is None:
+            if default is not None:
+                default()
+            return
+
+        app = self._session.app
+        if getattr(app, "_running_in_terminal", False):
+            self._on_resize()
+            return
+
+        try:
+            size = app.output.get_size()
+            max_rows = max(1, int(size.rows) - 3)
+            lines = provider(max_rows)
+            replay_lines = _wrap_replay_lines(lines, int(size.columns))[-max_rows:]
+        except Exception:
+            if default is not None:
+                default()
+            return
+
+        if not replay_lines:
+            if default is not None:
+                default()
+            return
+
+        renderer = app.renderer
+        output = app.output
+        renderer.erase(leave_alternate_screen=False)
+        output.erase_screen()
+        output.cursor_goto(0, 0)
+        output.flush()
+        renderer.reset(leave_alternate_screen=False)
+
+        output.write("\n".join(replay_lines))
+        output.write("\n")
+        output.flush()
+        renderer.report_absolute_cursor_row(
+            min(int(size.rows), len(replay_lines) + 1)
+        )
+        app._redraw()
 
     def read_prompt(self, *, attachment_count: int = 0) -> str:
         marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
