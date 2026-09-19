@@ -210,6 +210,68 @@ def test_resume_warns_when_history_comes_from_rate_limit_cache(tmp_path) -> None
     assert "Canonical history is rate-limited; showing cached history (12s old)." in warnings
 
 
+def test_resume_terminal_backend_override_opens_idle_and_warns_about_missing_final_text(
+    tmp_path,
+) -> None:
+    commands, renderer, _client, _state_path = make_commands(tmp_path)
+
+    commands.handle("/resume conv-stale")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.complete_resume(
+        request,
+        {
+            "status": SimpleNamespace(status="completed"),
+            "messages": [
+                {"message_id": "u1", "role": "user", "text": "question"},
+                {"message_id": "t1", "role": "tool", "text": "tool output"},
+            ],
+            "backend_stream_status": "COMPLETE",
+            "backend_terminal_status_proven": True,
+            "canonical_status_overridden": True,
+            "canonical_status_before_override": "tool_running",
+            "canonical_terminal_text_missing": True,
+        },
+    )
+
+    warnings = [event[1] for event in renderer.events if event[0] == "warning"]
+    assert warnings == [
+        "Backend reports COMPLETE; canonical status=tool_running is stale. "
+        "Opened chat idle; final assistant text is not yet present in canonical history."
+    ]
+    assert not any("unfinished turn" in warning for warning in warnings)
+
+
+def test_resume_terminal_backend_override_with_recovered_final_is_informational(
+    tmp_path,
+) -> None:
+    commands, renderer, _client, _state_path = make_commands(tmp_path)
+
+    commands.handle("/resume conv-stale")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.complete_resume(
+        request,
+        {
+            "status": SimpleNamespace(status="completed"),
+            "messages": [
+                {"message_id": "u1", "role": "user", "text": "question"},
+                {"message_id": "a1", "role": "assistant", "text": "final"},
+            ],
+            "backend_stream_status": "COMPLETE",
+            "backend_terminal_status_proven": True,
+            "canonical_status_overridden": True,
+            "canonical_status_before_override": "tool_running",
+            "canonical_terminal_text_missing": False,
+        },
+    )
+
+    infos = [event[1] for event in renderer.events if event[0] == "info"]
+    assert "Backend reports COMPLETE; ignored stale canonical status=tool_running." in infos
+    warnings = [event[1] for event in renderer.events if event[0] == "warning"]
+    assert not any("unfinished turn" in warning for warning in warnings)
+
+
 def test_resume_switches_while_already_attached_without_detach(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, _, client, state_path = make_commands(

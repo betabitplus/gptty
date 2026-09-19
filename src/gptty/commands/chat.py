@@ -67,6 +67,7 @@ FOLLOW_RATE_LIMIT_MAX_BACKOFF_SECONDS = 300.0
 FOLLOW_TIMEOUT_SECONDS = 2 * 60 * 60
 FOLLOW_MESSAGE_LIMIT = 128
 ANSWER_FINALITY_PENDING_SECONDS = 5.0
+CODEXPRO_RECENT_ACTIVITY_MAX_AGE_SECONDS = 5 * 60.0
 
 
 @dataclass
@@ -1094,6 +1095,8 @@ def _start_enhanced_resume(
                     request.conversation_ref,
                     emitted_message_ids=(),
                     limit=None,
+                    verify_terminal_status=True,
+                    terminal_probe_timeout=3.0,
                 )
             else:
                 payload = client.conversation_snapshot(request.conversation_ref)
@@ -1866,10 +1869,12 @@ def _codexpro_status_suffix(snapshot: CodexProActivitySnapshot) -> str:
                 f" · started {_format_status_duration(snapshot.last_event_age_seconds)} ago"
             )
     if snapshot.last_event_age_seconds is not None:
-        return (
-            " · CodexPro exact activity "
-            f"{_format_status_duration(snapshot.last_event_age_seconds)} ago"
-        )
+        if snapshot.last_event_age_seconds <= CODEXPRO_RECENT_ACTIVITY_MAX_AGE_SECONDS:
+            return (
+                " · CodexPro exact activity "
+                f"{_format_status_duration(snapshot.last_event_age_seconds)} ago"
+            )
+        return ""
     return " · CodexPro session mapped"
 
 

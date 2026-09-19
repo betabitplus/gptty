@@ -898,11 +898,15 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.follow_count += 1
             self.calls.append(("follow", ref))
             if self.follow_count == 1:
                 assert limit is None
+                assert verify_terminal_status is True
+                assert terminal_probe_timeout == 3.0
                 return {
                     "status": SimpleNamespace(status="tool_running"),
                     "messages": [
@@ -916,6 +920,7 @@ def test_unfinished_resume_follows_live_events_without_blocking_prompt(
                     "events": [],
                     "emitted_message_ids": ["old-event"],
                 }
+            assert verify_terminal_status is False
             if self.follow_count == 2:
                 assert "old-event" in emitted_message_ids
                 return {
@@ -1093,6 +1098,8 @@ def test_unfinished_resume_prefers_live_stream_without_polling(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.snapshot_count += 1
             self.calls.append(("snapshot", ref))
@@ -1258,6 +1265,8 @@ def test_terminal_follow_releases_multiple_queued_prompts_in_order(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.calls.append(("snapshot", ref))
             return {
@@ -1423,6 +1432,8 @@ def test_stop_command_during_follow_stops_then_sends_queued_prompt(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.calls.append(("snapshot", ref))
             return {
@@ -1551,6 +1562,8 @@ def test_nonterminal_follow_keeps_queued_prompt_unsent(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.calls.append(("snapshot", ref))
             return {
@@ -1667,6 +1680,8 @@ def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
             *,
             emitted_message_ids=(),
             limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
         ):
             self.snapshot_count += 1
             self.calls.append(("snapshot", ref))
@@ -2111,6 +2126,95 @@ def test_unfinished_resume_returns_to_prompt_without_polling(
     assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"
 
 
+def test_resume_terminal_backend_override_does_not_enter_follow(
+    tmp_path, monkeypatch
+) -> None:
+    class TerminalOverrideResumeClient:
+        instances: list["TerminalOverrideResumeClient"] = []
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str, bool, float]] = []
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+            verify_terminal_status=False,
+            terminal_probe_timeout=3.0,
+        ):
+            self.calls.append(
+                (
+                    "follow",
+                    ref,
+                    bool(verify_terminal_status),
+                    float(terminal_probe_timeout),
+                )
+            )
+            assert emitted_message_ids == ()
+            assert limit is None
+            return {
+                "status": SimpleNamespace(status="completed"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "old question"},
+                    {"message_id": "t1", "role": "tool", "text": "old tool output"},
+                ],
+                "events": [],
+                "emitted_message_ids": [],
+                "backend_stream_status": "COMPLETE",
+                "backend_terminal_status_proven": True,
+                "canonical_status_overridden": True,
+                "canonical_status_before_override": "tool_running",
+                "canonical_terminal_text_missing": True,
+            }
+
+    TerminalOverrideResumeClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            "/resume conv-stale",
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    event[0] == "warning"
+                    and "Opened chat idle" in str(event[1])
+                    for event in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=TerminalOverrideResumeClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = TerminalOverrideResumeClient.instances[0]
+    assert client.calls == [("follow", "conv-stale", True, 3.0)]
+    renderer = _FakeRenderer.instances[0]
+    infos = [str(event[1]) for event in renderer.events if event[0] == "info"]
+    assert "Following active response via live stream…" not in infos
+    assert "Following active response in background…" not in infos
+    warnings = [str(event[1]) for event in renderer.events if event[0] == "warning"]
+    assert not any("unfinished turn" in warning for warning in warnings)
+    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"
+
+
 def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
     class Tracker:
         def snapshot(self, _conversation_ref):
@@ -2142,6 +2246,35 @@ def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
     assert "CodexPro exact: bash running" in status
     assert "heartbeat 00:07 ago" in status
     assert "do not resend yet" in status
+
+
+def test_working_status_hides_stale_codexpro_activity(monkeypatch) -> None:
+    class Tracker:
+        def snapshot(self, _conversation_ref):
+            return chat_module.CodexProActivitySnapshot(
+                bound=True,
+                last_event_age_seconds=90 * 60.0,
+                last_tool="bash",
+                inflight=False,
+            )
+
+    now = 900.0
+    monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
+    health = chat_module._TurnHealth(
+        last_server_progress_at=600.0,
+        codexpro_tracker=Tracker(),
+        conversation_ref="conversation-1",
+    )
+    health.observe(
+        {
+            "type": "stream_handoff_server_stalled",
+            "server_idle_seconds": 300.0,
+        }
+    )
+
+    status = chat_module._working_status(500.0, 0, health=health)
+    assert "PROLONGED SILENCE" in status
+    assert "CodexPro" not in status
 
 
 def test_working_status_labels_idle_reconnect_as_delivery_check(monkeypatch) -> None:

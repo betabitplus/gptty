@@ -159,6 +159,24 @@ class InteractiveCommands:
                 self.renderer.warning(
                     "Canonical history is rate-limited; showing cached history."
                 )
+        if (
+            isinstance(snapshot, dict)
+            and snapshot.get("backend_terminal_status_proven") is True
+            and snapshot.get("canonical_status_overridden") is True
+        ):
+            backend_status = str(snapshot.get("backend_stream_status") or "terminal").strip()
+            canonical_status = str(
+                snapshot.get("canonical_status_before_override") or "unfinished"
+            ).strip()
+            if snapshot.get("canonical_terminal_text_missing") is True:
+                self.renderer.warning(
+                    f"Backend reports {backend_status}; canonical status={canonical_status} is stale. "
+                    "Opened chat idle; final assistant text is not yet present in canonical history."
+                )
+            else:
+                self.renderer.info(
+                    f"Backend reports {backend_status}; ignored stale canonical status={canonical_status}."
+                )
         status = _snapshot_status(snapshot)
         if status == "awaiting_tool_approval":
             self.renderer.warning("Conversation is waiting for tool approval.")
