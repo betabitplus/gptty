@@ -14,6 +14,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.shortcuts import CompleteStyle, choice
+from prompt_toolkit.utils import get_cwidth
 
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
@@ -38,6 +39,60 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("model", "Choose a real ChatGPT model"),
     CommandSpec("exit", "Exit gptty chat"),
 )
+
+
+def _text_width(value: str) -> int:
+    return sum(get_cwidth(char) for char in value)
+
+
+def _clip_toolbar(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if _text_width(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    remaining = width - 1
+    chars: list[str] = []
+    used = 0
+    for char in value:
+        char_width = get_cwidth(char)
+        if used + char_width > remaining:
+            break
+        chars.append(char)
+        used += char_width
+    return "".join(chars) + "…"
+
+
+def _fit_toolbar(candidates: tuple[str, ...], width: int | None) -> str:
+    if not candidates:
+        return ""
+    if width is None:
+        return candidates[0]
+    for candidate in candidates:
+        if _text_width(candidate) <= width:
+            return candidate
+    return _clip_toolbar(candidates[-1], width)
+
+
+def _compact_active_status(status: str) -> str:
+    compact = status
+    replacements = (
+        ("no observable server events ", "server silent "),
+        (" · turn may still be working", ""),
+        (" · turn may still recover", ""),
+        (" · no observable progress", ""),
+        (" · waiting safely", ""),
+        (" · answer text received", " · answer received"),
+        (" · do not resend yet", " · don't resend"),
+        (" · finality unconfirmed ", " · finality "),
+        ("CodexPro exact activity ", "CodexPro active "),
+        ("CodexPro exact: ", "CodexPro "),
+        (" · heartbeat ", " · hb "),
+    )
+    for old, new in replacements:
+        compact = compact.replace(old, new)
+    return compact
 
 
 class InteractiveSession:
@@ -135,10 +190,39 @@ class InteractiveSession:
             pass
 
     def _bottom_toolbar(self) -> str:
+        width = self._toolbar_width()
         if self._turn_controls is not None:
             status = self._working_status() if self._working_status is not None else "working"
-            return f" {status} · / commands · Ctrl-C stop · Ctrl-\\ quit"
-        return " / actions · Ctrl-R history · Alt-Enter newline"
+            return _fit_toolbar(
+                (
+                    f" {status} · / commands · Ctrl-C stop · Ctrl-\\ quit",
+                    f" {status} · Ctrl-C stop",
+                    f" {_compact_active_status(status)} · Ctrl-C stop",
+                    f" {_compact_active_status(status)}",
+                ),
+                width,
+            )
+        return _fit_toolbar(
+            (
+                " / actions · Ctrl-R history · Alt-Enter newline",
+                " / actions · Ctrl-R history",
+                " / actions",
+            ),
+            width,
+        )
+
+    def _toolbar_width(self) -> int | None:
+        try:
+            size = self._session.app.output.get_size()
+            columns = int(size.columns)
+        except Exception:
+            return None
+        if columns <= 0:
+            return None
+        # Leave the terminal's last column unused. Some terminals auto-wrap
+        # when the final cell is painted, which makes a one-line toolbar jump
+        # during SIGWINCH redraws.
+        return max(1, columns - 1)
 
     def read_image_path(self) -> str | None:
         kwargs: dict[str, Any] = {
