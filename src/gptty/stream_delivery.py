@@ -17,6 +17,7 @@ _HEALTH_TYPES = {
     "stream_handoff_delivery_recovered",
     "stream_handoff_server_quiet",
     "stream_handoff_server_stalled",
+    "stream_handoff_terminal_status",
     "stream_handoff_server_resumed",
 }
 _TEXT_TYPES = {
@@ -96,6 +97,7 @@ class StreamDeliveryJournal:
             "last_offset",
             "last_offset_age_seconds",
             "reconnect_count",
+            "stream_status",
         ):
             value = event.get(key)
             if isinstance(value, (str, int, float, bool)) or value is None:

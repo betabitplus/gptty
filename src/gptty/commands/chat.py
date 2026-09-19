@@ -9,7 +9,7 @@ import traceback
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
@@ -217,6 +217,7 @@ class _EnhancedFollow:
     seen_messages: dict[str, str]
     deadline: float
     health: _TurnHealth | None = None
+    started_at: float = field(default_factory=time.monotonic)
     next_interval: float = FOLLOW_MIN_INTERVAL_SECONDS
     stream_topic_id: str | None = None
     stream_answer_message_id: str | None = None
@@ -750,6 +751,7 @@ async def _enhanced_loop_core(
             renderer.info(
                 "Stopped following after 2 hours; conversation remains attached."
             )
+            ui.set_active_turn(None)
             active_follow = None
 
         if (
@@ -767,6 +769,7 @@ async def _enhanced_loop_core(
                 commands.has_pending_resume
                 or commands.conversation_ref != active_follow.conversation_ref
             ):
+                ui.set_active_turn(None)
                 active_follow = None
             else:
                 if command.split(maxsplit=1)[0].lower() == "/stop":
@@ -778,6 +781,7 @@ async def _enhanced_loop_core(
                 active_follow.stop_requested = True
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
+                ui.set_active_turn(None)
                 active_follow = None
             active_resume = _start_enhanced_resume(
                 get_client=get_client,
@@ -879,6 +883,11 @@ async def _enhanced_loop_core(
                         if not prompt.startswith("/"):
                             queued_prompts.append(prompt)
                             renderer.info(f"Queued · {len(queued_prompts)}")
+                            _refresh_active_follow_ui(
+                                ui,
+                                active_follow,
+                                queued_prompts,
+                            )
                         elif prompt.split(maxsplit=1)[0].lower() in {"/exit", "/quit"}:
                             result = commands.handle(prompt)
                             return _EnhancedLoopOutcome(
@@ -930,6 +939,8 @@ async def _enhanced_loop_core(
                         activity_tracker=activity_tracker,
                         delivery_journal=delivery_journal,
                     )
+                    if active_follow is not None:
+                        _refresh_active_follow_ui(ui, active_follow, queued_prompts)
             else:
                 commands.fail_resume(finished_resume.request, payload)
             if not resumed:
@@ -1033,6 +1044,7 @@ async def _enhanced_loop_core(
             if not keep_following:
                 _cancel_enhanced_follow_timer(active_follow)
                 _cancel_enhanced_follow_event_task(active_follow)
+                ui.set_active_turn(None)
                 active_follow = None
             elif active_follow.stop_requested and pending_follow_command is None:
                 active_follow.stop_requested = False
@@ -1170,12 +1182,14 @@ def _seed_enhanced_follow(
             if normalized_message_id in current_turn_event_ids:
                 health.observe(event)
                 renderer.live_event(event)
+    now = time.monotonic()
     return _EnhancedFollow(
         conversation_ref=request.conversation_ref,
         emitted_message_ids=emitted,
         seen_messages=seen,
-        deadline=time.monotonic() + FOLLOW_TIMEOUT_SECONDS,
+        deadline=now + FOLLOW_TIMEOUT_SECONDS,
         health=health,
+        started_at=now,
         next_interval=FOLLOW_MIN_INTERVAL_SECONDS,
         stream_topic_id=stream_topic_id,
         stream_answer_message_id=stream_answer_message_id,
@@ -1802,6 +1816,21 @@ def _refresh_active_turn_ui(
             active.started_at,
             len(queued_prompts),
             health=active.health,
+        ),
+    )
+
+
+def _refresh_active_follow_ui(
+    ui: InteractiveSession,
+    follow: _EnhancedFollow,
+    queued_prompts: deque[str],
+) -> None:
+    ui.set_active_turn(
+        None,
+        working_status=lambda: _working_status(
+            follow.started_at,
+            len(queued_prompts),
+            health=follow.health,
         ),
     )
 

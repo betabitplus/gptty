@@ -183,7 +183,7 @@ class InteractiveSession:
         working_status: Callable[[], str] | None = None,
     ) -> None:
         self._turn_controls = controls
-        self._working_status = working_status if controls is not None else None
+        self._working_status = working_status
         try:
             self._session.app.invalidate()
         except Exception:
@@ -191,7 +191,7 @@ class InteractiveSession:
 
     def _bottom_toolbar(self) -> str:
         width = self._toolbar_width()
-        if self._turn_controls is not None:
+        if self._turn_controls is not None or self._working_status is not None:
             status = self._working_status() if self._working_status is not None else "working"
             return _fit_toolbar(
                 (

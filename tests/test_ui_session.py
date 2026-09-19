@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 
+import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.base import Size
@@ -189,6 +190,65 @@ def test_active_toolbar_reflows_to_current_terminal_width(tmp_path) -> None:
     assert "Ctrl-C stop" not in rendered[80]
     assert "CodexPro active 00:04" in rendered[80]
     assert rendered[50].endswith("…")
+
+
+def test_status_only_follow_toolbar_is_active_without_turn_controls(tmp_path) -> None:
+    output = ResizableDummyOutput(120)
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=output,
+    )
+
+    session.set_active_turn(
+        None,
+        working_status=lambda: "server quiet 05:00 · queued 1",
+    )
+
+    toolbar = session._bottom_toolbar()
+    assert toolbar.startswith(" server quiet 05:00 · queued 1")
+    assert "Ctrl-C stop" in toolbar
+    assert session.active_turn_controls is None
+
+
+def test_status_only_follow_ctrl_c_keeps_follow_stop_semantics(tmp_path) -> None:
+    with create_pipe_input() as pipe:
+        session = InteractiveSession(
+            history_file=tmp_path / "history",
+            settings_file=tmp_path / "ui.json",
+            prompt_input=pipe,
+            prompt_output=DummyOutput(),
+        )
+        session.set_active_turn(
+            None,
+            working_status=lambda: "server quiet 05:00 · queued 1",
+        )
+        pipe.send_text("\x03")
+
+        with pytest.raises(KeyboardInterrupt):
+            session.read_prompt()
+
+    assert session.active_turn_controls is None
+
+
+def test_status_only_follow_ctrl_backslash_keeps_local_quit_semantics(tmp_path) -> None:
+    with create_pipe_input() as pipe:
+        session = InteractiveSession(
+            history_file=tmp_path / "history",
+            settings_file=tmp_path / "ui.json",
+            prompt_input=pipe,
+            prompt_output=DummyOutput(),
+        )
+        session.set_active_turn(
+            None,
+            working_status=lambda: "server quiet 05:00 · queued 1",
+        )
+        pipe.send_text("\x1c")
+
+        with pytest.raises(EOFError):
+            session.read_prompt()
+
+    assert session.active_turn_controls is None
 
 
 def test_idle_toolbar_reflows_without_using_last_terminal_column(tmp_path) -> None:

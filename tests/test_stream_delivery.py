@@ -43,6 +43,15 @@ def test_stream_delivery_journal_records_safe_delivery_evidence(tmp_path: Path) 
     journal.observe(
         "conversation-1",
         {
+            "type": "stream_handoff_terminal_status",
+            "topic_id": "conversation-turn-1",
+            "stream_status": "COMPLETE",
+            "last_offset": "1000-0",
+        },
+    )
+    journal.observe(
+        "conversation-1",
+        {
             "type": "canonical_intermediate_message",
             "message_id": "message-1",
             "message_kind": "commentary",
@@ -79,6 +88,12 @@ def test_stream_delivery_journal_records_safe_delivery_evidence(tmp_path: Path) 
         row for row in rows if row.get("event") == "stream_handoff_ws_subscribed"
     )
     assert subscribed["catchup_count"] == 0
+
+    terminal = next(
+        row for row in rows if row.get("event") == "stream_handoff_terminal_status"
+    )
+    assert terminal["stream_status"] == "COMPLETE"
+    assert terminal["last_offset"] == "1000-0"
 
     canonical = next(
         row for row in rows if row.get("event") == "canonical_intermediate_message"

@@ -1235,6 +1235,413 @@ def test_unfinished_resume_prefers_live_stream_without_polling(
     assert ("answer", "partial final") in renderer.events
 
 
+def test_terminal_follow_releases_multiple_queued_prompts_in_order(
+    tmp_path, monkeypatch
+) -> None:
+    class TerminalFollowClient:
+        instances: list["TerminalFollowClient"] = []
+        release_stream = threading.Event()
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.calls.append(("snapshot", ref))
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                ],
+                "events": [],
+                "emitted_message_ids": ["old-event"],
+                "stream_topic_id": "conversation-turn-orphaned",
+                "turn_exchange_id": "turn-orphaned",
+                "stream_answer_message_id": None,
+                "stream_answer_text": "",
+            }
+
+        def conversation_follow_stream(
+            self,
+            ref: str,
+            *,
+            topic_id,
+            emitted_message_ids,
+            answer_message_id,
+            answer_text,
+            timeout,
+            limit,
+            on_event,
+            should_stop,
+        ):
+            self.calls.append(("stream", ref))
+            assert self.release_stream.wait(timeout=2.0)
+            assert not should_stop()
+            on_event(
+                {
+                    "type": "stream_handoff_terminal_status",
+                    "stream_status": "COMPLETE",
+                    "last_offset": "1000-0",
+                }
+            )
+            return {
+                "stream_completed": True,
+                "status": SimpleNamespace(status="completed"),
+                "messages": [
+                    {"message_id": "u1", "role": "user", "text": "question"},
+                ],
+                "events": [],
+                "emitted_message_ids": list(emitted_message_ids),
+            }
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt))
+            return SimpleNamespace(
+                text=f"reply:{prompt}",
+                conversation_id=ref,
+                title="Terminal follow chat",
+            )
+
+    class TrackingSession(_FakeSession):
+        instances: list["TrackingSession"] = []
+
+        def __init__(self, **kwargs) -> None:
+            self.active_updates: list[tuple[object, object]] = []
+            self.__class__.instances.append(self)
+
+        def set_active_turn(self, controls, *, working_status=None) -> None:
+            self.active_updates.append((controls, working_status))
+
+    TerminalFollowClient.instances.clear()
+    TerminalFollowClient.release_stream.clear()
+    TrackingSession.instances.clear()
+    _FakeRenderer.instances.clear()
+
+    def follow_footer_active() -> bool:
+        if not TrackingSession.instances:
+            return False
+        return any(
+            controls is None and callable(status)
+            for controls, status in TrackingSession.instances[0].active_updates
+        )
+
+    def queued_two() -> bool:
+        if not _FakeRenderer.instances:
+            return False
+        visible = ("info", "Queued · 2") in _FakeRenderer.instances[0].events
+        if visible:
+            TerminalFollowClient.release_stream.set()
+        return visible
+
+    def two_sends_done() -> bool:
+        if not TerminalFollowClient.instances:
+            return False
+        sends = [
+            call
+            for call in TerminalFollowClient.instances[0].calls
+            if call[0] == "send_to_conversation"
+        ]
+        return len(sends) == 2
+
+    TrackingSession.script = iter(
+        [
+            "/resume conv-terminal",
+            (follow_footer_active, "queued one"),
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
+                "queued two",
+            ),
+            (queued_two, ""),
+            (two_sends_done, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", TrackingSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=TerminalFollowClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    sends = [
+        call
+        for call in TerminalFollowClient.instances[0].calls
+        if call[0] == "send_to_conversation"
+    ]
+    assert sends == [
+        ("send_to_conversation", "queued one"),
+        ("send_to_conversation", "queued two"),
+    ]
+    session = TrackingSession.instances[0]
+    assert any(
+        controls is None and callable(status)
+        for controls, status in session.active_updates
+    )
+    assert any(
+        controls is None and status is None
+        for controls, status in session.active_updates
+    )
+
+
+def test_stop_command_during_follow_stops_then_sends_queued_prompt(
+    tmp_path, monkeypatch
+) -> None:
+    class FollowStopClient:
+        instances: list["FollowStopClient"] = []
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.stopped = False
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.calls.append(("snapshot", ref))
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [],
+                "events": [],
+                "emitted_message_ids": [],
+                "stream_topic_id": "conversation-turn-stop",
+                "stream_answer_message_id": None,
+                "stream_answer_text": "",
+            }
+
+        def conversation_follow_stream(
+            self,
+            ref: str,
+            *,
+            topic_id,
+            emitted_message_ids,
+            answer_message_id,
+            answer_text,
+            timeout,
+            limit,
+            on_event,
+            should_stop,
+        ):
+            self.calls.append(("stream", ref))
+            if not self.stopped:
+                deadline = time.monotonic() + 2.0
+                while not should_stop() and time.monotonic() < deadline:
+                    time.sleep(0.002)
+                return {
+                    "stream_completed": False,
+                    "stream_cancelled": should_stop(),
+                    "stream_topic_id": topic_id,
+                    "emitted_message_ids": list(emitted_message_ids),
+                }
+            return {
+                "stream_completed": True,
+                "status": SimpleNamespace(status="completed"),
+                "messages": [],
+                "events": [],
+                "emitted_message_ids": list(emitted_message_ids),
+            }
+
+        def stop_generation(self, ref: str, timeout: float = 2.0):
+            self.calls.append(("stop_generation", ref))
+            self.stopped = True
+            return {"stopped": True, "conversationId": ref}
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt))
+            return SimpleNamespace(
+                text="queued sent after stop",
+                conversation_id=ref,
+                title="Follow stop chat",
+            )
+
+    FollowStopClient.instances.clear()
+    _FakeRenderer.instances.clear()
+
+    def stream_started() -> bool:
+        return bool(FollowStopClient.instances) and any(
+            call[0] == "stream" for call in FollowStopClient.instances[0].calls
+        )
+
+    def queued_visible() -> bool:
+        return bool(_FakeRenderer.instances) and (
+            "info",
+            "Queued · 1",
+        ) in _FakeRenderer.instances[0].events
+
+    def queued_sent() -> bool:
+        return bool(FollowStopClient.instances) and (
+            "send_to_conversation",
+            "queued after stop",
+        ) in FollowStopClient.instances[0].calls
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-follow-stop",
+            (stream_started, "queued after stop"),
+            (queued_visible, "/stop"),
+            (queued_sent, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=FollowStopClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = FollowStopClient.instances[0]
+    assert ("stop_generation", "conv-follow-stop") in client.calls
+    assert client.calls.count(("send_to_conversation", "queued after stop")) == 1
+    assert client.calls.index(("stop_generation", "conv-follow-stop")) < client.calls.index(
+        ("send_to_conversation", "queued after stop")
+    )
+
+
+def test_nonterminal_follow_keeps_queued_prompt_unsent(
+    tmp_path, monkeypatch
+) -> None:
+    class NonterminalFollowClient:
+        instances: list["NonterminalFollowClient"] = []
+        release_stream = threading.Event()
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.__class__.instances.append(self)
+
+        def conversation_follow_snapshot(
+            self,
+            ref: str,
+            *,
+            emitted_message_ids=(),
+            limit=128,
+        ):
+            self.calls.append(("snapshot", ref))
+            return {
+                "status": SimpleNamespace(status="tool_running"),
+                "messages": [],
+                "events": [],
+                "emitted_message_ids": [],
+                "stream_topic_id": "conversation-turn-still-running",
+                "stream_answer_message_id": None,
+                "stream_answer_text": "",
+            }
+
+        def conversation_follow_stream(
+            self,
+            ref: str,
+            *,
+            topic_id,
+            emitted_message_ids,
+            answer_message_id,
+            answer_text,
+            timeout,
+            limit,
+            on_event,
+            should_stop,
+        ):
+            self.calls.append(("stream", ref))
+            while not self.release_stream.is_set() and not should_stop():
+                time.sleep(0.002)
+            return {
+                "stream_completed": False,
+                "stream_cancelled": should_stop(),
+                "stream_topic_id": topic_id,
+                "emitted_message_ids": list(emitted_message_ids),
+            }
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt))
+            return SimpleNamespace(
+                text="must not send",
+                conversation_id=ref,
+                title="Nonterminal follow chat",
+            )
+
+    NonterminalFollowClient.instances.clear()
+    NonterminalFollowClient.release_stream.clear()
+    _FakeRenderer.instances.clear()
+
+    def queued_visible_without_send() -> bool:
+        if not _FakeRenderer.instances or not NonterminalFollowClient.instances:
+            return False
+        if ("info", "Queued · 1") not in _FakeRenderer.instances[0].events:
+            return False
+        assert not any(
+            call[0] == "send_to_conversation"
+            for call in NonterminalFollowClient.instances[0].calls
+        )
+        return True
+
+    _FakeSession.script = iter(
+        [
+            "/resume conv-nonterminal",
+            (
+                lambda: bool(NonterminalFollowClient.instances)
+                and any(
+                    call[0] == "stream"
+                    for call in NonterminalFollowClient.instances[0].calls
+                ),
+                "queued but hold",
+            ),
+            (queued_visible_without_send, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NonterminalFollowClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+    NonterminalFollowClient.release_stream.set()
+
+    assert code == 0
+    assert not any(
+        call[0] == "send_to_conversation"
+        for call in NonterminalFollowClient.instances[0].calls
+    )
+
+
 def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
     tmp_path, monkeypatch
 ) -> None:
