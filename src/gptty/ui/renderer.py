@@ -144,6 +144,11 @@ class PrettyRenderer:
             self._answer_stream_suppressed = False
             self.state.turn_active = False
 
+    def turn_stop_pending(self) -> None:
+        """Stop elapsed UI while preserving streamed answer state for canonical readback."""
+        self._stop_elapsed(label="stopped")
+        self.state.turn_active = False
+
     def _stop_elapsed(self, *, label: str) -> None:
         status = self._elapsed_status
         if status is None:
@@ -356,16 +361,23 @@ class PrettyRenderer:
 
     def answer(self, text: str) -> None:
         self.finish_elapsed()
-        if (
-            self._answer_stream_started
-            and not self._answer_stream_suppressed
-            and self._answer_state.text == text
-        ):
-            self.console.print()
-            self._answer_stream_started = False
-            self.state.last_block = "answer"
-            self.state.turn_active = False
-            return
+        if self._answer_stream_started and not self._answer_stream_suppressed:
+            streamed_text = self._answer_state.text
+            if streamed_text == text:
+                self.console.print()
+                self._answer_stream_started = False
+                self.state.last_block = "answer"
+                self.state.turn_active = False
+                return
+            if streamed_text and text.startswith(streamed_text):
+                suffix = text[len(streamed_text) :]
+                if suffix:
+                    self._write_answer_fragment(suffix)
+                self.console.print()
+                self._answer_stream_started = False
+                self.state.last_block = "answer"
+                self.state.turn_active = False
+                return
         if self._answer_stream_started:
             if not self._answer_stream_suppressed:
                 self.console.print()

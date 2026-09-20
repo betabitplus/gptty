@@ -239,6 +239,44 @@ def test_renderer_streams_append_only_answer_without_duplicate_final() -> None:
     assert "corrected answer follows" not in text
 
 
+def test_renderer_stop_readback_does_not_duplicate_matching_stream() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.turn_start(show_elapsed=False)
+    renderer.live_event(
+        {"type": "assistant_text_snapshot", "sequence": 1, "message_id": "m1", "text": "partial"}
+    )
+    renderer.turn_stop_pending()
+    renderer.info("ChatGPT stopped; finalizing local readback…")
+    renderer.answer("partial")
+
+    text = out.getvalue()
+    assert text.count("partial") == 1
+    assert "answer · final" not in text
+    assert "corrected answer follows" not in text
+
+
+def test_renderer_stop_readback_appends_only_canonical_suffix() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.turn_start(show_elapsed=False)
+    renderer.live_event(
+        {"type": "assistant_text_snapshot", "sequence": 1, "message_id": "m1", "text": "partial"}
+    )
+    renderer.turn_stop_pending()
+    renderer.info("ChatGPT stopped; finalizing local readback…")
+    renderer.answer("partial final")
+
+    text = out.getvalue()
+    assert text.count("partial") == 1
+    assert "partial final" not in text
+    assert " final" in text
+    assert "answer · final" not in text
+    assert "corrected answer follows" not in text
+
+
 def test_renderer_revision_falls_back_to_canonical_final() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))

@@ -288,6 +288,7 @@ class TranscriptStream:
     def record_prompt(self, text: str) -> None:
         if not text:
             return
+        self._session.ensure_transcript_line_boundary()
         lines = text.rstrip().splitlines() or [""]
         rendered = [f"❯ {lines[0]}"]
         rendered.extend(f"  {line}" for line in lines[1:])
@@ -600,6 +601,14 @@ class InteractiveSession:
             self._session.app.invalidate()
         except Exception:
             pass
+
+    def ensure_transcript_line_boundary(self) -> None:
+        current = self._transcript_lines[-1]
+        if not current.fragments and current.rule_title is None:
+            return
+        self._transcript_chars += 1
+        self._transcript_lines.append(_TranscriptLine())
+        self._trim_transcript()
 
     def append_rule(self, title: str, *, style: str | None = None) -> None:
         title = str(title).strip()

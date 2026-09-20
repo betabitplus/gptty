@@ -251,6 +251,13 @@ class GpttyClient:
         self.auth_file = Path(auth_file)
         self.timeout = int(timeout)
         self.browser_authority_backend = browser_authority_backend
+        from chatgpt_web_adapter.browser_authority_backend import (
+            resolve_browser_authority_backend,
+        )
+
+        self.effective_browser_authority_backend = (
+            resolve_browser_authority_backend(browser_authority_backend)
+        )
         self._client = sdk_client or self._build_sdk_client()
         self._media_default_model: str | None = None
 

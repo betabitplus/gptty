@@ -458,7 +458,8 @@ def test_ctrl_c_new_wk_chat_waits_for_write_identity_before_stop(tmp_path, monke
     controls = TurnControlSignals()
 
     class StopClient:
-        browser_authority_backend = "wkwebview"
+        browser_authority_backend = None
+        effective_browser_authority_backend = "wkwebview"
 
         def __init__(self) -> None:
             self.calls: list[tuple[str, object]] = []

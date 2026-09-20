@@ -2263,9 +2263,12 @@ def _send_chat_prompt(
             quit_wait_notice_shown = False
             stop_pending = False
             stop_notice_shown = False
-            stop_requires_conversation_ref = (
-                getattr(client, "browser_authority_backend", None) == "wkwebview"
+            effective_backend = getattr(
+                client,
+                "effective_browser_authority_backend",
+                getattr(client, "browser_authority_backend", None),
             )
+            stop_requires_conversation_ref = effective_backend == "wkwebview"
             while worker.is_alive():
                 worker.join(timeout=0.1)
                 if controls.quit_requested.is_set():
@@ -2345,7 +2348,11 @@ def _send_chat_prompt(
                             renderer.warning(str(exc))
                 if on_stop_confirmed is not None:
                     on_stop_confirmed(active_ref)
-                renderer.turn_abort()
+                stop_pending_renderer = getattr(renderer, "turn_stop_pending", None)
+                if callable(stop_pending_renderer):
+                    stop_pending_renderer()
+                else:
+                    renderer.turn_abort()
                 renderer.info("ChatGPT stopped; finalizing local readback…")
 
             if controls.quit_requested.is_set():

@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from gptty.commands._client import build_client
-from gptty.sdk_client import _ProductRuntimeClient
+from gptty.sdk_client import GpttyClient, _ProductRuntimeClient
 
 
 def test_command_client_boundary_omits_backend_when_not_selected() -> None:
@@ -38,6 +38,17 @@ def test_command_client_boundary_forwards_selected_backend() -> None:
         "timeout": 12,
         "browser_authority_backend": "wkwebview",
     }
+
+
+def test_gptty_client_exposes_effective_browser_backend() -> None:
+    from chatgpt_web_adapter.browser_authority_backend import (
+        resolve_browser_authority_backend,
+    )
+
+    client = GpttyClient(sdk_client=object())
+
+    assert client.browser_authority_backend is None
+    assert client.effective_browser_authority_backend == resolve_browser_authority_backend(None)
 
 
 def test_product_runtime_client_uses_cwa_wk_provider_when_selected(monkeypatch) -> None:
