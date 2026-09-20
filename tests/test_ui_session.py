@@ -101,13 +101,14 @@ def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
     )
 
     root = session.application.layout.container
+    body = root.content
     assert session.application.full_screen is True
     assert session.application.renderer.full_screen is True
-    assert session._session.mouse_support is True
+    assert session._session.mouse_support is False
     assert session._transcript_window is not None
-    assert root.children[0] is session._transcript_window
-    assert root.children[-1].content is session._footer_control
-    assert root.children[-1].height == 1
+    assert body.children[0] is session._transcript_window
+    assert body.children[-1].content is session._footer_control
+    assert body.children[-1].height == 1
 
 
 def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
@@ -153,7 +154,7 @@ def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
             await asyncio.sleep(0.05)
             assert session._session.default_buffer.complete_state is not None
             assert input_window.render_info is not None
-            assert input_window.render_info.window_height == 8
+            assert input_window.render_info.window_height == 1
 
             session._session.default_buffer.cancel_completion()
             session.application.invalidate()
@@ -164,6 +165,7 @@ def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
             session._session.default_buffer.text = "done"
             pipe.send_text("\r")
             assert await task == "done"
+            await session.stop_async()
 
     asyncio.run(scenario())
 
@@ -277,7 +279,7 @@ def test_transcript_mouse_wheel_scrolls_without_changing_input_focus(tmp_path) -
     assert session.application.layout.current_buffer is focused
 
 
-def test_raw_sgr_mouse_wheel_scrolls_transcript(tmp_path) -> None:
+def test_alternate_scroll_cursor_key_scrolls_transcript(tmp_path) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe:
             session = InteractiveSession(
@@ -291,7 +293,9 @@ def test_raw_sgr_mouse_wheel_scrolls_transcript(tmp_path) -> None:
             await asyncio.sleep(0.05)
             before = session._transcript_scroll_row
 
-            pipe.send_bytes(b"\x1b[<64;10;5M")
+            # Ghostty/xterm DECSET 1007 translates wheel events to cursor keys
+            # when the application does not capture the mouse.
+            pipe.send_bytes(b"\x1b[A")
             await asyncio.sleep(0.05)
 
             assert session._transcript_follow_tail is False
@@ -299,6 +303,7 @@ def test_raw_sgr_mouse_wheel_scrolls_transcript(tmp_path) -> None:
 
             pipe.send_text("done\r")
             assert await task == "done"
+            await session.stop_async()
 
     asyncio.run(scenario())
 
@@ -331,6 +336,95 @@ def test_raw_pageup_then_ctrl_end_toggles_transcript_follow(tmp_path) -> None:
 
             pipe.send_text("done\r")
             assert await task == "done"
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_picker_escape_cancels_quickly_without_restarting_app(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            await session.start_async()
+            app_task = session._application_task
+            assert app_task is not None
+            picker = asyncio.create_task(
+                session.choose_searchable_async(
+                    "Pick one",
+                    [("one", "One"), ("two", "Two")],
+                )
+            )
+            await asyncio.sleep(0.05)
+            pipe.send_bytes(b"\x1b")
+
+            assert await asyncio.wait_for(picker, timeout=0.2) is None
+            assert session._application_task is app_task
+            assert not app_task.done()
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_enter_applies_selected_command_completion_without_restarting_app(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+            app_task = session._application_task
+            assert app_task is not None
+
+            pipe.send_text("/")
+            await asyncio.sleep(0.05)
+            assert session._session.default_buffer.complete_state is not None
+            pipe.send_text("\r")
+
+            assert await task == "/new"
+            assert session._application_task is app_task
+            assert not app_task.done()
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_persistent_application_survives_multiple_submits(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            first = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+            app_task = session._application_task
+            assert app_task is not None and not app_task.done()
+
+            pipe.send_text("one\r")
+            assert await first == "one"
+            assert session._application_task is app_task
+            assert not app_task.done()
+
+            second = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.02)
+            pipe.send_text("two\r")
+            assert await second == "two"
+            assert session._application_task is app_task
+            assert not app_task.done()
+
+            await session.stop_async()
+            assert app_task.done()
 
     asyncio.run(scenario())
 

@@ -80,10 +80,13 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
     os.close(slave)
     try:
         startup = _read_until(master, "❯ ".encode(), timeout=5.0)
+        startup += _read_for(master, duration=0.2)
         assert b"ChatGPT" in startup
         assert b"\x1b[?1049h" in startup
-        assert b"\x1b[?1000h" in startup
-        assert b"\x1b[?1006h" in startup
+        assert b"\x1b[?1007h" in startup
+        assert b"\x1b[?1000h" not in startup
+        assert b"\x1b[?1003h" not in startup
+        assert b"\x1b[?1006h" not in startup
 
         for rows, cols in ((18, 60), (35, 120)):
             _set_winsize(master, rows, cols)
@@ -91,34 +94,35 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
             resized = _read_until(master, "❯".encode(), timeout=5.0)
             assert "❯".encode() in resized
             assert b"\x1b[?1049l" not in resized
-            assert resized.rfind(b"\x1b[?1000h") > resized.rfind(b"\x1b[?1000l")
-            assert resized.rfind(b"\x1b[?1006h") > resized.rfind(b"\x1b[?1006l")
+            assert b"\x1b[?1000h" not in resized
+            assert b"\x1b[?1003h" not in resized
+            assert b"\x1b[?1006h" not in resized
             assert process.poll() is None
             # SIGWINCH triggers a CPR query; let the fake terminal answer it
             # before the next resize/command.
             _read_for(master, duration=0.25)
 
-        os.write(master, b"/\r")
+        # Command completion is an in-place overlay: typing slash must not leave
+        # the alternate screen or restart the application.
+        os.write(master, b"/")
         menu = _read_until(master, b"/exit", timeout=5.0)
-        assert b"Actions" in menu
+        assert b"/new" in menu
         assert b"/resume" in menu
         assert b"/detach" in menu
         assert b"/stop" in menu
         assert b"/goal" in menu
         assert b"/image" in menu
-        assert b"/paste" in menu
-        assert b"/model" in menu
+        assert b"Actions" not in menu
         assert b"/help" not in menu
-        os.write(master, b"\x1b")
-        cancelled = _read_until(master, "❯".encode(), timeout=5.0)
-        assert "❯".encode() in cancelled
+        assert b"\x1b[?1049l" not in menu
+        os.write(master, b"\x7f")
+        _read_for(master, duration=0.15)
 
-        os.write(master, b"/\r")
-        menu = _read_until(master, b"Actions", timeout=5.0)
-        assert b"Actions" in menu
-        os.write(master, b"\r")
+        os.write(master, b"/new\r")
         selected = _read_until(master, b"Started a new conversation.", timeout=5.0)
         assert b"Started a new conversation." in selected
+        assert b"\x1b[?1049l" not in selected
+        assert b"\x1b[?1049h" not in selected
 
         image = tmp_path / "screen shot.png"
         image.write_bytes(b"png")

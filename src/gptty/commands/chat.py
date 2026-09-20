@@ -681,19 +681,27 @@ async def _run_enhanced_loop_async(
     patch_stdout_enabled: bool,
 ) -> _EnhancedLoopOutcome:
     output_context = patch_stdout(raw=True) if patch_stdout_enabled else nullcontext()
-    with output_context:
-        return await _enhanced_loop_core(
-            args=args,
-            state=state,
-            state_path=state_path,
-            get_client=get_client,
-            ui=ui,
-            renderer=renderer,
-            commands=commands,
-            queued_prompts=queued_prompts,
-            stdout=stdout,
-            stderr=stderr,
-        )
+    start_ui = getattr(ui, "start_async", None)
+    stop_ui = getattr(ui, "stop_async", None)
+    if callable(start_ui):
+        await start_ui()
+    try:
+        with output_context:
+            return await _enhanced_loop_core(
+                args=args,
+                state=state,
+                state_path=state_path,
+                get_client=get_client,
+                ui=ui,
+                renderer=renderer,
+                commands=commands,
+                queued_prompts=queued_prompts,
+                stdout=stdout,
+                stderr=stderr,
+            )
+    finally:
+        if callable(stop_ui):
+            await stop_ui()
 
 
 async def _enhanced_loop_core(
@@ -741,7 +749,7 @@ async def _enhanced_loop_core(
             _cancel_enhanced_follow_timer(active_follow)
             command = pending_follow_command
             pending_follow_command = None
-            result = commands.handle(command)
+            result = await commands.handle_async(command)
             if result is not None:
                 return _EnhancedLoopOutcome(exit_code=result)
             if (
@@ -884,9 +892,14 @@ async def _enhanced_loop_core(
                             active_follow.stop_requested = True
                             _cancel_enhanced_follow_timer(active_follow)
                     elif active is None and active_resume is None:
-                        if prompt.startswith("/"):
-                            return _EnhancedLoopOutcome(command=prompt)
-                        queued_prompts.append(prompt)
+                        if prompt == "/":
+                            ui.reopen_command_completion()
+                        elif prompt.startswith("/"):
+                            result = await commands.handle_async(prompt)
+                            if result is not None:
+                                return _EnhancedLoopOutcome(exit_code=result)
+                        else:
+                            queued_prompts.append(prompt)
                     elif active_resume is not None and active is None:
                         outcome = _handle_resume_loading_input(
                             prompt,

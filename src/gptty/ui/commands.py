@@ -82,6 +82,26 @@ class InteractiveCommands:
             return None
         return method(parts[1:])
 
+    async def handle_async(self, raw: str) -> int | None:
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            self.renderer.warning(f"Invalid command: {exc}")
+            return None
+        if not parts:
+            return None
+        name = parts[0].lstrip("/").lower()
+        argv = parts[1:]
+        if name == "resume" and not argv:
+            return await self._cmd_resume_async()
+        if name == "model" and not argv:
+            return await self._cmd_model_async()
+        method = getattr(self, f"_cmd_{name}", None)
+        if not callable(method):
+            self.renderer.warning(f"Unknown command: /{name}. Press / for actions.")
+            return None
+        return method(argv)
+
     @property
     def conversation_mode(self) -> str:
         return self._conversation_mode
@@ -568,11 +588,7 @@ class InteractiveCommands:
         self._pending_media.append(str(path))
         self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
 
-    def _cmd_resume(self, argv: list[str]) -> None:
-        ref = argv[0] if argv else self._choose_conversation(self.get_client())
-        if not ref:
-            return
-
+    def _begin_resume(self, ref: str) -> None:
         attached_ref = _canonical_conversation_ref(str(ref))
         if self.state.current_conversation and attached_ref != self.state.current_conversation:
             self._pause_active_goal("conversation changed")
@@ -580,7 +596,24 @@ class InteractiveCommands:
         self._pending_resume = ResumeRequest(conversation_ref=attached_ref)
         self.renderer.info(f"Loading conversation: {_short_ref(attached_ref)}")
 
-    def _choose_conversation(self, client: Any) -> str | None:
+    def _cmd_resume(self, argv: list[str]) -> None:
+        ref = argv[0] if argv else self._choose_conversation(self.get_client())
+        if not ref:
+            return
+        self._begin_resume(str(ref))
+
+    async def _cmd_resume_async(self) -> None:
+        options = self._conversation_options(self.get_client())
+        if not options:
+            return
+        selected = await self.ui.choose_searchable_async(
+            "Resume conversation",
+            options,
+        )
+        if selected:
+            self._begin_resume(str(selected))
+
+    def _conversation_options(self, client: Any) -> list[tuple[str, str]]:
         try:
             recent_catalog = getattr(client, "list_recent_conversations", None)
             conversations = (
@@ -590,7 +623,7 @@ class InteractiveCommands:
             )
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Conversation list failed: {exc}")
-            return None
+            return []
         current_ref = _canonical_conversation_ref(self.state.current_conversation or "")
         options: list[tuple[str, str]] = []
         for item in conversations:
@@ -611,6 +644,11 @@ class InteractiveCommands:
             )
         if not options:
             self.renderer.info("No ChatGPT conversations found.")
+        return options
+
+    def _choose_conversation(self, client: Any) -> str | None:
+        options = self._conversation_options(client)
+        if not options:
             return None
         selected = self.ui.choose_searchable(
             "Resume conversation",
@@ -618,57 +656,78 @@ class InteractiveCommands:
         )
         return str(selected) if selected else None
 
-    def _cmd_model(self, argv: list[str]) -> None:
-        if argv and argv[0].strip().lower() == "default":
-            previous = self.state.model
-            self.state.model = None
-            if not self._save_state():
-                self.state.model = previous
-                return
-            self.renderer.info("Model: latest frontier · High")
-            return
-
+    def _available_models(self) -> dict[str, Any] | None:
         try:
             models = self.get_client().list_models()
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Model list failed: {exc}")
-            return
-
-        available = [model for model in models if _model_slug(model) is not None and _model_available(model)]
+            return None
+        available = [
+            model
+            for model in models
+            if _model_slug(model) is not None and _model_available(model)
+        ]
         by_slug = {_model_slug(model): model for model in available}
-        by_slug = {slug: model for slug, model in by_slug.items() if slug is not None}
+        return {slug: model for slug, model in by_slug.items() if slug is not None}
 
-        if argv:
-            selected = argv[0].strip()
-            if selected not in by_slug:
-                self.renderer.warning("Unknown model slug. Run /model and choose from the live ChatGPT list.")
-                return
-        else:
-            options: list[tuple[Any, str]] = [
-                (
-                    "",
-                    "Default · latest frontier · High"
-                    + (" · current" if self.state.model is None else ""),
-                )
-            ]
-            options.extend(
-                (
-                    slug,
-                    _model_label(model, current=slug == self.state.model),
-                )
-                for slug, model in by_slug.items()
+    def _model_options(self, by_slug: dict[str, Any]) -> list[tuple[Any, str]]:
+        options: list[tuple[Any, str]] = [
+            (
+                "",
+                "Default · latest frontier · High"
+                + (" · current" if self.state.model is None else ""),
             )
-            value = self.ui.choose_searchable("ChatGPT model", options)
-            if value is None:
-                return
-            selected = str(value)
+        ]
+        options.extend(
+            (
+                slug,
+                _model_label(model, current=slug == self.state.model),
+            )
+            for slug, model in by_slug.items()
+        )
+        return options
 
+    def _apply_model(self, selected: str) -> None:
         previous = self.state.model
         self.state.model = selected or None
         if not self._save_state():
             self.state.model = previous
             return
         self.renderer.info(f"Model: {self.state.model or 'latest frontier · High'}")
+
+    def _cmd_model(self, argv: list[str]) -> None:
+        if argv and argv[0].strip().lower() == "default":
+            self._apply_model("")
+            return
+
+        by_slug = self._available_models()
+        if by_slug is None:
+            return
+        if argv:
+            selected = argv[0].strip()
+            if selected not in by_slug:
+                self.renderer.warning("Unknown model slug. Run /model and choose from the live ChatGPT list.")
+                return
+        else:
+            value = self.ui.choose_searchable(
+                "ChatGPT model",
+                self._model_options(by_slug),
+            )
+            if value is None:
+                return
+            selected = str(value)
+        self._apply_model(selected)
+
+    async def _cmd_model_async(self) -> None:
+        by_slug = self._available_models()
+        if by_slug is None:
+            return
+        value = await self.ui.choose_searchable_async(
+            "ChatGPT model",
+            self._model_options(by_slug),
+        )
+        if value is not None:
+            self._apply_model(str(value))
 
     def _resume_goal(self) -> None:
         goal = self.state.goal

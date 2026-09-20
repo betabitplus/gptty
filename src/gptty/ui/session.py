@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -12,12 +14,12 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import to_filter
+from prompt_toolkit.filters import Condition, has_focus, to_filter
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout import CompletionsMenu, Float, FloatContainer, Layout
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
@@ -307,6 +309,16 @@ class InteractiveSession:
         self._input_window: Window | None = None
         self._transcript_control: _TranscriptControl | None = None
         self._footer_control: FormattedTextControl | None = None
+        self._attachment_count = 0
+        self._prompt_override: str | None = None
+        self._persistent_input_queue: asyncio.Queue[object] | None = None
+        self._application_task: asyncio.Task[Any] | None = None
+        self._default_accept_handler: Callable[[Any], bool] | None = None
+        self._persistent_cancel = object()
+        self._picker_active = False
+        self._picker_previous_prompt: str | None = None
+        self._picker_previous_completer: Any | None = None
+        self._command_completer: Any | None = None
         self._session: PromptSession[str]
         self._build_session()
 
@@ -318,6 +330,7 @@ class InteractiveSession:
             WordCompleter(command_words, meta_dict=meta, sentence=True),
             enable_fuzzy=True,
         )
+        self._command_completer = completer
         bindings = KeyBindings()
 
         @bindings.add("escape", "enter")
@@ -326,10 +339,17 @@ class InteractiveSession:
 
         @bindings.add(Keys.ControlC, eager=True)
         def _control_c(event: Any) -> None:
+            if self._picker_active:
+                self._cancel_picker()
+                return
             if self._turn_controls is not None:
                 self._turn_controls.request_stop()
                 return
             event.app.exit(exception=KeyboardInterrupt())
+
+        @bindings.add("escape", filter=Condition(lambda: self._picker_active), eager=True)
+        def _cancel_picker_key(event: Any) -> None:
+            self._cancel_picker()
 
         @bindings.add(Keys.ControlBackslash, eager=True)
         def _control_backslash(event: Any) -> None:
@@ -354,27 +374,45 @@ class InteractiveSession:
         def _scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
+        empty_input = Condition(
+            lambda: not self._picker_active
+            and not self._session.default_buffer.text
+            and self._session.default_buffer.complete_state is None
+        )
+
+        @bindings.add(Keys.Up, filter=empty_input, eager=True)
+        def _alternate_scroll_up(event: Any) -> None:
+            self.scroll_transcript(-3)
+
+        @bindings.add(Keys.Down, filter=empty_input, eager=True)
+        def _alternate_scroll_down(event: Any) -> None:
+            self.scroll_transcript(3)
+
         @bindings.add(Keys.ControlEnd, eager=True)
         def _scroll_bottom(event: Any) -> None:
             self.scroll_transcript_to_bottom()
 
         editing_mode = EditingMode.VI if self.settings.editor == "vi" else EditingMode.EMACS
         kwargs: dict[str, Any] = {
+            "message": self._prompt_text,
             "history": FileHistory(str(self.history_file)),
             "auto_suggest": AutoSuggestFromHistory(),
             "completer": completer,
             "complete_while_typing": True,
+            "reserve_space_for_menu": 0,
             "multiline": False,
             "key_bindings": bindings,
             "editing_mode": editing_mode,
             "bottom_toolbar": None,
-            "mouse_support": True,
+            "mouse_support": False,
+            "refresh_interval": 1.0,
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
         if self._prompt_output is not None:
             kwargs["output"] = self._prompt_output
         self._session = PromptSession(**kwargs)
+        self._session.app.ttimeoutlen = 0.05
         self._bound_input_window_height()
         self._install_transcript_layout()
         if os.name != "nt" and hasattr(signal, "SIGWINCH"):
@@ -383,9 +421,16 @@ class InteractiveSession:
             # produces a second resize callback after the first redraw.
             self._session.app.terminal_size_polling_interval = None
 
+    def _prompt_text(self) -> str:
+        if self._prompt_override is not None:
+            return self._prompt_override
+        if self._attachment_count:
+            suffix = "s" if self._attachment_count != 1 else ""
+            return f"[{self._attachment_count} image{suffix}] ❯ "
+        return "❯ "
+
     def _input_window_height(self) -> Dimension:
-        min_rows = 8 if self._session.default_buffer.complete_state is not None else 1
-        return Dimension(min=min_rows, max=8)
+        return Dimension(min=1, max=8)
 
     def _bound_input_window_height(self) -> None:
         """Keep the prompt at the bottom and grow it only for visible content/menu."""
@@ -394,9 +439,33 @@ class InteractiveSession:
         input_window.dont_extend_height = to_filter(True)
         self._input_window = input_window
 
+    def _strip_inner_completion_floats(self, container: Any) -> None:
+        seen: set[int] = set()
+
+        def visit(node: Any) -> None:
+            node_id = id(node)
+            if node_id in seen:
+                return
+            seen.add(node_id)
+            if isinstance(node, FloatContainer):
+                node.floats = [
+                    item
+                    for item in node.floats
+                    if "Completion" not in type(item.content).__name__
+                ]
+            for child in getattr(node, "children", ()) or ():
+                visit(child)
+            for attr in ("content", "alternative_content"):
+                child = getattr(node, attr, None)
+                if child is not None and child is not node:
+                    visit(child)
+
+        visit(container)
+
     def _install_transcript_layout(self) -> None:
         app = self._session.app
         original = app.layout.container
+        self._strip_inner_completion_floats(original)
         children = list(getattr(original, "children", ()))
         self._transcript_control = _TranscriptControl(
             self._visible_transcript,
@@ -415,8 +484,26 @@ class InteractiveSession:
             style="reverse",
             always_hide_cursor=True,
         )
+        body = HSplit([self._transcript_window, *children, footer])
+        completion_popup = CompletionsMenu(
+            max_height=8,
+            scroll_offset=1,
+            extra_filter=has_focus(self._session.default_buffer),
+            display_arrows=True,
+        )
         app.layout = Layout(
-            HSplit([self._transcript_window, *children, footer]),
+            FloatContainer(
+                content=body,
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=completion_popup,
+                        allow_cover_cursor=False,
+                        z_index=100,
+                    )
+                ],
+            ),
             focused_element=self._session.default_buffer,
         )
         # PromptSession builds its Application/Renderer for line mode by default.
@@ -588,13 +675,173 @@ class InteractiveSession:
         except Exception:
             pass
 
+    def _persistent_accept(self, buffer: Any) -> bool:
+        queue = self._persistent_input_queue
+        if queue is None:
+            return True
+        state = buffer.complete_state
+        completion = state.current_completion if state is not None else None
+        if completion is None and state is not None and state.completions:
+            completion = state.completions[0]
+        if completion is not None:
+            buffer.apply_completion(completion)
+        queue.put_nowait(buffer.text)
+        return False
+
+    def _restore_picker_state(self) -> None:
+        buffer = self._session.default_buffer
+        self._picker_active = False
+        self._prompt_override = self._picker_previous_prompt
+        buffer.completer = self._picker_previous_completer or self._command_completer
+        self._picker_previous_prompt = None
+        self._picker_previous_completer = None
+        buffer.reset()
+        self._session.app.invalidate()
+
+    def _cancel_picker(self) -> None:
+        if not self._picker_active:
+            return
+        queue = self._persistent_input_queue
+        self._restore_picker_state()
+        if queue is not None:
+            queue.put_nowait(self._persistent_cancel)
+
+    async def start_async(self) -> None:
+        task = self._application_task
+        if task is not None and not task.done():
+            return
+        self._persistent_input_queue = asyncio.Queue()
+        buffer = self._session.default_buffer
+        self._default_accept_handler = buffer.accept_handler
+        buffer.accept_handler = self._persistent_accept
+        self._application_task = asyncio.create_task(self._session.app.run_async())
+        await asyncio.sleep(0)
+        output = self._session.app.output
+        try:
+            # Keep native mouse selection. In alternate screen mode Ghostty/xterm
+            # translate wheel scrolling into cursor up/down when DECSET 1007 is on.
+            output.write_raw("\x1b[?1007h")
+            output.flush()
+        except Exception:
+            pass
+
+    async def stop_async(self) -> None:
+        task = self._application_task
+        if task is None:
+            return
+        output = self._session.app.output
+        try:
+            output.write_raw("\x1b[?1007l")
+            output.flush()
+        except Exception:
+            pass
+        if not task.done():
+            try:
+                self._session.app.exit()
+            except Exception:
+                pass
+        with suppress(BaseException):
+            await task
+        self._application_task = None
+        self._persistent_input_queue = None
+        self._picker_active = False
+        buffer = self._session.default_buffer
+        if self._default_accept_handler is not None:
+            buffer.accept_handler = self._default_accept_handler
+        self._default_accept_handler = None
+
+    async def _next_persistent_input(self) -> object:
+        queue = self._persistent_input_queue
+        app_task = self._application_task
+        if queue is None or app_task is None:
+            raise RuntimeError("interactive application is not running")
+        queue_task = asyncio.create_task(queue.get())
+        done, _ = await asyncio.wait(
+            {queue_task, app_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if queue_task in done:
+            return queue_task.result()
+        queue_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await queue_task
+        try:
+            await app_task
+        except (KeyboardInterrupt, EOFError):
+            raise
+        raise EOFError()
+
+    def reopen_command_completion(self) -> None:
+        buffer = self._session.default_buffer
+        buffer.reset()
+        buffer.text = "/"
+        buffer.cursor_position = 1
+        buffer.start_completion(select_first=False)
+        self._session.app.invalidate()
+
+    async def choose_searchable_async(
+        self,
+        message: str,
+        options: list[tuple[Any, str]],
+    ) -> Any | None:
+        if not options:
+            return None
+        await self.start_async()
+        labels: list[str] = []
+        values_by_label: dict[str, Any] = {}
+        for value, raw_label in options:
+            label = str(raw_label).strip() or str(value)
+            if label in values_by_label:
+                label = f"{label}  [{value}]"
+            labels.append(label)
+            values_by_label[label] = value
+
+        buffer = self._session.default_buffer
+        self._picker_previous_completer = buffer.completer
+        self._picker_previous_prompt = self._prompt_override
+        self._picker_active = True
+        self._prompt_override = f"{message}: "
+        buffer.completer = FuzzyCompleter(
+            WordCompleter(labels, sentence=True),
+            enable_fuzzy=True,
+        )
+        buffer.reset()
+        buffer.start_completion(select_first=False)
+        self._session.app.invalidate()
+        try:
+            raw = await self._next_persistent_input()
+            if raw is self._persistent_cancel:
+                return None
+            selected = str(raw).strip()
+            if not selected:
+                return None
+            if selected in values_by_label:
+                return values_by_label[selected]
+            for value, _label in options:
+                if str(value) == selected:
+                    return value
+            matches = [
+                value
+                for label, value in values_by_label.items()
+                if selected.casefold() in label.casefold()
+            ]
+            return matches[0] if len(matches) == 1 else None
+        finally:
+            if self._picker_active or self._picker_previous_completer is not None:
+                self._restore_picker_state()
+
     def read_prompt(self, *, attachment_count: int = 0) -> str:
         marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
         return self._session.prompt(f"{marker}❯ ")
 
     async def read_prompt_async(self, *, attachment_count: int = 0) -> str:
-        marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
-        return await self._session.prompt_async(f"{marker}❯ ", refresh_interval=1.0)
+        self._attachment_count = attachment_count
+        await self.start_async()
+        self._session.app.invalidate()
+        raw = await self._next_persistent_input()
+        if raw is self._persistent_cancel:
+            return ""
+        return str(raw)
 
     @property
     def application(self) -> Any:

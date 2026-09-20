@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from gptty.state import ChatState, GoalState, StateError, load_chat_state
@@ -15,6 +16,10 @@ class FakeUI:
     def choose_searchable(self, message, options, *, default=None):
         self.seen.append((message, list(options)))
         return self.choices.pop(0) if self.choices else default
+
+    async def choose_searchable_async(self, message, options):
+        self.seen.append((message, list(options)))
+        return self.choices.pop(0) if self.choices else None
 
     def read_image_path(self):
         return self.image_paths.pop(0) if self.image_paths else None
@@ -164,6 +169,19 @@ def test_resume_picker_prefers_bounded_recent_catalog(tmp_path) -> None:
 
     assert commands.handle("/resume") is None
     assert client.calls == [("list_recent_conversations", 100)]
+
+
+def test_resume_async_picker_stays_in_enhanced_ui(tmp_path) -> None:
+    ui = FakeUI(choices=["conv-2"])
+    commands, _renderer, client, _state_path = make_commands(tmp_path, ui=ui)
+
+    assert asyncio.run(commands.handle_async("/resume")) is None
+
+    request = commands.take_pending_resume()
+    assert request is not None
+    assert request.conversation_ref == "conv-2"
+    assert client.calls == [("list_conversations", None)]
+    assert ui.seen[-1][0] == "Resume conversation"
 
 
 def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> None:
@@ -466,6 +484,24 @@ def test_model_uses_live_catalog_slug(tmp_path) -> None:
     commands.handle("/model")
 
     assert client.calls == [("list_models", None)]
+    assert state.model == "gpt-real-b"
+    assert load_chat_state(state_path).model == "gpt-real-b"
+    assert renderer.events[-1] == ("info", "Model: gpt-real-b")
+
+
+def test_model_async_picker_stays_in_enhanced_ui(tmp_path) -> None:
+    state = ChatState(model="old")
+    ui = FakeUI(choices=["gpt-real-b"])
+    commands, renderer, client, state_path = make_commands(
+        tmp_path,
+        state=state,
+        ui=ui,
+    )
+
+    assert asyncio.run(commands.handle_async("/model")) is None
+
+    assert client.calls == [("list_models", None)]
+    assert ui.seen[-1][0] == "ChatGPT model"
     assert state.model == "gpt-real-b"
     assert load_chat_state(state_path).model == "gpt-real-b"
     assert renderer.events[-1] == ("info", "Model: gpt-real-b")
