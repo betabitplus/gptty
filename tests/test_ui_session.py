@@ -28,12 +28,13 @@ class TTYStringIO(StringIO):
 
 
 class ResizableDummyOutput(DummyOutput):
-    def __init__(self, columns: int) -> None:
+    def __init__(self, columns: int, rows: int = 24) -> None:
         super().__init__()
         self.columns = columns
+        self.rows = rows
 
     def get_size(self) -> Size:
-        return Size(rows=24, columns=self.columns)
+        return Size(rows=self.rows, columns=self.columns)
 
 
 def test_enhanced_ui_auto_requires_tty(tmp_path, monkeypatch) -> None:
@@ -107,6 +108,64 @@ def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
     assert root.children[0] is session._transcript_window
     assert root.children[-1].content is session._footer_control
     assert root.children[-1].height == 1
+
+
+def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(100, rows=40),
+            )
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+
+            input_window = session._input_window
+            transcript_window = session._transcript_window
+            assert input_window is not None
+            assert transcript_window is not None
+            assert input_window.render_info is not None
+            assert transcript_window.render_info is not None
+            assert input_window.render_info.window_height == 1
+            assert transcript_window.render_info.window_height == 38
+
+            session._session.default_buffer.text = "one\ntwo\nthree\nfour"
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            assert input_window.render_info is not None
+            assert transcript_window.render_info is not None
+            assert input_window.render_info.window_height == 4
+            assert transcript_window.render_info.window_height == 35
+
+            session._session.default_buffer.text = "\n".join(f"line {i}" for i in range(20))
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            assert input_window.render_info is not None
+            assert transcript_window.render_info is not None
+            assert input_window.render_info.window_height == 8
+            assert transcript_window.render_info.window_height == 31
+
+            session._session.default_buffer.text = "/"
+            session._session.default_buffer.start_completion()
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            assert session._session.default_buffer.complete_state is not None
+            assert input_window.render_info is not None
+            assert input_window.render_info.window_height == 8
+
+            session._session.default_buffer.cancel_completion()
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            assert input_window.render_info is not None
+            assert input_window.render_info.window_height == 1
+
+            session._session.default_buffer.text = "done"
+            pipe.send_text("\r")
+            assert await task == "done"
+
+    asyncio.run(scenario())
 
 
 def test_transcript_auto_follow_uses_real_bottom_not_sentinel(tmp_path) -> None:

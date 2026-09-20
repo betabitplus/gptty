@@ -12,6 +12,7 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import to_filter
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -303,6 +304,7 @@ class InteractiveSession:
         self._transcript_view_width = 1
         self._transcript_view_height = 1
         self._transcript_window: Window | None = None
+        self._input_window: Window | None = None
         self._transcript_control: _TranscriptControl | None = None
         self._footer_control: FormattedTextControl | None = None
         self._session: PromptSession[str]
@@ -373,12 +375,24 @@ class InteractiveSession:
         if self._prompt_output is not None:
             kwargs["output"] = self._prompt_output
         self._session = PromptSession(**kwargs)
+        self._bound_input_window_height()
         self._install_transcript_layout()
         if os.name != "nt" and hasattr(signal, "SIGWINCH"):
             # prompt_toolkit also polls terminal size every 0.5s by default.
             # On POSIX main-thread TTYs SIGWINCH is authoritative; keeping both
             # produces a second resize callback after the first redraw.
             self._session.app.terminal_size_polling_interval = None
+
+    def _input_window_height(self) -> Dimension:
+        min_rows = 8 if self._session.default_buffer.complete_state is not None else 1
+        return Dimension(min=min_rows, max=8)
+
+    def _bound_input_window_height(self) -> None:
+        """Keep the prompt at the bottom and grow it only for visible content/menu."""
+        input_window = self._session.app.layout.current_window
+        input_window.height = self._input_window_height
+        input_window.dont_extend_height = to_filter(True)
+        self._input_window = input_window
 
     def _install_transcript_layout(self) -> None:
         app = self._session.app
