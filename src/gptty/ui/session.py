@@ -12,7 +12,6 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.filters import to_filter
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -345,6 +344,14 @@ class InteractiveSession:
         def _page_down(event: Any) -> None:
             self.scroll_transcript(self._transcript_page_size())
 
+        @bindings.add(Keys.ScrollUp, eager=True)
+        def _scroll_up(event: Any) -> None:
+            self.scroll_transcript(-3)
+
+        @bindings.add(Keys.ScrollDown, eager=True)
+        def _scroll_down(event: Any) -> None:
+            self.scroll_transcript(3)
+
         @bindings.add(Keys.ControlEnd, eager=True)
         def _scroll_bottom(event: Any) -> None:
             self.scroll_transcript_to_bottom()
@@ -359,6 +366,7 @@ class InteractiveSession:
             "key_bindings": bindings,
             "editing_mode": editing_mode,
             "bottom_toolbar": None,
+            "mouse_support": True,
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
@@ -397,8 +405,11 @@ class InteractiveSession:
             HSplit([self._transcript_window, *children, footer]),
             focused_element=self._session.default_buffer,
         )
+        # PromptSession builds its Application/Renderer for line mode by default.
+        # Both flags must agree or resize redraws leak old full-screen frames into
+        # the normal terminal screen.
         app.full_screen = True
-        app.mouse_support = to_filter(True)
+        app.renderer.full_screen = True
         self.scroll_transcript_to_bottom()
 
     def transcript_stream(self, base: TextIO, *, stream_name: str) -> TranscriptStream:

@@ -101,6 +101,8 @@ def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
 
     root = session.application.layout.container
     assert session.application.full_screen is True
+    assert session.application.renderer.full_screen is True
+    assert session._session.mouse_support is True
     assert session._transcript_window is not None
     assert root.children[0] is session._transcript_window
     assert root.children[-1].content is session._footer_control
@@ -214,6 +216,32 @@ def test_transcript_mouse_wheel_scrolls_without_changing_input_focus(tmp_path) -
     assert session._transcript_scroll_row == 57
     assert session._transcript_follow_tail is False
     assert session.application.layout.current_buffer is focused
+
+
+def test_raw_sgr_mouse_wheel_scrolls_transcript(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            session.append_transcript("".join(f"line {i}\n" for i in range(80)))
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+            before = session._transcript_scroll_row
+
+            pipe.send_bytes(b"\x1b[<64;10;5M")
+            await asyncio.sleep(0.05)
+
+            assert session._transcript_follow_tail is False
+            assert session._transcript_scroll_row == before - 3
+
+            pipe.send_text("done\r")
+            assert await task == "done"
+
+    asyncio.run(scenario())
 
 
 def test_raw_pageup_then_ctrl_end_toggles_transcript_follow(tmp_path) -> None:
