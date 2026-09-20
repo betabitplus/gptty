@@ -334,6 +334,7 @@ class InteractiveSession:
         self._transcript_window: Window | None = None
         self._input_window: Window | None = None
         self._search_window: Window | None = None
+        self._input_visual_cache: tuple[str, int, str, list[tuple[int, int]]] | None = None
         self._transcript_control: _TranscriptControl | None = None
         self._footer_control: FormattedTextControl | None = None
         self._attachment_count = 0
@@ -388,11 +389,33 @@ class InteractiveSession:
                 return
             event.app.exit(exception=EOFError())
 
-        @bindings.add(Keys.PageUp, eager=True)
+        main_draft = Condition(
+            lambda: not self._picker_active
+            and get_app().current_buffer is self._session.default_buffer
+            and bool(self._session.default_buffer.text)
+            and self._session.default_buffer.complete_state is None
+        )
+        visual_draft = main_draft & Condition(self._input_has_multiple_visual_rows)
+        empty_input = Condition(
+            lambda: not self._picker_active
+            and get_app().current_buffer is self._session.default_buffer
+            and not self._session.default_buffer.text
+            and self._session.default_buffer.complete_state is None
+        )
+
+        @bindings.add(Keys.PageUp, filter=visual_draft, eager=True)
+        def _draft_page_up(event: Any) -> None:
+            self._move_input_visual_rows(-self._input_page_size())
+
+        @bindings.add(Keys.PageDown, filter=visual_draft, eager=True)
+        def _draft_page_down(event: Any) -> None:
+            self._move_input_visual_rows(self._input_page_size())
+
+        @bindings.add(Keys.PageUp, filter=empty_input, eager=True)
         def _page_up(event: Any) -> None:
             self.scroll_transcript(-self._transcript_page_size())
 
-        @bindings.add(Keys.PageDown, eager=True)
+        @bindings.add(Keys.PageDown, filter=empty_input, eager=True)
         def _page_down(event: Any) -> None:
             self.scroll_transcript(self._transcript_page_size())
 
@@ -404,11 +427,13 @@ class InteractiveSession:
         def _scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
-        empty_input = Condition(
-            lambda: not self._picker_active
-            and not self._session.default_buffer.text
-            and self._session.default_buffer.complete_state is None
-        )
+        @bindings.add(Keys.Up, filter=visual_draft, eager=True)
+        def _draft_up(event: Any) -> None:
+            self._move_input_visual_rows(-1)
+
+        @bindings.add(Keys.Down, filter=visual_draft, eager=True)
+        def _draft_down(event: Any) -> None:
+            self._move_input_visual_rows(1)
 
         @bindings.add(Keys.Up, filter=empty_input, eager=True)
         def _alternate_scroll_up(event: Any) -> None:
@@ -418,7 +443,17 @@ class InteractiveSession:
         def _alternate_scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
-        @bindings.add(Keys.ControlEnd, eager=True)
+        @bindings.add(Keys.ControlUp, filter=visual_draft, eager=True)
+        @bindings.add(Keys.ControlHome, filter=main_draft, eager=True)
+        def _draft_start(event: Any) -> None:
+            self._move_input_to_edge(end=False)
+
+        @bindings.add(Keys.ControlDown, filter=visual_draft, eager=True)
+        @bindings.add(Keys.ControlEnd, filter=main_draft, eager=True)
+        def _draft_end(event: Any) -> None:
+            self._move_input_to_edge(end=True)
+
+        @bindings.add(Keys.ControlEnd, filter=empty_input, eager=True)
         def _scroll_bottom(event: Any) -> None:
             self.scroll_transcript_to_bottom()
 
@@ -468,6 +503,103 @@ class InteractiveSession:
         input_window.height = self._input_window_height
         input_window.dont_extend_height = to_filter(True)
         self._input_window = input_window
+
+    def _input_page_size(self) -> int:
+        render_info = self._input_window.render_info if self._input_window is not None else None
+        if render_info is not None:
+            return max(1, int(render_info.window_height) - 1)
+        return max(1, self._input_window_height().max - 1)
+
+    def _move_input_to_edge(self, *, end: bool) -> None:
+        buffer = self._session.default_buffer
+        buffer.cursor_position = len(buffer.text) if end else 0
+        buffer.preferred_column = None
+        self._session.app.invalidate()
+
+    def _input_visual_positions(self) -> list[tuple[int, int]]:
+        """Return the wrapped draft row/column for every cursor position."""
+        buffer = self._session.default_buffer
+        render_info = self._input_window.render_info if self._input_window is not None else None
+        if render_info is not None:
+            width = max(1, int(render_info.window_width))
+        else:
+            try:
+                width = max(1, int(self._session.app.output.get_size().columns))
+            except Exception:
+                width = 80
+
+        text = buffer.text
+        prompt = self._prompt_text()
+        cache = self._input_visual_cache
+        if cache is not None:
+            cached_text, cached_width, cached_prompt, cached_positions = cache
+            if cached_text is text and cached_width == width and cached_prompt == prompt:
+                return cached_positions
+
+        prompt_width = min(width - 1, _text_width(prompt))
+        row = 0
+        col = 0
+        capacity = max(1, width - prompt_width)
+        positions: list[tuple[int, int]] = [(row, col)]
+        for char in text:
+            if char == "\n":
+                row += 1
+                col = 0
+                capacity = width
+                positions.append((row, col))
+                continue
+
+            char_width = max(0, get_cwidth(char))
+            if char_width > 0 and col + char_width > capacity:
+                row += 1
+                col = 0
+                capacity = width
+            col += char_width
+            while col >= capacity:
+                col -= capacity
+                row += 1
+                capacity = width
+            positions.append((row, col))
+        self._input_visual_cache = (text, width, prompt, positions)
+        return positions
+
+    def _input_has_multiple_visual_rows(self) -> bool:
+        positions = self._input_visual_positions()
+        return bool(positions and positions[-1][0] > 0)
+
+    def _move_input_visual_rows(self, delta: int) -> None:
+        """Move through wrapped screen rows instead of logical newline rows."""
+        if delta == 0:
+            return
+
+        buffer = self._session.default_buffer
+        if not buffer.text:
+            return
+
+        before = buffer.cursor_position
+        positions = self._input_visual_positions()
+        current_y, current_x = positions[before]
+        target_y = current_y + int(delta)
+        candidates: list[tuple[int, int]] = []
+        for index, (row, col) in enumerate(positions):
+            if row != target_y:
+                continue
+            if delta > 0 and index <= before:
+                continue
+            if delta < 0 and index >= before:
+                continue
+            candidates.append((abs(col - current_x), index))
+
+        if candidates:
+            _, target = min(candidates)
+            buffer.cursor_position = target
+        elif delta > 0 and before < len(buffer.text):
+            buffer.cursor_position = len(buffer.text)
+        elif delta < 0 and before > 0:
+            buffer.cursor_position = 0
+
+        buffer.preferred_column = None
+        self._session.app.invalidate()
 
     def _bound_search_window_height(self, container: Any) -> None:
         """Keep reverse-history search to one row inside the persistent layout."""

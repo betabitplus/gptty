@@ -555,6 +555,45 @@ def test_enter_applies_selected_command_completion_without_restarting_app(tmp_pa
     asyncio.run(scenario())
 
 
+def test_down_arrow_still_browses_command_completion_menu(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+
+            pipe.send_text("/")
+            await asyncio.sleep(0.05)
+            buffer = session._session.default_buffer
+            assert buffer.complete_state is not None
+            assert buffer.complete_state.current_completion is None
+
+            pipe.send_bytes(b"\x1b[B")
+            await asyncio.sleep(0.03)
+            assert buffer.complete_state is not None
+            first = buffer.complete_state.current_completion
+            assert first is not None
+            assert first.text == "/new"
+
+            pipe.send_bytes(b"\x1b[B")
+            await asyncio.sleep(0.03)
+            assert buffer.complete_state is not None
+            selected = buffer.complete_state.current_completion
+            assert selected is not None
+            assert selected.text == "/temporary"
+
+            pipe.send_text("\r")
+            assert await task == "/temporary"
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
 def test_persistent_application_survives_multiple_submits(tmp_path) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe:
@@ -659,6 +698,140 @@ def test_alt_enter_inserts_newline_before_submit(tmp_path) -> None:
         pipe.send_text("first\x1b\rsecond\r")
 
         assert session.read_prompt() == "first\nsecond"
+
+
+def test_long_draft_down_arrow_traverses_wrapped_rows_to_end(tmp_path) -> None:
+    text = (
+        "@CodexTool внимательно почитай что бы дальше продолжить работу над Sphinx\n"
+        "Needs\n"
+        "https://chatgpt.com/c/6aa71f0e-2284-83ed-a373-0050985707e1\n"
+        "https://chatgpt.com/c/6aa7f385-c678-83eb-9785-95965bb2b130\n"
+        "https://chatgpt.com/c/6aa85c3d-09d4-83eb-9747-15810cd97a65\n"
+        "https://chatgpt.com/c/6aa98224-a978-83eb-9252-dbcedae0768e\n"
+        "https://chatgpt.com/c/6aabf65a-9260-83ed-83c4-a75dfbf01582\n"
+        "https://chatgpt.com/c/6aad111b-d2f4-83ed-aec6-a6e5f3fce721\n"
+        "https://chatgpt.com/c/6aaec65c-1c5c-83ed-97b9-eaa218e1c02d\n"
+        "поясни что мы делали, нюансы с которыми столкнулись и решения которые приняли. "
+        "Далее поясни на чем мы остановили и что дальше делаем. Войди в контекст работы короче, "
+        "и будь готов продолжать. Иди последовательно и изучи всю историю целиком. "
+        "Обязательно все читай полностью через codexpro инструменты включая ссылки на чаты."
+    )
+
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80, rows=20),
+            )
+            await session.start_async()
+            buffer = session._session.default_buffer
+            buffer.text = text
+            buffer.cursor_position = 0
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+
+            positions = [0]
+            rows = [0]
+            for _ in range(24):
+                pipe.send_bytes(b"\x1b[B")
+                await asyncio.sleep(0.01)
+                positions.append(buffer.cursor_position)
+                rows.append(buffer.document.cursor_position_row)
+                if buffer.cursor_position == len(text):
+                    break
+
+            assert positions == sorted(set(positions))
+            assert buffer.cursor_position == len(text)
+            assert rows.count(9) >= 4
+            assert buffer.text == text
+
+            reverse_positions = [buffer.cursor_position]
+            for _ in range(24):
+                pipe.send_bytes(b"\x1b[A")
+                await asyncio.sleep(0.01)
+                reverse_positions.append(buffer.cursor_position)
+                if buffer.cursor_position == 0:
+                    break
+
+            assert reverse_positions == sorted(set(reverse_positions), reverse=True)
+            assert buffer.cursor_position == 0
+            assert buffer.text == text
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_long_draft_ctrl_arrows_and_ctrl_home_end_jump_to_edges(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(60, rows=16),
+            )
+            await session.start_async()
+            buffer = session._session.default_buffer
+            buffer.text = "alpha\n" + ("wrapped " * 40)
+            buffer.cursor_position = len(buffer.text) // 2
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+
+            pipe.send_bytes(b"\x1b[1;5A")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position == 0
+
+            pipe.send_bytes(b"\x1b[1;5B")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position == len(buffer.text)
+
+            pipe.send_bytes(b"\x1b[1;5H")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position == 0
+
+            pipe.send_bytes(b"\x1b[1;5F")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position == len(buffer.text)
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_long_draft_page_keys_move_inside_input_not_transcript(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(50, rows=18),
+            )
+            session.append_transcript("\n".join(f"transcript {index}" for index in range(100)))
+            await session.start_async()
+            buffer = session._session.default_buffer
+            buffer.text = "draft " * 120
+            buffer.cursor_position = 0
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            scroll_before = session._transcript_scroll_row
+
+            pipe.send_bytes(b"\x1b[6~")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position > 0
+            assert session._transcript_scroll_row == scroll_before
+
+            pipe.send_bytes(b"\x1b[5~")
+            await asyncio.sleep(0.02)
+            assert buffer.cursor_position == 0
+            assert session._transcript_scroll_row == scroll_before
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
 
 
 def test_searchable_picker_accepts_unique_fuzzy_text(tmp_path) -> None:
