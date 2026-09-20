@@ -6,6 +6,7 @@ import os
 import signal
 
 import pytest
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.data_structures import Point
@@ -698,6 +699,84 @@ def test_alt_enter_inserts_newline_before_submit(tmp_path) -> None:
         pipe.send_text("first\x1b\rsecond\r")
 
         assert session.read_prompt() == "first\nsecond"
+
+
+def test_single_line_draft_arrows_do_not_replace_text_from_history(tmp_path) -> None:
+    history = tmp_path / "history"
+    FileHistory(str(history)).append_string("previous prompt")
+
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=history,
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80, rows=20),
+            )
+            await session.start_async()
+            await asyncio.sleep(0.05)
+            buffer = session._session.default_buffer
+            buffer.text = "current draft"
+            buffer.cursor_position = len(buffer.text)
+            session.application.invalidate()
+            await asyncio.sleep(0.02)
+
+            pipe.send_bytes(b"\x1b[A")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "current draft"
+            assert buffer.cursor_position == len(buffer.text)
+
+            pipe.send_bytes(b"\x1b[B")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "current draft"
+            assert buffer.cursor_position == len(buffer.text)
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_p_n_browse_history_and_restore_current_draft(tmp_path) -> None:
+    history = tmp_path / "history"
+    file_history = FileHistory(str(history))
+    file_history.append_string("older prompt")
+    file_history.append_string("newer\nmultiline")
+
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=history,
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80, rows=20),
+            )
+            await session.start_async()
+            await asyncio.sleep(0.05)
+            buffer = session._session.default_buffer
+            buffer.text = "current draft"
+            buffer.cursor_position = len(buffer.text)
+            session.application.invalidate()
+            await asyncio.sleep(0.02)
+
+            pipe.send_bytes(b"\x10")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "newer\nmultiline"
+
+            pipe.send_bytes(b"\x10")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "older prompt"
+
+            pipe.send_bytes(b"\x0e")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "newer\nmultiline"
+
+            pipe.send_bytes(b"\x0e")
+            await asyncio.sleep(0.02)
+            assert buffer.text == "current draft"
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
 
 
 def test_long_draft_down_arrow_traverses_wrapped_rows_to_end(tmp_path) -> None:

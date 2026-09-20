@@ -389,19 +389,14 @@ class InteractiveSession:
                 return
             event.app.exit(exception=EOFError())
 
-        main_draft = Condition(
+        main_input = Condition(
             lambda: not self._picker_active
             and get_app().current_buffer is self._session.default_buffer
-            and bool(self._session.default_buffer.text)
             and self._session.default_buffer.complete_state is None
         )
+        main_draft = main_input & Condition(lambda: bool(self._session.default_buffer.text))
         visual_draft = main_draft & Condition(self._input_has_multiple_visual_rows)
-        empty_input = Condition(
-            lambda: not self._picker_active
-            and get_app().current_buffer is self._session.default_buffer
-            and not self._session.default_buffer.text
-            and self._session.default_buffer.complete_state is None
-        )
+        empty_input = main_input & Condition(lambda: not self._session.default_buffer.text)
 
         @bindings.add(Keys.PageUp, filter=visual_draft, eager=True)
         def _draft_page_up(event: Any) -> None:
@@ -427,11 +422,11 @@ class InteractiveSession:
         def _scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
-        @bindings.add(Keys.Up, filter=visual_draft, eager=True)
+        @bindings.add(Keys.Up, filter=main_draft, eager=True)
         def _draft_up(event: Any) -> None:
             self._move_input_visual_rows(-1)
 
-        @bindings.add(Keys.Down, filter=visual_draft, eager=True)
+        @bindings.add(Keys.Down, filter=main_draft, eager=True)
         def _draft_down(event: Any) -> None:
             self._move_input_visual_rows(1)
 
@@ -442,6 +437,14 @@ class InteractiveSession:
         @bindings.add(Keys.Down, filter=empty_input, eager=True)
         def _alternate_scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
+
+        @bindings.add("c-p", filter=main_input, eager=True)
+        def _history_previous(event: Any) -> None:
+            event.current_buffer.history_backward()
+
+        @bindings.add("c-n", filter=main_input, eager=True)
+        def _history_next(event: Any) -> None:
+            event.current_buffer.history_forward()
 
         @bindings.add(Keys.ControlUp, filter=visual_draft, eager=True)
         @bindings.add(Keys.ControlHome, filter=main_draft, eager=True)
@@ -573,7 +576,7 @@ class InteractiveSession:
             return
 
         buffer = self._session.default_buffer
-        if not buffer.text:
+        if not buffer.text or not self._input_has_multiple_visual_rows():
             return
 
         before = buffer.cursor_position
@@ -1112,9 +1115,9 @@ class InteractiveSession:
             )
         return _fit_toolbar(
             (
-                f" / actions · Ctrl-R history · Alt-Enter newline{scroll_suffix}",
-                f" / actions · Ctrl-R history{scroll_suffix}",
-                f" / actions{compact_scroll_suffix}",
+                f" / actions · Ctrl-P/N history · Ctrl-R search · Alt-Enter newline{scroll_suffix}",
+                f" / actions · Ctrl-P/N history · Ctrl-R search{scroll_suffix}",
+                f" / actions · Ctrl-R history{compact_scroll_suffix}",
             ),
             width,
         )
