@@ -39,6 +39,7 @@ UNFINISHED_STATUSES = {
 @dataclass(frozen=True)
 class ResumeRequest:
     conversation_ref: str
+    reload: bool = False
 
 
 class InteractiveCommands:
@@ -160,13 +161,15 @@ class InteractiveCommands:
             self.state.current_conversation = previous
             return False
 
-        self.clear_pending_media()
+        if not request.reload:
+            self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(
             conversation=attached_ref,
             model=self.state.model or "latest frontier · High",
         )
-        self.renderer.info(f"Resumed: {_short_ref(attached_ref)}")
+        action = "Reloaded" if request.reload else "Resumed"
+        self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
         if isinstance(snapshot, dict) and snapshot.get("canonical_cache_stale") is True:
@@ -209,8 +212,9 @@ class InteractiveCommands:
         return True
 
     def fail_resume(self, request: ResumeRequest, error: BaseException) -> None:
+        action = "Reload" if request.reload else "Resume"
         self.renderer.warning(
-            f"Resume failed for {_short_ref(request.conversation_ref)}: {error}"
+            f"{action} failed for {_short_ref(request.conversation_ref)}: {error}"
         )
 
     def prepare_goal_user_prompt(self, prompt: str) -> str:
@@ -597,13 +601,30 @@ class InteractiveCommands:
         self._pending_media.append(str(path))
         self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
 
-    def _begin_resume(self, ref: str) -> None:
+    def _begin_resume(self, ref: str, *, reload: bool = False) -> None:
         attached_ref = _canonical_conversation_ref(str(ref))
         if self.state.current_conversation and attached_ref != self.state.current_conversation:
             self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
-        self._pending_resume = ResumeRequest(conversation_ref=attached_ref)
-        self.renderer.info(f"Loading conversation: {_short_ref(attached_ref)}")
+        self._pending_resume = ResumeRequest(
+            conversation_ref=attached_ref,
+            reload=reload,
+        )
+        action = "Reloading" if reload else "Loading conversation"
+        self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
+
+    def _cmd_reload(self, argv: list[str]) -> None:
+        if argv:
+            self.renderer.warning("/reload takes no arguments.")
+            return
+        if self._conversation_mode == "temporary":
+            self.renderer.warning("/reload is unavailable for Temporary ChatGPT conversations.")
+            return
+        ref = self.state.current_conversation
+        if not ref:
+            self.renderer.info("No conversation is attached.")
+            return
+        self._begin_resume(ref, reload=True)
 
     def _cmd_resume(self, argv: list[str]) -> None:
         ref = argv[0] if argv else self._choose_conversation(self.get_client())

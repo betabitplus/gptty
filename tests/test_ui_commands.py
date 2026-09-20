@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from gptty.state import ChatState, GoalState, StateError, load_chat_state
+from gptty.state import ChatState, GoalState, StateError, load_chat_state, save_chat_state
 from gptty.ui.commands import InteractiveCommands
 
 
@@ -323,6 +323,81 @@ def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
     finish_pending_resume(commands, client)
     assert client.calls == [("snapshot", "direct")]
     assert load_chat_state(state_path).current_conversation == "direct"
+
+
+def test_reload_refreshes_same_chat_without_detach_or_goal_pause(tmp_path) -> None:
+    image = tmp_path / "queued.png"
+    image.write_bytes(b"png")
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            conversation_ref="conv-1",
+            status="active",
+            objective="finish it",
+        ),
+    )
+    commands, renderer, client, state_path = make_commands(tmp_path, state=state)
+    commands.handle(f"/image {image}")
+    assert commands.pending_media == [str(image)]
+
+    commands.handle("/reload")
+
+    request = commands.take_pending_resume()
+    assert request is not None
+    assert request.conversation_ref == "conv-1"
+    assert request.reload is True
+    assert state.current_conversation == "conv-1"
+    assert state.goal is not None and state.goal.status == "active"
+    assert commands.pending_media == [str(image)]
+    assert client.calls == []
+    assert ("info", "Reloading: conv-1") in renderer.events
+
+    snapshot = client.conversation_snapshot(request.conversation_ref)
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert load_chat_state(state_path).current_conversation == "conv-1"
+    assert state.goal is not None and state.goal.status == "active"
+    assert commands.pending_media == [str(image)]
+    assert ("info", "Reloaded: conv-1") in renderer.events
+
+
+def test_reload_failure_keeps_current_attachment(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
+    save_chat_state(state_path, state)
+
+    commands.handle("/reload")
+    request = commands.take_pending_resume()
+    assert request is not None and request.reload is True
+    commands.fail_resume(request, RuntimeError("snapshot failed"))
+
+    assert state.current_conversation == "conv-1"
+    assert load_chat_state(state_path).current_conversation == "conv-1"
+    assert any(
+        event[0] == "warning"
+        and event[1] == "Reload failed for conv-1: snapshot failed"
+        for event in renderer.events
+    )
+
+
+def test_reload_rejects_args_missing_attachment_and_temporary_chat(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(tmp_path)
+
+    commands.handle("/reload extra")
+    assert renderer.events[-1] == ("warning", "/reload takes no arguments.")
+    assert commands.take_pending_resume() is None
+
+    commands.handle("/reload")
+    assert renderer.events[-1] == ("info", "No conversation is attached.")
+    assert commands.take_pending_resume() is None
+
+    commands.handle("/temporary")
+    commands.handle("/reload")
+    assert renderer.events[-1] == (
+        "warning",
+        "/reload is unavailable for Temporary ChatGPT conversations.",
+    )
+    assert commands.take_pending_resume() is None
 
 
 def test_detach_is_local_only(tmp_path) -> None:

@@ -109,6 +109,7 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"/new" in menu
         assert b"/resume" in menu
         assert b"/detach" in menu
+        assert b"/reload" in menu
         assert b"/stop" in menu
         assert b"/goal" in menu
         assert b"/image" in menu

@@ -62,6 +62,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "Enter: choose chat · or <conversation-id>",
     ),
     CommandSpec("detach", "Detach locally from the current conversation"),
+    CommandSpec("reload", "Refresh the currently attached conversation"),
     CommandSpec("stop", "Stop the active ChatGPT response"),
     CommandSpec(
         "goal",
@@ -755,7 +756,7 @@ class InteractiveSession:
         )
         body = HSplit([self._transcript_window, *children])
         completion_popup = CompletionsMenu(
-            max_height=8,
+            max_height=12,
             scroll_offset=1,
             extra_filter=has_focus(self._session.default_buffer),
             display_arrows=True,

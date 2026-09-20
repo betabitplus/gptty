@@ -1163,6 +1163,7 @@ def test_command_registry_exposes_session_actions() -> None:
         "temporary",
         "resume",
         "detach",
+        "reload",
         "stop",
         "goal",
         "export",
