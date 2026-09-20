@@ -423,6 +423,9 @@ class PrettyRenderer:
         for index, message in enumerate(messages):
             if index:
                 self.console.print()
+            if message.role == "user":
+                self.console.print(_user_message_text(message.text))
+                continue
             self.console.print(Text(message.role, style="bold"))
             if self.settings.markdown and message.text:
                 self.console.print(Markdown(message.text))
@@ -437,6 +440,18 @@ class PrettyRenderer:
         if block == "tool" and previous == "tool":
             return
         self.console.print()
+
+
+def _user_message_text(value: str) -> Text:
+    lines = value.rstrip().splitlines() or [""]
+    result = Text()
+    result.append(" YOU ", style="bold reverse")
+    result.append("❯ ")
+    result.append(lines[0])
+    for line in lines[1:]:
+        result.append("\n       ")
+        result.append(line)
+    return result
 
 
 def _clean(value: Any) -> str:

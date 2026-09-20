@@ -715,7 +715,8 @@ def test_transcript_stream_records_submitted_multiline_prompt(tmp_path) -> None:
     stream.record_prompt("hello\nworld")
 
     rendered = "".join(fragment[1] for fragment in session._formatted_transcript())
-    assert rendered == "❯ hello\n  world\n"
+    assert rendered == " YOU ❯ hello\n       world\n"
+    assert session._transcript_lines[0].fragments[0] == ("bold reverse", " YOU ")
 
 
 def test_record_prompt_starts_new_line_after_unterminated_stream_fragment(tmp_path) -> None:
@@ -730,7 +731,7 @@ def test_record_prompt_starts_new_line_after_unterminated_stream_fragment(tmp_pa
     stream.record_prompt("/new")
 
     rendered = "".join(fragment[1] for fragment in session._formatted_transcript())
-    assert rendered == "FINAL_WITHOUT_NEWLINE\n❯ /new\n"
+    assert rendered == "FINAL_WITHOUT_NEWLINE\n YOU ❯ /new\n"
 
 
 def test_transcript_buffer_is_bounded(tmp_path) -> None:

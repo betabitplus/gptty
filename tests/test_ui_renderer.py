@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from io import StringIO
 
-from gptty.ui.renderer import PrettyRenderer, _format_elapsed
+from gptty.output import OutputMessage
+from gptty.ui.renderer import PrettyRenderer, _format_elapsed, _user_message_text
 from gptty.ui.state import UISettings
 
 
@@ -83,6 +84,29 @@ def test_renderer_surfaces_tool_result_labels_and_errors_without_raw_success_pay
     assert "Workspace inspection complete" in text
     assert "raw success payload" not in text
     assert "api_tool.call_tool failed · Workspace not found" in text
+
+
+def test_user_message_badge_is_high_contrast_and_multiline_aligned() -> None:
+    rendered = _user_message_text("hello\nworld")
+
+    assert rendered.plain == " YOU ❯ hello\n       world"
+    assert any(span.style == "bold reverse" for span in rendered.spans)
+
+
+def test_renderer_resume_messages_highlights_user_turns() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.messages(
+        [
+            OutputMessage(role="user", text="question\ncontinued"),
+            OutputMessage(role="assistant", text="answer"),
+        ]
+    )
+
+    text = out.getvalue()
+    assert " YOU ❯ question\n       continued" in text
+    assert "assistant\nanswer" in text
 
 
 def test_renderer_header_shows_full_chat_link() -> None:

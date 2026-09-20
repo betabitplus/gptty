@@ -373,8 +373,8 @@ class TranscriptStream:
             return
         self._session.ensure_transcript_line_boundary()
         lines = text.rstrip().splitlines() or [""]
-        rendered = [f"❯ {lines[0]}"]
-        rendered.extend(f"  {line}" for line in lines[1:])
+        rendered = [f"\x1b[1;7m YOU \x1b[0m❯ {lines[0]}"]
+        rendered.extend(f"       {line}" for line in lines[1:])
         self._session.append_transcript("\n".join(rendered) + "\n")
 
     def write_rule(self, title: str, *, style: str | None = None) -> None:
