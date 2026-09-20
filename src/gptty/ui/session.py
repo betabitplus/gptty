@@ -27,7 +27,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import CompletionsMenu, Float, FloatContainer, Layout
 from prompt_toolkit.layout.containers import HSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
+from prompt_toolkit.layout.controls import FormattedTextControl, SearchBufferControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.shortcuts import CompleteStyle, choice
@@ -332,6 +332,7 @@ class InteractiveSession:
         self._transcript_view_height = 1
         self._transcript_window: Window | None = None
         self._input_window: Window | None = None
+        self._search_window: Window | None = None
         self._transcript_control: _TranscriptControl | None = None
         self._footer_control: FormattedTextControl | None = None
         self._attachment_count = 0
@@ -467,6 +468,28 @@ class InteractiveSession:
         input_window.dont_extend_height = to_filter(True)
         self._input_window = input_window
 
+    def _bound_search_window_height(self, container: Any) -> None:
+        """Keep reverse-history search to one row inside the persistent layout."""
+        seen: set[int] = set()
+
+        def visit(node: Any) -> None:
+            node_id = id(node)
+            if node_id in seen:
+                return
+            seen.add(node_id)
+            if isinstance(node, Window) and isinstance(node.content, SearchBufferControl):
+                node.height = Dimension(min=1, max=1)
+                node.dont_extend_height = to_filter(True)
+                self._search_window = node
+            for child in getattr(node, "children", ()) or ():
+                visit(child)
+            for attr in ("content", "alternative_content"):
+                child = getattr(node, attr, None)
+                if child is not None and child is not node:
+                    visit(child)
+
+        visit(container)
+
     def _strip_inner_completion_floats(self, container: Any) -> None:
         seen: set[int] = set()
 
@@ -493,6 +516,7 @@ class InteractiveSession:
     def _install_transcript_layout(self) -> None:
         app = self._session.app
         original = app.layout.container
+        self._bound_search_window_height(original)
         self._strip_inner_completion_floats(original)
         children = list(getattr(original, "children", ()))
         self._transcript_control = _TranscriptControl(
@@ -716,6 +740,9 @@ class InteractiveSession:
             self._transcript_max_scroll,
             max(0, self._transcript_scroll_row + int(delta)),
         )
+        if delta > 0 and self._transcript_scroll_row >= self._transcript_max_scroll:
+            self._transcript_follow_tail = True
+            self._transcript_has_new_output = False
         try:
             self._session.app.invalidate()
         except Exception:
@@ -963,6 +990,26 @@ class InteractiveSession:
         # when the final cell is painted, which makes a one-line toolbar jump
         # during SIGWINCH redraws.
         return max(1, columns - 1)
+
+    async def read_image_path_async(self) -> str | None:
+        await self.start_async()
+        buffer = self._session.default_buffer
+        self._picker_previous_completer = buffer.completer
+        self._picker_previous_prompt = self._prompt_override
+        self._picker_active = True
+        self._prompt_override = "Image path: "
+        buffer.completer = PathCompleter(expanduser=True)
+        buffer.reset()
+        self._session.app.invalidate()
+        try:
+            raw = await self._next_persistent_input()
+            if raw is self._persistent_cancel:
+                return None
+            value = str(raw).strip()
+            return value or None
+        finally:
+            if self._picker_active or self._picker_previous_completer is not None:
+                self._restore_picker_state()
 
     def read_image_path(self) -> str | None:
         kwargs: dict[str, Any] = {

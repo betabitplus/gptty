@@ -96,6 +96,8 @@ class InteractiveCommands:
             return await self._cmd_resume_async()
         if name == "model" and not argv:
             return await self._cmd_model_async()
+        if name == "image" and not argv:
+            return await self._cmd_image_async()
         method = getattr(self, f"_cmd_{name}", None)
         if not callable(method):
             self.renderer.warning(f"Unknown command: /{name}. Press / for actions.")
@@ -547,17 +549,10 @@ class InteractiveCommands:
             return False
         return True
 
-    def _cmd_image(self, argv: list[str]) -> None:
-        if argv and argv[0].strip().lower() == "clear":
-            count = self.pending_media_count
-            self.clear_pending_media()
-            self.renderer.info(f"Cleared {count} pending image{'s' if count != 1 else ''}.")
-            return
-
-        raw = " ".join(argv).strip() if argv else self.ui.read_image_path()
+    def _attach_image_input(self, raw: str | None, *, from_prompt: bool) -> None:
         if not raw:
             return
-        if not argv:
+        if from_prompt:
             try:
                 parsed = shlex.split(raw)
             except ValueError as exc:
@@ -572,6 +567,20 @@ class InteractiveCommands:
         if media not in self._pending_media:
             self._pending_media.append(media)
         self.renderer.info(f"Attached for next prompt: {Path(media).name or media} · pending: {self.pending_media_count}")
+
+    def _cmd_image(self, argv: list[str]) -> None:
+        if argv and argv[0].strip().lower() == "clear":
+            count = self.pending_media_count
+            self.clear_pending_media()
+            self.renderer.info(f"Cleared {count} pending image{'s' if count != 1 else ''}.")
+            return
+
+        raw = " ".join(argv).strip() if argv else self.ui.read_image_path()
+        self._attach_image_input(raw, from_prompt=not argv)
+
+    async def _cmd_image_async(self) -> None:
+        raw = await self.ui.read_image_path_async()
+        self._attach_image_input(raw, from_prompt=True)
 
     def _cmd_paste(self, argv: list[str]) -> None:
         if argv:

@@ -24,6 +24,9 @@ class FakeUI:
     def read_image_path(self):
         return self.image_paths.pop(0) if self.image_paths else None
 
+    async def read_image_path_async(self):
+        return self.image_paths.pop(0) if self.image_paths else None
+
 
 class FakeRenderer:
     def __init__(self) -> None:
@@ -439,6 +442,17 @@ def test_image_command_without_argument_uses_path_prompt(tmp_path) -> None:
     commands, _, _, _ = make_commands(tmp_path, ui=FakeUI(image_paths=[dragged_path]))
 
     commands.handle("/image")
+
+    assert commands.pending_media == [str(image)]
+
+
+def test_async_image_command_uses_persistent_path_prompt(tmp_path) -> None:
+    image = tmp_path / "picked async image.png"
+    image.write_bytes(b"png")
+    dragged_path = str(image).replace(" ", "\\ ")
+    commands, _, _, _ = make_commands(tmp_path, ui=FakeUI(image_paths=[dragged_path]))
+
+    asyncio.run(commands.handle_async("/image"))
 
     assert commands.pending_media == [str(image)]
 

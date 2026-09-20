@@ -124,6 +124,19 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"\x1b[?1049l" not in selected
         assert b"\x1b[?1049h" not in selected
 
+        os.write(master, b"/image\r")
+        image_prompt = _read_until(master, b"Image path:", timeout=5.0)
+        assert b"Image path:" in image_prompt
+        assert b"\x1b[?1049l" not in image_prompt
+        assert b"\x1b[?1049h" not in image_prompt
+        assert process.poll() is None
+        os.write(master, b"\x1b")
+        restored = _read_until(master, "❯".encode(), timeout=5.0)
+        assert "❯".encode() in restored
+        assert b"\x1b[?1049l" not in restored
+        assert b"\x1b[?1049h" not in restored
+        assert process.poll() is None
+
         image = tmp_path / "screen shot.png"
         image.write_bytes(b"png")
         os.write(master, f'/image "{image}"\r'.encode())

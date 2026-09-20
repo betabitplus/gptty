@@ -114,6 +114,43 @@ def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
     assert session._footer_control not in [getattr(child, "content", None) for child in body.children]
 
 
+def test_reverse_history_search_keeps_transcript_geometry(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80, rows=20),
+            )
+            session.append_transcript("alpha\nbeta\ngamma\n")
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+
+            transcript_window = session._transcript_window
+            assert transcript_window is not None
+            assert transcript_window.render_info is not None
+            before_height = transcript_window.render_info.window_height
+            assert before_height == 18
+
+            pipe.send_bytes(b"\x12")
+            await asyncio.sleep(0.05)
+
+            assert session.application.layout.current_buffer.name == "SEARCH_BUFFER"
+            assert transcript_window.render_info is not None
+            assert transcript_window.render_info.window_height == before_height
+
+            pipe.send_bytes(b"\x1b")
+            await asyncio.sleep(0.12)
+            assert session.application.layout.current_buffer.name == "DEFAULT_BUFFER"
+
+            pipe.send_text("done\r")
+            assert await task == "done"
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
 def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe:
@@ -292,6 +329,30 @@ def test_scroll_up_freezes_transcript_and_marks_new_output(tmp_path) -> None:
     assert "↓ new" not in session._bottom_toolbar()
 
 
+def test_scrolling_down_to_bottom_restores_follow_tail(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    session.append_transcript("\n".join(f"line {index}" for index in range(80)))
+    session._visible_transcript(80, 20)
+    session.scroll_transcript(-8)
+    session.append_transcript("\nlate output")
+    session._visible_transcript(80, 20)
+
+    assert session._transcript_follow_tail is False
+    assert session._transcript_has_new_output is True
+
+    session.scroll_transcript(1000)
+    session._visible_transcript(80, 20)
+
+    assert session._transcript_follow_tail is True
+    assert session._transcript_has_new_output is False
+    assert session._transcript_scroll_row == session._transcript_max_scroll
+    assert "↓ new" not in session._bottom_toolbar()
+
+
 def test_transcript_mouse_wheel_scrolls_without_changing_input_focus(tmp_path) -> None:
     session = InteractiveSession(
         history_file=tmp_path / "history",
@@ -405,6 +466,60 @@ def test_picker_escape_cancels_quickly_without_restarting_app(tmp_path) -> None:
             assert await asyncio.wait_for(picker, timeout=0.2) is None
             assert session._application_task is app_task
             assert not app_task.done()
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_image_path_prompt_reuses_persistent_application(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            await session.start_async()
+            app_task = session._application_task
+            assert app_task is not None and not app_task.done()
+
+            picker = asyncio.create_task(session.read_image_path_async())
+            await asyncio.sleep(0.05)
+            assert session._picker_active is True
+            assert session._prompt_override == "Image path: "
+
+            pipe.send_text("/tmp/gptty-nonexistent-image.png\r")
+            assert await picker == "/tmp/gptty-nonexistent-image.png"
+            assert session._application_task is app_task
+            assert not app_task.done()
+            assert session._picker_active is False
+            assert session._prompt_override is None
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_image_path_prompt_escape_restores_main_prompt(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            picker = asyncio.create_task(session.read_image_path_async())
+            await asyncio.sleep(0.05)
+            app_task = session._application_task
+
+            pipe.send_bytes(b"\x1b")
+            assert await asyncio.wait_for(picker, timeout=0.2) is None
+            assert app_task is not None and not app_task.done()
+            assert session._picker_active is False
+            assert session._prompt_override is None
+
             await session.stop_async()
 
     asyncio.run(scenario())
