@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 from collections import deque
 from contextlib import suppress
@@ -12,7 +13,12 @@ from typing import Any, Callable, TextIO
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
+from prompt_toolkit.completion import (
+    ConditionalCompleter,
+    FuzzyCompleter,
+    PathCompleter,
+    WordCompleter,
+)
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, has_focus, to_filter
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
@@ -50,6 +56,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("model", "Choose a real ChatGPT model"),
     CommandSpec("exit", "Exit gptty chat"),
 )
+
+_OSC_SEQUENCE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 
 
 def _text_width(value: str) -> int:
@@ -110,6 +118,8 @@ def _compact_active_status(status: str) -> str:
 class _TranscriptLine:
     fragments: list[tuple[str, str]] = field(default_factory=list)
     chars: int = 0
+    rule_title: str | None = None
+    rule_style: str = ""
     _wrapped_width: int | None = None
     _wrapped_rows: tuple[tuple[tuple[str, str], ...], ...] = ()
 
@@ -168,6 +178,18 @@ class _TranscriptLine:
     def wrapped(self, width: int) -> tuple[tuple[tuple[str, str], ...], ...]:
         width = max(1, int(width))
         if self._wrapped_width == width:
+            return self._wrapped_rows
+        if self.rule_title is not None:
+            title = f" {self.rule_title.strip()} "
+            if _text_width(title) >= width:
+                rendered = _clip_toolbar(self.rule_title.strip(), width)
+            else:
+                remaining = width - _text_width(title)
+                left = remaining // 2
+                right = remaining - left
+                rendered = ("─" * left) + title + ("─" * right)
+            self._wrapped_width = width
+            self._wrapped_rows = (((self.rule_style, rendered),),)
             return self._wrapped_rows
         if not self.fragments:
             rows: list[list[tuple[str, str]]] = [[]]
@@ -271,6 +293,9 @@ class TranscriptStream:
         rendered.extend(f"  {line}" for line in lines[1:])
         self._session.append_transcript("\n".join(rendered) + "\n")
 
+    def write_rule(self, title: str, *, style: str | None = None) -> None:
+        self._session.append_rule(title, style=style)
+
     def flush(self) -> None:
         return None
 
@@ -326,9 +351,12 @@ class InteractiveSession:
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         command_words = [f"/{spec.name}" for spec in COMMANDS]
         meta = {f"/{spec.name}": spec.description for spec in COMMANDS}
-        completer = FuzzyCompleter(
-            WordCompleter(command_words, meta_dict=meta, sentence=True),
-            enable_fuzzy=True,
+        completer = ConditionalCompleter(
+            FuzzyCompleter(
+                WordCompleter(command_words, meta_dict=meta, sentence=True),
+                enable_fuzzy=True,
+            ),
+            Condition(lambda: get_app().current_buffer.text.startswith("/")),
         )
         self._command_completer = completer
         bindings = KeyBindings()
@@ -484,26 +512,27 @@ class InteractiveSession:
             style="reverse",
             always_hide_cursor=True,
         )
-        body = HSplit([self._transcript_window, *children, footer])
+        body = HSplit([self._transcript_window, *children])
         completion_popup = CompletionsMenu(
             max_height=8,
             scroll_offset=1,
             extra_filter=has_focus(self._session.default_buffer),
             display_arrows=True,
         )
+        completion_layer = FloatContainer(
+            content=body,
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=completion_popup,
+                    allow_cover_cursor=False,
+                    z_index=100,
+                )
+            ],
+        )
         app.layout = Layout(
-            FloatContainer(
-                content=body,
-                floats=[
-                    Float(
-                        xcursor=True,
-                        ycursor=True,
-                        content=completion_popup,
-                        allow_cover_cursor=False,
-                        z_index=100,
-                    )
-                ],
-            ),
+            HSplit([completion_layer, footer]),
             focused_element=self._session.default_buffer,
         )
         # PromptSession builds its Application/Renderer for line mode by default.
@@ -520,6 +549,7 @@ class InteractiveSession:
         if not text:
             return
         normalized = text.replace("\r\n", "\n").replace("\r", "")
+        normalized = _OSC_SEQUENCE_RE.sub("", normalized)
         if "\x1b" in normalized:
             try:
                 parsed = to_formatted_text(ANSI(normalized))
@@ -539,6 +569,28 @@ class InteractiveSession:
                 if index < len(parts) - 1:
                     self._transcript_chars += 1
                     self._transcript_lines.append(_TranscriptLine())
+        self._trim_transcript()
+        if not self._transcript_follow_tail:
+            self._transcript_has_new_output = True
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
+
+    def append_rule(self, title: str, *, style: str | None = None) -> None:
+        title = str(title).strip()
+        if not title:
+            return
+        current = self._transcript_lines[-1]
+        if current.fragments or current.rule_title is not None:
+            self._transcript_lines.append(_TranscriptLine())
+        self._transcript_lines[-1] = _TranscriptLine(
+            chars=len(title),
+            rule_title=title,
+            rule_style="fg:#888888" if style == "dim" else "",
+        )
+        self._transcript_lines.append(_TranscriptLine())
+        self._transcript_chars += len(title) + 1
         self._trim_transcript()
         if not self._transcript_follow_tail:
             self._transcript_has_new_output = True
@@ -592,7 +644,10 @@ class InteractiveSession:
         fragments: list[tuple[str, str]] = []
         lines = list(self._transcript_lines)
         for index, line in enumerate(lines):
-            fragments.extend(line.fragments)
+            if line.rule_title is not None:
+                fragments.extend(line.wrapped(max(1, self._transcript_view_width))[0])
+            else:
+                fragments.extend(line.fragments)
             if index < len(lines) - 1:
                 fragments.append(("", "\n"))
         return fragments

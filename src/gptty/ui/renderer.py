@@ -58,6 +58,13 @@ class PrettyRenderer:
         self._answer_stream_started = False
         self._answer_stream_suppressed = False
 
+    def _rule(self, title: str, *, style: str | None = None) -> None:
+        write_rule = getattr(self.stdout, "write_rule", None)
+        if callable(write_rule):
+            write_rule(title, style=style)
+            return
+        self.console.print(Rule(title, style=style))
+
     def header(
         self,
         *,
@@ -66,7 +73,7 @@ class PrettyRenderer:
         model: str | None = None,
         temporary: bool = False,
     ) -> None:
-        self.console.print(Rule("ChatGPT", style="dim"))
+        self._rule("ChatGPT", style="dim")
         details: list[str] = []
         if profile:
             details.append(f"profile: {profile}")
@@ -102,7 +109,7 @@ class PrettyRenderer:
         self._answer_state = RevisionTextState()
         self._answer_stream_started = False
         self._answer_stream_suppressed = False
-        self.console.print(Rule("working", style="dim"))
+        self._rule("working", style="dim")
         self.console.print()
         self.state = RenderState(last_block="boundary", turn_active=True)
         if show_elapsed:
@@ -292,7 +299,7 @@ class PrettyRenderer:
             return
         self.finish_elapsed()
         self.console.print()
-        self.console.print(Rule("answer"))
+        self._rule("answer")
         self.console.print()
         self._answer_stream_started = True
         self.state.last_block = "answer"
@@ -366,7 +373,7 @@ class PrettyRenderer:
             self._answer_stream_started = False
             self._answer_stream_suppressed = False
             self.console.print()
-            self.console.print(Rule("answer · final"))
+            self._rule("answer · final")
             self.console.print()
             if self.settings.markdown and text:
                 self.console.print(Markdown(text))
@@ -376,7 +383,7 @@ class PrettyRenderer:
             self.state.turn_active = False
             return
         self.console.print()
-        self.console.print(Rule("answer"))
+        self._rule("answer")
         self.console.print()
         if self.settings.markdown and text:
             self.console.print(Markdown(text))

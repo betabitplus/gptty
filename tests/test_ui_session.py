@@ -101,14 +101,17 @@ def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
     )
 
     root = session.application.layout.container
-    body = root.content
+    completion_layer = root.children[0]
+    body = completion_layer.content
+    footer = root.children[-1]
     assert session.application.full_screen is True
     assert session.application.renderer.full_screen is True
     assert session._session.mouse_support is False
     assert session._transcript_window is not None
     assert body.children[0] is session._transcript_window
-    assert body.children[-1].content is session._footer_control
-    assert body.children[-1].height == 1
+    assert footer.content is session._footer_control
+    assert footer.height == 1
+    assert session._footer_control not in [getattr(child, "content", None) for child in body.children]
 
 
 def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
@@ -221,6 +224,43 @@ def test_transcript_stream_keeps_ansi_as_formatted_text_and_can_clear(tmp_path) 
 
     stream.clear()
     assert session._formatted_transcript() == []
+
+
+def test_transcript_strips_osc8_hyperlink_controls(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+    url = "https://chatgpt.com/c/6aafcb0b-5edc-83eb-9463-ba69ebd90547"
+
+    stream.write(f"chat: \x1b]8;id=7924233;{url}\x1b\\{url}\x1b]8;;\x1b\\\n")
+
+    text = "".join(fragment[1] for fragment in session._formatted_transcript())
+    assert text == f"chat: {url}\n"
+    assert "8;id=" not in text
+
+
+def test_transcript_rules_reflow_semantically_on_resize(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(100),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+    stream.write_rule("ChatGPT", style="dim")
+
+    wide = session._visible_transcript(100, 10)
+    narrow = session._visible_transcript(44, 10)
+    wide_rule = "".join(fragment[1] for fragment in wide[0])
+    narrow_rule = "".join(fragment[1] for fragment in narrow[0])
+
+    assert "ChatGPT" in wide_rule
+    assert "ChatGPT" in narrow_rule
+    assert _text_width(wide_rule) == 100
+    assert _text_width(narrow_rule) == 44
+    assert "\n" not in narrow_rule
 
 
 def test_scroll_up_freezes_transcript_and_marks_new_output(tmp_path) -> None:
@@ -390,6 +430,9 @@ def test_enter_applies_selected_command_completion_without_restarting_app(tmp_pa
             pipe.send_text("\r")
 
             assert await task == "/new"
+            await asyncio.sleep(0.05)
+            assert session._session.default_buffer.text == ""
+            assert session._session.default_buffer.complete_state is None
             assert session._application_task is app_task
             assert not app_task.done()
             await session.stop_async()
