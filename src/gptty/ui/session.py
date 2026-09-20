@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import signal
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -12,9 +12,16 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import FuzzyCompleter, PathCompleter, WordCompleter
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import to_filter
+from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.shortcuts import CompleteStyle, choice
 from prompt_toolkit.utils import get_cwidth
 
@@ -66,39 +73,6 @@ def _clip_toolbar(value: str, width: int) -> str:
     return "".join(chars) + "…"
 
 
-def _wrap_replay_lines(lines: list[str], width: int) -> list[str]:
-    width = max(1, int(width))
-    wrapped: list[str] = []
-    for line in lines:
-        if not line:
-            wrapped.append("")
-            continue
-        if line.count("─") >= max(8, len(line) // 2):
-            label = line.strip("─ ")
-            if not label:
-                wrapped.append("─" * width)
-            elif width <= _text_width(label) + 2:
-                wrapped.append(_clip_toolbar(label, width))
-            else:
-                padding = width - _text_width(label) - 2
-                left = padding // 2
-                right = padding - left
-                wrapped.append("─" * left + f" {label} " + "─" * right)
-            continue
-        chunk: list[str] = []
-        used = 0
-        for char in line:
-            char_width = max(0, get_cwidth(char))
-            if chunk and used + char_width > width:
-                wrapped.append("".join(chunk))
-                chunk = []
-                used = 0
-            chunk.append(char)
-            used += char_width
-        wrapped.append("".join(chunk))
-    return wrapped
-
-
 def _fit_toolbar(candidates: tuple[str, ...], width: int | None) -> str:
     if not candidates:
         return ""
@@ -130,6 +104,178 @@ def _compact_active_status(status: str) -> str:
     return compact
 
 
+@dataclass
+class _TranscriptLine:
+    fragments: list[tuple[str, str]] = field(default_factory=list)
+    chars: int = 0
+    _wrapped_width: int | None = None
+    _wrapped_rows: tuple[tuple[tuple[str, str], ...], ...] = ()
+
+    def _invalidate_wrap(self) -> None:
+        self._wrapped_width = None
+        self._wrapped_rows = ()
+
+    def append(self, style: str, text: str) -> None:
+        if not text:
+            return
+        if self.fragments and self.fragments[-1][0] == style:
+            previous_style, previous_text = self.fragments[-1]
+            self.fragments[-1] = (previous_style, previous_text + text)
+        else:
+            self.fragments.append((style, text))
+        self.chars += len(text)
+        self._invalidate_wrap()
+
+    def trim_prefix(self, count: int) -> int:
+        remaining = max(0, int(count))
+        if remaining <= 0 or not self.fragments:
+            return 0
+        removed_chars = 0
+        kept: list[tuple[str, str]] = []
+        for style, text in self.fragments:
+            if remaining <= 0:
+                kept.append((style, text))
+                continue
+            if len(text) <= remaining:
+                removed_chars += len(text)
+                remaining -= len(text)
+                continue
+            removed = text[:remaining]
+            tail = text[remaining:]
+            removed_chars += len(removed)
+            remaining = 0
+            if tail:
+                kept.append((style, tail))
+        self.fragments = kept
+        self.chars = max(0, self.chars - removed_chars)
+        self._invalidate_wrap()
+        return removed_chars
+
+    @staticmethod
+    def _append_row_fragment(
+        row: list[tuple[str, str]], style: str, text: str
+    ) -> None:
+        if not text:
+            return
+        if row and row[-1][0] == style:
+            previous_style, previous_text = row[-1]
+            row[-1] = (previous_style, previous_text + text)
+        else:
+            row.append((style, text))
+
+    def wrapped(self, width: int) -> tuple[tuple[tuple[str, str], ...], ...]:
+        width = max(1, int(width))
+        if self._wrapped_width == width:
+            return self._wrapped_rows
+        if not self.fragments:
+            rows: list[list[tuple[str, str]]] = [[]]
+        else:
+            rows = [[]]
+            used = 0
+            for style, text in self.fragments:
+                segment_start = 0
+                for index, char in enumerate(text):
+                    char_width = max(0, get_cwidth(char))
+                    if used > 0 and char_width > 0 and used + char_width > width:
+                        self._append_row_fragment(
+                            rows[-1], style, text[segment_start:index]
+                        )
+                        rows.append([])
+                        used = 0
+                        segment_start = index
+                    used += char_width
+                self._append_row_fragment(rows[-1], style, text[segment_start:])
+        self._wrapped_width = width
+        self._wrapped_rows = tuple(tuple(row) for row in rows)
+        return self._wrapped_rows
+
+
+class _TranscriptControl(UIControl):
+    def __init__(
+        self,
+        content_provider: Callable[[int, int], list[list[tuple[str, str]]]],
+        *,
+        scroll_handler: Callable[[MouseEvent], object],
+    ) -> None:
+        self._content_provider = content_provider
+        self._scroll_handler = scroll_handler
+
+    def create_content(self, width: int, height: int) -> UIContent:
+        lines = self._content_provider(max(1, width), max(1, height))
+        return UIContent(
+            get_line=lambda index: lines[index],
+            line_count=len(lines),
+            show_cursor=False,
+        )
+
+    def mouse_handler(self, mouse_event: MouseEvent) -> object:
+        if mouse_event.event_type in {
+            MouseEventType.SCROLL_UP,
+            MouseEventType.SCROLL_DOWN,
+        }:
+            return self._scroll_handler(mouse_event)
+        return NotImplemented
+
+
+class TranscriptStream:
+    """Text stream that feeds the prompt_toolkit-owned transcript viewport."""
+
+    supports_rich_ansi = True
+    supports_live = False
+
+    def __init__(
+        self,
+        session: "InteractiveSession",
+        base: TextIO,
+        *,
+        stream_name: str,
+    ) -> None:
+        self._session = session
+        self._base = base
+        self._stream_name = stream_name
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._base, "encoding", None) or "utf-8"
+
+    @property
+    def errors(self) -> str:
+        return getattr(self._base, "errors", None) or "strict"
+
+    def fileno(self) -> int:
+        return self._base.fileno()
+
+    def isatty(self) -> bool:
+        # Rich ANSI is forced explicitly by PrettyRenderer. Returning False here
+        # keeps Rich Live/cursor-control output out of the transcript model.
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self._session.append_transcript(text)
+        return len(text)
+
+    def write_stream_fragment(self, text: str) -> int:
+        self._session.append_transcript(text)
+        return len(text)
+
+    def record_prompt(self, text: str) -> None:
+        if not text:
+            return
+        lines = text.rstrip().splitlines() or [""]
+        rendered = [f"❯ {lines[0]}"]
+        rendered.extend(f"  {line}" for line in lines[1:])
+        self._session.append_transcript("\n".join(rendered) + "\n")
+
+    def flush(self) -> None:
+        return None
+
+    def clear(self) -> None:
+        self._session.clear_transcript()
+
+
 class InteractiveSession:
     def __init__(
         self,
@@ -147,10 +293,19 @@ class InteractiveSession:
         self._prompt_output = prompt_output
         self._turn_controls: TurnControlSignals | None = None
         self._working_status: Callable[[], str] | None = None
-        self._resize_replay: Callable[[int], list[str]] | None = None
-        self._default_on_resize: Callable[[], None] | None = None
-        self._resize_replay_pending = False
-        self._resize_replay_handle: asyncio.TimerHandle | None = None
+        self._transcript_lines: deque[_TranscriptLine] = deque([_TranscriptLine()])
+        self._transcript_chars = 0
+        self._transcript_char_limit = 1_000_000
+        self._transcript_line_limit = 20_000
+        self._transcript_follow_tail = True
+        self._transcript_has_new_output = False
+        self._transcript_scroll_row = 0
+        self._transcript_max_scroll = 0
+        self._transcript_view_width = 1
+        self._transcript_view_height = 1
+        self._transcript_window: Window | None = None
+        self._transcript_control: _TranscriptControl | None = None
+        self._footer_control: FormattedTextControl | None = None
         self._session: PromptSession[str]
         self._build_session()
 
@@ -182,6 +337,18 @@ class InteractiveSession:
                 return
             event.app.exit(exception=EOFError())
 
+        @bindings.add(Keys.PageUp, eager=True)
+        def _page_up(event: Any) -> None:
+            self.scroll_transcript(-self._transcript_page_size())
+
+        @bindings.add(Keys.PageDown, eager=True)
+        def _page_down(event: Any) -> None:
+            self.scroll_transcript(self._transcript_page_size())
+
+        @bindings.add(Keys.ControlEnd, eager=True)
+        def _scroll_bottom(event: Any) -> None:
+            self.scroll_transcript_to_bottom()
+
         editing_mode = EditingMode.VI if self.settings.editor == "vi" else EditingMode.EMACS
         kwargs: dict[str, Any] = {
             "history": FileHistory(str(self.history_file)),
@@ -191,106 +358,210 @@ class InteractiveSession:
             "multiline": False,
             "key_bindings": bindings,
             "editing_mode": editing_mode,
-            "bottom_toolbar": self._bottom_toolbar,
+            "bottom_toolbar": None,
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
         if self._prompt_output is not None:
             kwargs["output"] = self._prompt_output
         self._session = PromptSession(**kwargs)
+        self._install_transcript_layout()
         if os.name != "nt" and hasattr(signal, "SIGWINCH"):
             # prompt_toolkit also polls terminal size every 0.5s by default.
             # On POSIX main-thread TTYs SIGWINCH is authoritative; keeping both
             # produces a second resize callback after the first redraw.
             self._session.app.terminal_size_polling_interval = None
-        self._default_on_resize = self._session.app._on_resize
-        self._session.app._on_resize = self._on_resize
 
-    def set_resize_replay(self, provider: Callable[[int], list[str]] | None) -> None:
-        self._resize_replay = provider
-
-    def _on_resize(self) -> None:
-        default = self._default_on_resize
-        provider = self._resize_replay
-        if provider is None:
-            if default is not None:
-                default()
-            return
-
+    def _install_transcript_layout(self) -> None:
         app = self._session.app
-        if getattr(app, "_running_in_terminal", False):
-            future = getattr(app, "_running_in_terminal_f", None)
-            if future is not None and not self._resize_replay_pending:
-                self._resize_replay_pending = True
-
-                def replay_after_terminal(_future: object) -> None:
-                    self._resize_replay_pending = False
-                    if not getattr(app, "is_done", False):
-                        self._schedule_resize_replay()
-
-                future.add_done_callback(replay_after_terminal)
-            return
-
-        self._schedule_resize_replay()
-
-    def _schedule_resize_replay(self) -> None:
-        handle = self._resize_replay_handle
-        if handle is not None and not handle.cancelled():
-            handle.cancel()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._perform_resize_replay()
-            return
-        self._resize_replay_handle = loop.call_later(
-            0.075,
-            self._perform_resize_replay,
+        original = app.layout.container
+        children = list(getattr(original, "children", ()))
+        self._transcript_control = _TranscriptControl(
+            self._visible_transcript,
+            scroll_handler=self._transcript_mouse_handler,
         )
+        self._transcript_window = Window(
+            content=self._transcript_control,
+            wrap_lines=False,
+            always_hide_cursor=True,
+            height=Dimension(weight=1),
+        )
+        self._footer_control = FormattedTextControl(self._bottom_toolbar)
+        footer = Window(
+            content=self._footer_control,
+            height=1,
+            style="reverse",
+            always_hide_cursor=True,
+        )
+        app.layout = Layout(
+            HSplit([self._transcript_window, *children, footer]),
+            focused_element=self._session.default_buffer,
+        )
+        app.full_screen = True
+        app.mouse_support = to_filter(True)
+        self.scroll_transcript_to_bottom()
 
-    def _perform_resize_replay(self) -> None:
-        self._resize_replay_handle = None
-        default = self._default_on_resize
-        provider = self._resize_replay
-        if provider is None:
-            if default is not None:
-                default()
+    def transcript_stream(self, base: TextIO, *, stream_name: str) -> TranscriptStream:
+        return TranscriptStream(self, base, stream_name=stream_name)
+
+    def append_transcript(self, text: str) -> None:
+        if not text:
             return
-
-        app = self._session.app
-        if getattr(app, "_running_in_terminal", False):
-            self._on_resize()
-            return
-
+        normalized = text.replace("\r\n", "\n").replace("\r", "")
+        if "\x1b" in normalized:
+            try:
+                parsed = to_formatted_text(ANSI(normalized))
+                fragments = [(style, value) for style, value, *_rest in parsed]
+            except Exception:
+                fragments = [("", normalized)]
+        else:
+            fragments = [("", normalized)]
+        for style, value in fragments:
+            if not value:
+                continue
+            parts = value.split("\n")
+            for index, part in enumerate(parts):
+                if part:
+                    self._transcript_lines[-1].append(style, part)
+                    self._transcript_chars += len(part)
+                if index < len(parts) - 1:
+                    self._transcript_chars += 1
+                    self._transcript_lines.append(_TranscriptLine())
+        self._trim_transcript()
+        if not self._transcript_follow_tail:
+            self._transcript_has_new_output = True
         try:
-            size = app.output.get_size()
-            max_rows = max(1, int(size.rows) - 3)
-            lines = provider(max_rows)
-            replay_lines = _wrap_replay_lines(lines, int(size.columns))[-max_rows:]
+            self._session.app.invalidate()
         except Exception:
-            if default is not None:
-                default()
-            return
+            pass
 
-        if not replay_lines:
-            if default is not None:
-                default()
-            return
+    def clear_transcript(self) -> None:
+        self._transcript_lines = deque([_TranscriptLine()])
+        self._transcript_chars = 0
+        self._transcript_has_new_output = False
+        self._transcript_follow_tail = True
+        self._transcript_scroll_row = 0
+        self._transcript_max_scroll = 0
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
 
-        renderer = app.renderer
-        output = app.output
-        renderer.erase(leave_alternate_screen=False)
-        output.erase_screen()
-        output.cursor_goto(0, 0)
-        output.flush()
-        renderer.reset(leave_alternate_screen=False)
+    def _trim_transcript(self) -> None:
+        width = max(1, self._transcript_view_width)
+        while len(self._transcript_lines) > 1 and (
+            self._transcript_chars > self._transcript_char_limit
+            or len(self._transcript_lines) > self._transcript_line_limit
+        ):
+            first = self._transcript_lines.popleft()
+            removed_rows = len(first.wrapped(width))
+            self._transcript_chars = max(0, self._transcript_chars - first.chars - 1)
+            if not self._transcript_follow_tail:
+                self._transcript_scroll_row = max(
+                    0, self._transcript_scroll_row - removed_rows
+                )
+        if (
+            self._transcript_chars > self._transcript_char_limit
+            and self._transcript_lines
+        ):
+            first = self._transcript_lines[0]
+            before_rows = len(first.wrapped(width))
+            excess = self._transcript_chars - self._transcript_char_limit
+            removed = first.trim_prefix(excess)
+            self._transcript_chars = max(0, self._transcript_chars - removed)
+            if not self._transcript_follow_tail and removed:
+                after_rows = len(first.wrapped(width))
+                self._transcript_scroll_row = max(
+                    0,
+                    self._transcript_scroll_row - max(0, before_rows - after_rows),
+                )
 
-        output.write("\n".join(replay_lines))
-        output.write("\n")
-        output.flush()
-        renderer.report_absolute_cursor_row(
-            min(int(size.rows), len(replay_lines) + 1)
+    def _formatted_transcript(self) -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = []
+        lines = list(self._transcript_lines)
+        for index, line in enumerate(lines):
+            fragments.extend(line.fragments)
+            if index < len(lines) - 1:
+                fragments.append(("", "\n"))
+        return fragments
+
+    def _visible_transcript(
+        self, width: int, height: int
+    ) -> list[list[tuple[str, str]]]:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        self._transcript_view_width = width
+        self._transcript_view_height = height
+        total_rows = sum(
+            len(line.wrapped(width)) for line in self._transcript_lines
         )
-        app._redraw()
+        self._transcript_max_scroll = max(0, total_rows - height)
+        if self._transcript_follow_tail:
+            self._transcript_scroll_row = self._transcript_max_scroll
+        else:
+            self._transcript_scroll_row = min(
+                self._transcript_max_scroll,
+                max(0, self._transcript_scroll_row),
+            )
+
+        start = self._transcript_scroll_row
+        visible: list[list[tuple[str, str]]] = []
+        row_cursor = 0
+        for line in self._transcript_lines:
+            wrapped = line.wrapped(width)
+            next_cursor = row_cursor + len(wrapped)
+            if next_cursor <= start:
+                row_cursor = next_cursor
+                continue
+            offset = max(0, start - row_cursor)
+            for row in wrapped[offset:]:
+                visible.append(list(row))
+                if len(visible) >= height:
+                    return visible
+            row_cursor = next_cursor
+        return visible or [[]]
+
+    def _transcript_mouse_handler(self, event: MouseEvent) -> object:
+        if event.event_type == MouseEventType.SCROLL_UP:
+            self.scroll_transcript(-3)
+            return None
+        if event.event_type == MouseEventType.SCROLL_DOWN:
+            self.scroll_transcript(3)
+            return None
+        return NotImplemented
+
+    def _transcript_page_size(self) -> int:
+        if self._transcript_view_height > 1:
+            return max(3, self._transcript_view_height - 1)
+        try:
+            rows = int(self._session.app.output.get_size().rows)
+        except Exception:
+            return 10
+        return max(3, rows - 5)
+
+    def scroll_transcript(self, delta: int) -> None:
+        if self._transcript_control is None or delta == 0:
+            return
+        if self._transcript_follow_tail:
+            self._transcript_scroll_row = self._transcript_max_scroll
+        self._transcript_follow_tail = False
+        self._transcript_scroll_row = min(
+            self._transcript_max_scroll,
+            max(0, self._transcript_scroll_row + int(delta)),
+        )
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
+
+    def scroll_transcript_to_bottom(self) -> None:
+        self._transcript_follow_tail = True
+        self._transcript_has_new_output = False
+        self._transcript_scroll_row = self._transcript_max_scroll
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
 
     def read_prompt(self, *, attachment_count: int = 0) -> str:
         marker = f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] " if attachment_count else ""
@@ -323,22 +594,32 @@ class InteractiveSession:
 
     def _bottom_toolbar(self) -> str:
         width = self._toolbar_width()
+        scroll_suffix = ""
+        compact_scroll_suffix = ""
+        if not self._transcript_follow_tail:
+            if self._transcript_has_new_output:
+                scroll_suffix = " · ↓ new · Ctrl-End bottom"
+                compact_scroll_suffix = " · ↓ new"
+            else:
+                scroll_suffix = " · Ctrl-End bottom"
+                compact_scroll_suffix = " · ↑ scroll"
         if self._turn_controls is not None or self._working_status is not None:
             status = self._working_status() if self._working_status is not None else "working"
+            compact = _compact_active_status(status)
             return _fit_toolbar(
                 (
-                    f" {status} · / commands · Ctrl-C stop · Ctrl-\\ quit",
-                    f" {status} · Ctrl-C stop",
-                    f" {_compact_active_status(status)} · Ctrl-C stop",
-                    f" {_compact_active_status(status)}",
+                    f" {status} · / commands · Ctrl-C stop · Ctrl-\\ quit{scroll_suffix}",
+                    f" {status} · Ctrl-C stop{scroll_suffix}",
+                    f" {compact} · Ctrl-C stop{compact_scroll_suffix}",
+                    f" {compact}{compact_scroll_suffix}",
                 ),
                 width,
             )
         return _fit_toolbar(
             (
-                " / actions · Ctrl-R history · Alt-Enter newline",
-                " / actions · Ctrl-R history",
-                " / actions",
+                f" / actions · Ctrl-R history · Alt-Enter newline{scroll_suffix}",
+                f" / actions · Ctrl-R history{scroll_suffix}",
+                f" / actions{compact_scroll_suffix}",
             ),
             width,
         )

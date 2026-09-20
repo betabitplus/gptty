@@ -22,6 +22,8 @@ def _read_until(fd: int, needle: bytes, *, timeout: float = 5.0) -> bytes:
         chunk = os.read(fd, 65536)
         if not chunk:
             break
+        if b"\x1b[6n" in chunk:
+            os.write(fd, b"\x1b[1;1R")
         data.extend(chunk)
     return bytes(data)
 
@@ -75,16 +77,14 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         assert b"Actions" in menu
         os.write(master, b"\r")
         selected = _read_until(master, b"Started a new conversation.", timeout=5.0)
-        assert b"\x1b[2J" in selected
-        assert b"\x1b[H" in selected
         assert b"Started a new conversation." in selected
 
         image = tmp_path / "screen shot.png"
         image.write_bytes(b"png")
         os.write(master, f'/image "{image}"\r'.encode())
-        attached = _read_until(master, b"[1 image] ", timeout=5.0)
+        attached = _read_until(master, b"Attached for next prompt", timeout=5.0)
         assert b"Attached for next prompt" in attached
-        assert b"[1 image]" in attached
+        assert b"pending: 1" in attached
 
         os.write(master, b"/image clear\r")
         cleared = _read_until(master, b"Cleared 1 pending image.", timeout=5.0)

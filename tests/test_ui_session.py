@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 import os
 import signal
@@ -7,13 +8,14 @@ import signal
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output.base import Size
 
 from gptty.ui.session import (
     COMMANDS,
     InteractiveSession,
     _text_width,
-    _wrap_replay_lines,
     should_use_enhanced_ui,
 )
 from gptty.ui.signals import TurnControlSignals
@@ -80,25 +82,6 @@ def test_pretty_on_never_forces_prompt_toolkit_into_non_tty(tmp_path) -> None:
     assert enabled is False
 
 
-def test_wrap_replay_lines_uses_terminal_display_width() -> None:
-    assert _wrap_replay_lines(["abcdefgh", "界界界", ""], 4) == [
-        "abcd",
-        "efgh",
-        "界界",
-        "界",
-        "",
-    ]
-
-
-def test_wrap_replay_lines_redraws_rich_rule_for_new_width() -> None:
-    line = "──────────── working ────────────"
-
-    wrapped = _wrap_replay_lines([line], 20)
-
-    assert wrapped == ["───── working ──────"]
-    assert _text_width(wrapped[0]) == 20
-
-
 def test_posix_session_uses_sigwinch_without_redundant_size_polling(tmp_path) -> None:
     session = InteractiveSession(
         history_file=tmp_path / "history",
@@ -109,130 +92,191 @@ def test_posix_session_uses_sigwinch_without_redundant_size_polling(tmp_path) ->
         assert session.application.terminal_size_polling_interval is None
 
 
-def test_resize_replays_recent_transcript_before_redraw(tmp_path, monkeypatch) -> None:
-    output = ResizableDummyOutput(80)
+def test_transcript_layout_is_fullscreen_with_pinned_footer(tmp_path) -> None:
     session = InteractiveSession(
         history_file=tmp_path / "history",
         settings_file=tmp_path / "ui.json",
-        prompt_output=output,
+        prompt_output=ResizableDummyOutput(80),
     )
-    requested_limits: list[int] = []
-    session.set_resize_replay(
-        lambda max_lines: requested_limits.append(max_lines) or ["one", "two"]
-    )
-    app = session.application
-    events: list[object] = []
 
-    monkeypatch.setattr(
-        app.renderer,
-        "erase",
-        lambda **kwargs: events.append(("erase", kwargs)),
-    )
-    monkeypatch.setattr(app.output, "erase_screen", lambda: events.append("erase_screen"))
-    monkeypatch.setattr(
-        app.output,
-        "cursor_goto",
-        lambda row, column: events.append(("cursor_goto", row, column)),
-    )
-    monkeypatch.setattr(app.output, "write", lambda text: events.append(("write", text)))
-    monkeypatch.setattr(app.output, "flush", lambda: events.append("flush"))
-    monkeypatch.setattr(
-        app.renderer,
-        "reset",
-        lambda **kwargs: events.append(("reset", kwargs)),
-    )
-    monkeypatch.setattr(
-        app.renderer,
-        "report_absolute_cursor_row",
-        lambda row: events.append(("cursor_row", row)),
-    )
-    monkeypatch.setattr(app, "_redraw", lambda: events.append("redraw"))
-
-    session._on_resize()
-
-    assert requested_limits == [21]
-    assert events == [
-        ("erase", {"leave_alternate_screen": False}),
-        "erase_screen",
-        ("cursor_goto", 0, 0),
-        "flush",
-        ("reset", {"leave_alternate_screen": False}),
-        ("write", "one\ntwo"),
-        ("write", "\n"),
-        "flush",
-        ("cursor_row", 3),
-        "redraw",
-    ]
+    root = session.application.layout.container
+    assert session.application.full_screen is True
+    assert session._transcript_window is not None
+    assert root.children[0] is session._transcript_window
+    assert root.children[-1].content is session._footer_control
+    assert root.children[-1].height == 1
 
 
-def test_resize_during_run_in_terminal_defers_and_coalesces_replay(
-    tmp_path, monkeypatch
-) -> None:
-    output = ResizableDummyOutput(80)
+def test_transcript_auto_follow_uses_real_bottom_not_sentinel(tmp_path) -> None:
     session = InteractiveSession(
         history_file=tmp_path / "history",
         settings_file=tmp_path / "ui.json",
-        prompt_output=output,
+        prompt_output=ResizableDummyOutput(80),
     )
-    session.set_resize_replay(lambda _max_lines: ["one"])
-    app = session.application
-    events: list[object] = []
-    callbacks: list[object] = []
+    session.append_transcript("\n".join(f"line {index}" for index in range(75)))
 
-    class Future:
-        def add_done_callback(self, callback) -> None:
-            callbacks.append(callback)
+    session._visible_transcript(80, 20)
+    assert session._transcript_max_scroll == 55
+    assert session._transcript_scroll_row == 55
 
-    app._running_in_terminal = True
-    app._running_in_terminal_f = Future()
-    monkeypatch.setattr(
-        app.renderer,
-        "erase",
-        lambda **kwargs: events.append(("erase", kwargs)),
+    session.scroll_transcript(-10)
+    assert session._transcript_follow_tail is False
+    session._visible_transcript(80, 20)
+    assert session._transcript_scroll_row == 45
+
+
+def test_transcript_control_materializes_only_viewport_rows(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
     )
-    monkeypatch.setattr(app.output, "erase_screen", lambda: events.append("erase_screen"))
-    monkeypatch.setattr(
-        app.output,
-        "cursor_goto",
-        lambda row, column: events.append(("cursor_goto", row, column)),
+    session.append_transcript("\n".join(f"line {index}" for index in range(5000)))
+    control = session._transcript_control
+    assert control is not None
+
+    content = control.create_content(width=100, height=24)
+
+    assert content.line_count == 24
+    assert session._transcript_max_scroll == 4976
+    assert session._transcript_scroll_row == 4976
+
+
+def test_transcript_stream_keeps_ansi_as_formatted_text_and_can_clear(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
     )
-    monkeypatch.setattr(app.output, "write", lambda text: events.append(("write", text)))
-    monkeypatch.setattr(app.output, "flush", lambda: events.append("flush"))
-    monkeypatch.setattr(
-        app.renderer,
-        "reset",
-        lambda **kwargs: events.append(("reset", kwargs)),
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+
+    stream.write("\x1b[31mhello\x1b[0m\n")
+
+    fragments = session._formatted_transcript()
+    assert "".join(fragment[1] for fragment in fragments) == "hello\n"
+    assert any("ansired" in fragment[0] for fragment in fragments)
+
+    stream.clear()
+    assert session._formatted_transcript() == []
+
+
+def test_scroll_up_freezes_transcript_and_marks_new_output(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
     )
-    monkeypatch.setattr(
-        app.renderer,
-        "report_absolute_cursor_row",
-        lambda row: events.append(("cursor_row", row)),
+    session.append_transcript("\n".join(f"line {index}" for index in range(80)))
+    session._visible_transcript(80, 20)
+    assert session._transcript_scroll_row == 60
+
+    session.scroll_transcript(-5)
+    assert session._transcript_scroll_row == 55
+    assert session._transcript_follow_tail is False
+
+    session.append_transcript("\nnew output")
+    session._visible_transcript(80, 20)
+
+    assert session._transcript_scroll_row == 55
+    assert session._transcript_has_new_output is True
+    assert "new" in session._bottom_toolbar()
+
+    session.scroll_transcript_to_bottom()
+    session._visible_transcript(80, 20)
+    assert session._transcript_follow_tail is True
+    assert session._transcript_has_new_output is False
+    assert session._transcript_scroll_row == session._transcript_max_scroll
+    assert "↓ new" not in session._bottom_toolbar()
+
+
+def test_transcript_mouse_wheel_scrolls_without_changing_input_focus(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
     )
-    monkeypatch.setattr(app, "_redraw", lambda: events.append("redraw"))
+    session.append_transcript("\n".join(f"line {index}" for index in range(80)))
+    session._visible_transcript(80, 20)
+    control = session._transcript_control
+    assert control is not None
+    focused = session.application.layout.current_buffer
 
-    session._on_resize()
-    session._on_resize()
+    result = control.mouse_handler(
+        MouseEvent(
+            position=Point(x=60, y=10),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+    )
 
-    assert events == []
-    assert len(callbacks) == 1
-    assert session._resize_replay_pending is True
+    assert result is None
+    assert session._transcript_scroll_row == 57
+    assert session._transcript_follow_tail is False
+    assert session.application.layout.current_buffer is focused
 
-    app._running_in_terminal = False
-    callbacks[0](None)
 
-    assert session._resize_replay_pending is False
-    assert events == [
-        ("erase", {"leave_alternate_screen": False}),
-        "erase_screen",
-        ("cursor_goto", 0, 0),
-        "flush",
-        ("reset", {"leave_alternate_screen": False}),
-        ("write", "one"),
-        ("write", "\n"),
-        "flush",
-        ("cursor_row", 2),
-        "redraw",
-    ]
+def test_raw_pageup_then_ctrl_end_toggles_transcript_follow(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            session.append_transcript("".join(f"line {i}\n" for i in range(80)))
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+
+            pipe.send_bytes(b"\x1b[5~")
+            await asyncio.sleep(0.05)
+            assert session._transcript_follow_tail is False
+
+            session.append_transcript("late output\n")
+            assert session._transcript_has_new_output is True
+            assert "↓ new" in session._bottom_toolbar()
+
+            pipe.send_bytes(b"\x1b[1;5F")
+            await asyncio.sleep(0.05)
+            assert session._transcript_follow_tail is True
+            assert session._transcript_has_new_output is False
+
+            pipe.send_text("done\r")
+            assert await task == "done"
+
+    asyncio.run(scenario())
+
+
+def test_transcript_stream_records_submitted_multiline_prompt(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+
+    stream.record_prompt("hello\nworld")
+
+    rendered = "".join(fragment[1] for fragment in session._formatted_transcript())
+    assert rendered == "❯ hello\n  world\n"
+
+
+def test_transcript_buffer_is_bounded(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    session._transcript_char_limit = 20
+
+    session.append_transcript("old line\n")
+    session.append_transcript("newer line\n")
+    session.append_transcript("latest line\n")
+
+    rendered = "".join(fragment[1] for fragment in session._formatted_transcript())
+    assert len(rendered) <= 20
+    assert "latest line" in rendered
 
 
 def test_prompt_session_reads_input_and_persists_history(tmp_path) -> None:

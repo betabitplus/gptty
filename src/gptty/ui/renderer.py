@@ -36,12 +36,21 @@ class _ElapsedStatus:
 
 
 class PrettyRenderer:
-    """Line-oriented Rich renderer that keeps normal terminal scrollback intact."""
+    """Line-oriented Rich renderer for terminal or transcript-backed output."""
 
     def __init__(self, stdout: TextIO, settings: UISettings) -> None:
         self.stdout = stdout
         self.settings = settings
-        self.console = Console(file=stdout, highlight=False, soft_wrap=False)
+        force_terminal = True if getattr(stdout, "supports_rich_ansi", False) else None
+        self.console = Console(
+            file=stdout,
+            highlight=False,
+            soft_wrap=False,
+            force_terminal=force_terminal,
+        )
+        self._supports_live = bool(
+            getattr(stdout, "supports_live", self.console.is_terminal)
+        )
         self.state = RenderState()
         self._elapsed_status: _ElapsedStatus | None = None
         self._elapsed_live: Live | None = None
@@ -80,7 +89,11 @@ class PrettyRenderer:
 
     def clear_context(self) -> None:
         self.turn_abort()
-        self.console.clear()
+        clear = getattr(self.stdout, "clear", None)
+        if callable(clear):
+            clear()
+        else:
+            self.console.clear()
         self.state = RenderState()
 
     def turn_start(self, *, show_elapsed: bool = True) -> None:
@@ -102,7 +115,7 @@ class PrettyRenderer:
             initial_elapsed=max(0.0, float(initial_elapsed)),
         )
         self.state.turn_active = True
-        if self.console.is_terminal:
+        if self._supports_live:
             self._elapsed_live = Live(
                 self._elapsed_status,
                 console=self.console,

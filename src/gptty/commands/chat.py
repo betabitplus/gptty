@@ -14,8 +14,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
-from prompt_toolkit.patch_stdout import StdoutProxy, patch_stdout
-from rich.text import Text as RichText
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
@@ -236,91 +235,6 @@ class _EnhancedFollow:
     stopped_by_user: bool = False
 
 
-class _TranscriptReplayBuffer:
-    """Keep a bounded, plain-text tail for clean terminal resize redraws."""
-
-    def __init__(self, *, max_lines: int = 400) -> None:
-        self._max_lines = max(1, int(max_lines))
-        self._lines: deque[str] = deque(maxlen=self._max_lines)
-        self._fragments: dict[str, str] = {}
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _plain_line(value: str) -> str:
-        try:
-            value = RichText.from_ansi(value).plain
-        except Exception:  # pragma: no cover - defensive fallback for malformed escapes.
-            pass
-        return value.rstrip("\r ")
-
-    def feed(self, stream_name: str, text: str) -> None:
-        if not text:
-            return
-        with self._lock:
-            pending = self._fragments.get(stream_name, "") + text
-            parts = pending.split("\n")
-            self._fragments[stream_name] = parts.pop()
-            for part in parts:
-                self._lines.append(self._plain_line(part))
-
-    def snapshot(self, max_lines: int) -> list[str]:
-        limit = max(1, int(max_lines))
-        with self._lock:
-            lines = list(self._lines)
-            for stream_name in ("stdout", "stderr"):
-                fragment = self._fragments.get(stream_name, "")
-                if fragment:
-                    lines.append(self._plain_line(fragment))
-        return lines[-limit:]
-
-
-class _PromptAwareStream:
-    """Write through prompt_toolkit's patched stdio only while its app is active."""
-
-    def __init__(
-        self,
-        base: TextIO,
-        *,
-        stream_name: str,
-        replay_buffer: _TranscriptReplayBuffer | None = None,
-    ) -> None:
-        self._base = base
-        self._stream_name = stream_name
-        self._replay_buffer = replay_buffer
-
-    def _target(self) -> TextIO:
-        current = getattr(sys, self._stream_name)
-        return current if current is not self._base else self._base
-
-    def write(self, text: str) -> int:
-        if self._replay_buffer is not None:
-            self._replay_buffer.feed(self._stream_name, text)
-        return self._target().write(text)
-
-    def write_stream_fragment(self, text: str) -> int:
-        if self._replay_buffer is not None:
-            self._replay_buffer.feed(self._stream_name, text)
-        target = self._target()
-        written = target.write(text)
-        if not isinstance(target, StdoutProxy):
-            target.flush()
-        return written
-
-    def record_prompt(self, text: str) -> None:
-        if self._replay_buffer is None or not text:
-            return
-        lines = text.rstrip().splitlines() or [""]
-        rendered = [f"❯ {lines[0]}"]
-        rendered.extend(f"  {line}" for line in lines[1:])
-        self._replay_buffer.feed("stdout", "\n".join(rendered) + "\n")
-
-    def flush(self) -> None:
-        self._target().flush()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._base, name)
-
-
 class _ThreadsafeRendererProxy:
     """Marshal PrettyRenderer method calls onto the asyncio/UI thread."""
 
@@ -505,30 +419,22 @@ def run_chat(
             settings_file=ui_settings_path(state_path),
             settings=ui_settings,
         )
-        prompt_patch_enabled = stdout is sys.stdout or stderr is sys.stderr
-        replay_buffer = (
-            _TranscriptReplayBuffer() if prompt_patch_enabled else None
-        )
-        renderer_stdout: TextIO = (
-            _PromptAwareStream(
+        prompt_patch_enabled = False
+        transcript_stream = getattr(ui, "transcript_stream", None)
+        if callable(transcript_stream):
+            renderer_stdout: TextIO = transcript_stream(
                 stdout,
                 stream_name="stdout",
-                replay_buffer=replay_buffer,
             )
-            if stdout is sys.stdout
-            else stdout
-        )
-        renderer_stderr: TextIO = (
-            _PromptAwareStream(
+            renderer_stderr: TextIO = transcript_stream(
                 stderr,
                 stream_name="stderr",
-                replay_buffer=replay_buffer,
             )
-            if stderr is sys.stderr
-            else stderr
-        )
-        if replay_buffer is not None:
-            ui.set_resize_replay(replay_buffer.snapshot)
+        else:
+            # Keep lightweight test/dummy sessions usable without requiring the
+            # full terminal transcript implementation.
+            renderer_stdout = stdout
+            renderer_stderr = stderr
         renderer = PrettyRenderer(renderer_stdout, ui_settings)
         interactive_commands = InteractiveCommands(
             state=state,
