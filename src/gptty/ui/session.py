@@ -14,6 +14,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import (
+    Completer,
+    Completion,
     ConditionalCompleter,
     FuzzyCompleter,
     PathCompleter,
@@ -38,24 +40,105 @@ from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
 
 
 @dataclass(frozen=True)
+class CommandOptionSpec:
+    value: str
+    description: str
+
+
+@dataclass(frozen=True)
 class CommandSpec:
     name: str
     description: str
+    usage: str | None = None
+    options: tuple[CommandOptionSpec, ...] = ()
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("new", "Start a new ChatGPT conversation"),
     CommandSpec("temporary", "Start a new Temporary ChatGPT conversation"),
-    CommandSpec("resume", "Resume a real ChatGPT conversation"),
+    CommandSpec(
+        "resume",
+        "Resume a real ChatGPT conversation",
+        "Enter: choose chat · or <conversation-id>",
+    ),
     CommandSpec("detach", "Detach locally from the current conversation"),
     CommandSpec("stop", "Stop the active ChatGPT response"),
-    CommandSpec("goal", "Run the current task until complete or blocked"),
+    CommandSpec(
+        "goal",
+        "Run the current task until complete or blocked",
+        "<objective> | pause | resume | status | clear",
+        (
+            CommandOptionSpec("pause", "Pause the active goal"),
+            CommandOptionSpec("resume", "Resume a paused or blocked goal"),
+            CommandOptionSpec("status", "Show goal state and turn count"),
+            CommandOptionSpec("clear", "Remove the configured goal"),
+        ),
+    ),
     CommandSpec("export", "Export the attached conversation to Markdown"),
-    CommandSpec("image", "Attach an image to the next prompt"),
+    CommandSpec(
+        "image",
+        "Attach an image to the next prompt",
+        "Enter: choose path · or clear",
+        (CommandOptionSpec("clear", "Remove pending images"),),
+    ),
     CommandSpec("paste", "Attach the clipboard image to the next prompt"),
-    CommandSpec("model", "Choose a real ChatGPT model"),
+    CommandSpec(
+        "model",
+        "Choose a real ChatGPT model",
+        "Enter: choose model · or default | <slug>",
+        (CommandOptionSpec("default", "Use latest frontier · High"),),
+    ),
     CommandSpec("exit", "Exit gptty chat"),
 )
+
+
+def _command_meta(spec: CommandSpec) -> str:
+    if spec.usage:
+        return f"{spec.description} · {spec.usage}"
+    return spec.description
+
+
+class _ContextualCommandCompleter(Completer):
+    def __init__(self, commands: tuple[CommandSpec, ...]) -> None:
+        self._commands = commands
+        self._by_name = {spec.name: spec for spec in commands}
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        text = document.text_before_cursor
+        if not text.startswith("/") or "\n" in text:
+            return
+
+        if " " not in text:
+            if text != "/":
+                return
+            for spec in self._commands:
+                yield Completion(
+                    f"/{spec.name}",
+                    start_position=-1,
+                    display=f"/{spec.name}",
+                    display_meta=_command_meta(spec),
+                )
+            return
+
+        command_token, remainder = text.split(" ", 1)
+        command_name = command_token[1:].strip().lower()
+        spec = self._by_name.get(command_name)
+        if spec is None or not spec.options:
+            return
+
+        # FuzzyCompleter strips the currently typed word before calling us.
+        # If any prior argument remains, this is no longer the first option.
+        if remainder.strip():
+            return
+
+        for option in spec.options:
+            yield Completion(
+                option.value,
+                start_position=0,
+                display=option.value,
+                display_meta=option.description,
+            )
+
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 
@@ -352,11 +435,9 @@ class InteractiveSession:
 
     def _build_session(self) -> None:
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
-        command_words = [f"/{spec.name}" for spec in COMMANDS]
-        meta = {f"/{spec.name}": spec.description for spec in COMMANDS}
         completer = ConditionalCompleter(
             FuzzyCompleter(
-                WordCompleter(command_words, meta_dict=meta, sentence=True),
+                _ContextualCommandCompleter(COMMANDS),
                 enable_fuzzy=True,
             ),
             Condition(lambda: get_app().current_buffer.text.startswith("/")),
@@ -1090,6 +1171,29 @@ class InteractiveSession:
         except Exception:
             pass
 
+    def _command_toolbar_hint(self) -> str | None:
+        if self._picker_active:
+            return None
+        buffer = self._session.default_buffer
+        text = buffer.text
+        if not text.startswith("/") or "\n" in text:
+            return None
+
+        command_token, separator, remainder = text.partition(" ")
+        command_name = command_token[1:].strip().lower()
+        spec = next((item for item in COMMANDS if item.name == command_name), None)
+        if spec is None:
+            return None
+
+        if separator and remainder.strip():
+            first_arg = remainder.strip().split()[0].lower()
+            option = next((item for item in spec.options if item.value == first_arg), None)
+            if option is not None:
+                return f" /{spec.name} {option.value} · {option.description}"
+
+        detail = spec.usage or spec.description
+        return f" /{spec.name} · {detail}"
+
     def _bottom_toolbar(self) -> str:
         width = self._toolbar_width()
         scroll_suffix = ""
@@ -1113,6 +1217,9 @@ class InteractiveSession:
                 ),
                 width,
             )
+        command_hint = self._command_toolbar_hint()
+        if command_hint is not None:
+            return _fit_toolbar((command_hint,), width)
         return _fit_toolbar(
             (
                 f" / actions · Ctrl-P/N history · Ctrl-R search · Alt-Enter newline{scroll_suffix}",
@@ -1175,7 +1282,7 @@ class InteractiveSession:
     def choose_command(self) -> str | None:
         selected = self.choose(
             "Actions",
-            [(f"/{spec.name}", f"/{spec.name:<10} {spec.description}") for spec in COMMANDS],
+            [(f"/{spec.name}", f"/{spec.name:<10} {_command_meta(spec)}") for spec in COMMANDS],
         )
         return str(selected) if selected else None
 

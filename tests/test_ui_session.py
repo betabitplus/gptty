@@ -189,8 +189,8 @@ def test_prompt_stays_at_bottom_and_grows_only_with_content(tmp_path) -> None:
             assert input_window.render_info.window_height == 8
             assert transcript_window.render_info.window_height == 31
 
-            session._session.default_buffer.text = "/"
-            session._session.default_buffer.start_completion()
+            session._session.default_buffer.reset()
+            session._session.default_buffer.insert_text("/")
             session.application.invalidate()
             await asyncio.sleep(0.05)
             assert session._session.default_buffer.complete_state is not None
@@ -590,6 +590,83 @@ def test_down_arrow_still_browses_command_completion_menu(tmp_path) -> None:
 
             pipe.send_text("\r")
             assert await task == "/temporary"
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_contextual_command_completion_exposes_usage_and_subcommands(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(120),
+            )
+            task = asyncio.create_task(session.read_prompt_async())
+            await asyncio.sleep(0.05)
+            buffer = session._session.default_buffer
+
+            pipe.send_text("/")
+            await asyncio.sleep(0.05)
+            assert buffer.complete_state is not None
+            top = {item.text: item for item in buffer.complete_state.completions}
+            assert "pause | resume | status | clear" in top["/goal"].display_meta_text
+            assert "Enter: choose chat" in top["/resume"].display_meta_text
+
+            for raw, expected in (
+                ("/goal ", ["pause", "resume", "status", "clear"]),
+                ("/goal re", ["resume"]),
+                ("/image ", ["clear"]),
+                ("/model ", ["default"]),
+            ):
+                buffer.reset()
+                buffer.insert_text(raw)
+                await asyncio.sleep(0.05)
+                assert buffer.complete_state is not None
+                assert [item.text for item in buffer.complete_state.completions] == expected
+
+            for raw in ("/resume ", "/stop ", "/export "):
+                buffer.reset()
+                buffer.insert_text(raw)
+                await asyncio.sleep(0.05)
+                assert buffer.complete_state is None
+
+            await session.stop_async()
+            task.cancel()
+
+    asyncio.run(scenario())
+
+
+def test_command_toolbar_is_contextual_and_never_hides_active_turn_status(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(120),
+            )
+            await session.start_async()
+            buffer = session._session.default_buffer
+
+            buffer.text = "/resume "
+            session.application.invalidate()
+            await asyncio.sleep(0.02)
+            assert "Enter: choose chat" in session._bottom_toolbar()
+
+            buffer.text = "/goal resume"
+            session.application.invalidate()
+            await asyncio.sleep(0.02)
+            assert "Resume a paused or blocked goal" in session._bottom_toolbar()
+
+            controls = TurnControlSignals()
+            session.set_active_turn(controls, working_status=lambda: "working · queued 1")
+            assert "working · queued 1" in session._bottom_toolbar()
+            assert "paused or blocked" not in session._bottom_toolbar()
+
+            session.set_active_turn(None)
             await session.stop_async()
 
     asyncio.run(scenario())
