@@ -7,6 +7,7 @@ import signal
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
+from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -34,6 +35,8 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.shortcuts import CompleteStyle, choice
 from prompt_toolkit.utils import get_cwidth
+from rich.console import Console
+from rich.markdown import Markdown
 
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
@@ -198,22 +201,76 @@ def _compact_active_status(status: str) -> str:
     return compact
 
 
+def _ansi_rows(value: str) -> tuple[tuple[tuple[str, str], ...], ...]:
+    if not value:
+        return ((),)
+    try:
+        parsed = to_formatted_text(ANSI(value))
+        fragments = [(style, text) for style, text, *_rest in parsed]
+    except Exception:
+        fragments = [("", value)]
+
+    rows: list[list[tuple[str, str]]] = [[]]
+    for style, text in fragments:
+        if not text:
+            continue
+        parts = text.split("\n")
+        for index, part in enumerate(parts):
+            if part:
+                _TranscriptLine._append_row_fragment(rows[-1], style, part)
+            if index < len(parts) - 1:
+                rows.append([])
+    return tuple(tuple(row) for row in rows)
+
+
+def _render_markdown_rows(
+    value: str, width: int
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """Render raw Markdown for one viewport width without freezing that width in state."""
+    width = max(1, int(width))
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+        soft_wrap=False,
+        width=width,
+        height=1_000_000,
+    )
+    console.print(Markdown(value))
+    rendered = output.getvalue()
+    rows = list(_ansi_rows(rendered))
+    # Console.print adds one terminal newline after the renderable. The transcript
+    # block itself owns content rows; the caller keeps the semantic line boundary.
+    if rendered.endswith("\n") and rows and not rows[-1]:
+        rows.pop()
+    return tuple(rows) or ((),)
+
+
 @dataclass
 class _TranscriptLine:
     fragments: list[tuple[str, str]] = field(default_factory=list)
     chars: int = 0
     rule_title: str | None = None
     rule_style: str = ""
+    markdown_text: str | None = None
     _wrapped_width: int | None = None
     _wrapped_rows: tuple[tuple[tuple[str, str], ...], ...] = ()
+    _markdown_wrapped_cache: dict[
+        int, tuple[tuple[tuple[str, str], ...], ...]
+    ] = field(default_factory=dict)
 
     def _invalidate_wrap(self) -> None:
         self._wrapped_width = None
         self._wrapped_rows = ()
+        self._markdown_wrapped_cache.clear()
 
     def append(self, style: str, text: str) -> None:
         if not text:
             return
+        if self.markdown_text is not None:
+            raise RuntimeError("cannot append terminal fragments to a Markdown transcript block")
         if self.fragments and self.fragments[-1][0] == style:
             previous_style, previous_text = self.fragments[-1]
             self.fragments[-1] = (previous_style, previous_text + text)
@@ -224,7 +281,15 @@ class _TranscriptLine:
 
     def trim_prefix(self, count: int) -> int:
         remaining = max(0, int(count))
-        if remaining <= 0 or not self.fragments:
+        if remaining <= 0:
+            return 0
+        if self.markdown_text is not None:
+            removed_chars = min(remaining, len(self.markdown_text))
+            self.markdown_text = self.markdown_text[removed_chars:]
+            self.chars = max(0, self.chars - removed_chars)
+            self._invalidate_wrap()
+            return removed_chars
+        if not self.fragments:
             return 0
         removed_chars = 0
         kept: list[tuple[str, str]] = []
@@ -263,6 +328,17 @@ class _TranscriptLine:
         width = max(1, int(width))
         if self._wrapped_width == width:
             return self._wrapped_rows
+        if self.markdown_text is not None:
+            cached = self._markdown_wrapped_cache.get(width)
+            if cached is None:
+                cached = _render_markdown_rows(self.markdown_text, width)
+                self._markdown_wrapped_cache[width] = cached
+                while len(self._markdown_wrapped_cache) > 4:
+                    oldest_width = next(iter(self._markdown_wrapped_cache))
+                    self._markdown_wrapped_cache.pop(oldest_width, None)
+            self._wrapped_width = width
+            self._wrapped_rows = cached
+            return cached
         if self.rule_title is not None:
             title = f" {self.rule_title.strip()} "
             if _text_width(title) >= width:
@@ -368,6 +444,9 @@ class TranscriptStream:
     def write_stream_fragment(self, text: str) -> int:
         self._session.append_transcript(text)
         return len(text)
+
+    def write_markdown(self, text: str) -> None:
+        self._session.append_markdown(text)
 
     def record_prompt(self, text: str) -> None:
         if not text:
@@ -819,9 +898,38 @@ class InteractiveSession:
         except Exception:
             pass
 
+    def append_markdown(self, text: str) -> None:
+        value = str(text)
+        if not value:
+            return
+        current = self._transcript_lines[-1]
+        if (
+            current.fragments
+            or current.rule_title is not None
+            or current.markdown_text is not None
+        ):
+            self._transcript_lines.append(_TranscriptLine())
+        self._transcript_lines[-1] = _TranscriptLine(
+            chars=len(value),
+            markdown_text=value,
+        )
+        self._transcript_lines.append(_TranscriptLine())
+        self._transcript_chars += len(value) + 1
+        self._trim_transcript()
+        if not self._transcript_follow_tail:
+            self._transcript_has_new_output = True
+        try:
+            self._session.app.invalidate()
+        except Exception:
+            pass
+
     def ensure_transcript_line_boundary(self) -> None:
         current = self._transcript_lines[-1]
-        if not current.fragments and current.rule_title is None:
+        if (
+            not current.fragments
+            and current.rule_title is None
+            and current.markdown_text is None
+        ):
             return
         self._transcript_chars += 1
         self._transcript_lines.append(_TranscriptLine())
@@ -832,7 +940,11 @@ class InteractiveSession:
         if not title:
             return
         current = self._transcript_lines[-1]
-        if current.fragments or current.rule_title is not None:
+        if (
+            current.fragments
+            or current.rule_title is not None
+            or current.markdown_text is not None
+        ):
             self._transcript_lines.append(_TranscriptLine())
         self._transcript_lines[-1] = _TranscriptLine(
             chars=len(title),
@@ -893,9 +1005,16 @@ class InteractiveSession:
     def _formatted_transcript(self) -> list[tuple[str, str]]:
         fragments: list[tuple[str, str]] = []
         lines = list(self._transcript_lines)
+        width = max(1, self._transcript_view_width)
         for index, line in enumerate(lines):
-            if line.rule_title is not None:
-                fragments.extend(line.wrapped(max(1, self._transcript_view_width))[0])
+            if line.markdown_text is not None:
+                rows = line.wrapped(width)
+                for row_index, row in enumerate(rows):
+                    fragments.extend(row)
+                    if row_index < len(rows) - 1:
+                        fragments.append(("", "\n"))
+            elif line.rule_title is not None:
+                fragments.extend(line.wrapped(width)[0])
             else:
                 fragments.extend(line.fragments)
             if index < len(lines) - 1:

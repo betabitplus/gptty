@@ -280,6 +280,78 @@ def test_transcript_strips_osc8_hyperlink_controls(tmp_path) -> None:
     assert "8;id=" not in text
 
 
+def test_transcript_markdown_reflows_from_raw_source_on_resize(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(177),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+    markdown = (
+        "Short answer.\n\n"
+        "- alpha\n- beta\n\n"
+        "```python\ndef hello(name):\n    return f\"hello {name}\"\n```\n\n"
+        "| Name | Value |\n|---|---|\n| Alpha | 123 |\n| Beta | 456 |\n\n"
+        "> quoted line\n> second line"
+    )
+
+    stream.write_markdown(markdown)
+
+    blocks = [line for line in session._transcript_lines if line.markdown_text is not None]
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block.markdown_text == markdown
+    assert block.fragments == []
+
+    wide = block.wrapped(177)
+    narrow = block.wrapped(88)
+    fresh_narrow = block.wrapped(88)
+
+    assert narrow is fresh_narrow
+    assert narrow != wide
+    narrow_text = "\n".join(
+        "".join(fragment[1] for fragment in row).rstrip() for row in narrow
+    )
+    assert "Short answer." in narrow_text
+    assert "• alpha" in narrow_text
+    assert "def hello(name):" in narrow_text
+    assert 'return f"hello {name}"' in narrow_text
+    assert "Alpha" in narrow_text and "123" in narrow_text
+    assert "quoted line second line" in narrow_text
+
+
+def test_transcript_markdown_short_messages_do_not_gain_blank_rows_after_resize(
+    tmp_path,
+) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(177),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+    stream.write("assistant\n")
+    stream.write_markdown("Listed available actions")
+    stream.write("\nassistant\n")
+    stream.write_markdown("SECOND_CLEAN_DONE")
+
+    def logical_rows(width: int) -> list[str]:
+        rows = session._visible_transcript(width, 40)
+        return ["".join(fragment[1] for fragment in row).rstrip() for row in rows]
+
+    wide = logical_rows(177)
+    narrow = logical_rows(88)
+
+    assert wide == narrow
+    assert narrow == [
+        "assistant",
+        "Listed available actions",
+        "",
+        "assistant",
+        "SECOND_CLEAN_DONE",
+        "",
+    ]
+
+
 def test_transcript_rules_reflow_semantically_on_resize(tmp_path) -> None:
     session = InteractiveSession(
         history_file=tmp_path / "history",

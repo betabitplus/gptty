@@ -7,6 +7,31 @@ from gptty.ui.renderer import PrettyRenderer, _format_elapsed, _user_message_tex
 from gptty.ui.state import UISettings
 
 
+class _SemanticMarkdownSink(StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.markdown_blocks: list[str] = []
+
+    def write_markdown(self, text: str) -> None:
+        self.markdown_blocks.append(text)
+
+
+def test_renderer_routes_markdown_to_semantic_transcript_sink() -> None:
+    out = _SemanticMarkdownSink()
+    renderer = PrettyRenderer(out, UISettings(markdown=True))
+
+    renderer.messages(
+        [
+            OutputMessage(role="assistant", text="**history**"),
+        ]
+    )
+    renderer.answer("**final**")
+
+    assert out.markdown_blocks == ["**history**", "**final**"]
+    assert "**history**" not in out.getvalue()
+    assert "**final**" not in out.getvalue()
+
+
 def test_renderer_separates_thinking_and_groups_tools() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))

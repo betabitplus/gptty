@@ -65,6 +65,13 @@ class PrettyRenderer:
             return
         self.console.print(Rule(title, style=style))
 
+    def _markdown(self, text: str) -> None:
+        write_markdown = getattr(self.stdout, "write_markdown", None)
+        if callable(write_markdown):
+            write_markdown(text)
+            return
+        self.console.print(Markdown(text))
+
     def header(
         self,
         *,
@@ -388,7 +395,7 @@ class PrettyRenderer:
             self._rule("answer · final")
             self.console.print()
             if self.settings.markdown and text:
-                self.console.print(Markdown(text))
+                self._markdown(text)
             else:
                 self.console.print(text)
             self.state.last_block = "answer"
@@ -398,7 +405,7 @@ class PrettyRenderer:
         self._rule("answer")
         self.console.print()
         if self.settings.markdown and text:
-            self.console.print(Markdown(text))
+            self._markdown(text)
         else:
             self.console.print(text)
         self.state.last_block = "answer"
@@ -428,7 +435,7 @@ class PrettyRenderer:
                 continue
             self.console.print(Text(message.role, style="bold"))
             if self.settings.markdown and message.text:
-                self.console.print(Markdown(message.text))
+                self._markdown(message.text)
             else:
                 self.console.print(message.text)
         self.state.last_block = "messages"
