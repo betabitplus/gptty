@@ -31,6 +31,7 @@ from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..state import ChatState, StateError, load_chat_state, save_chat_state
+from ..tui_archive import TUIArchive
 from ..ui.commands import (
     UNFINISHED_STATUSES,
     InteractiveCommands,
@@ -202,6 +203,7 @@ class _EnhancedTurn:
     media: list[str]
     started_at: float
     health: _TurnHealth
+    archive_turn_id: str | None = None
     pause_goal_after_turn: bool = False
     exit_after_turn: bool = False
 
@@ -436,12 +438,18 @@ def run_chat(
             renderer_stdout = stdout
             renderer_stderr = stderr
         renderer = PrettyRenderer(renderer_stdout, ui_settings)
+        try:
+            tui_archive: TUIArchive | None = TUIArchive()
+        except Exception as exc:  # noqa: BLE001 - archive failure must not block chat.
+            tui_archive = None
+            renderer.warning(f"TUI archive unavailable: {exc}")
         interactive_commands = InteractiveCommands(
             state=state,
             state_path=state_path,
             get_client=get_client,
             ui=ui,
             renderer=renderer,
+            tui_archive=tui_archive,
         )
         renderer.header(
             profile=getattr(args, "profile", None),
@@ -1749,6 +1757,17 @@ def _start_enhanced_turn(
     conversation_mode = commands.conversation_mode
     attached_ref = commands.conversation_ref
     goal_turn = commands.goal_active
+    archive_turn_id: str | None = None
+    if conversation_mode == "normal" and commands.tui_archive is not None:
+        try:
+            archive_turn_id = commands.tui_archive.record_user(
+                prompt,
+                conversation_ref=attached_ref,
+                model=state.model,
+                media_count=len(media),
+            )
+        except Exception as exc:  # noqa: BLE001 - local archive must never break chat.
+            renderer.warning(f"TUI archive write failed: {exc}")
     turn_result: dict[str, Any] = {}
     controls = TurnControlSignals()
     started_at = time.monotonic()
@@ -1800,6 +1819,8 @@ def _start_enhanced_turn(
             on_stop_confirmed=stop_confirmed if goal_turn else None,
             defer_final_rendering=True,
             turn_health=health,
+            tui_archive=commands.tui_archive,
+            archive_turn_id=archive_turn_id,
         )
     )
     active = _EnhancedTurn(
@@ -1810,6 +1831,7 @@ def _start_enhanced_turn(
         media=media,
         started_at=started_at,
         health=health,
+        archive_turn_id=archive_turn_id,
     )
     _refresh_active_turn_ui(ui, active, queued_prompts)
     return active
@@ -2087,6 +2109,8 @@ def _send_chat_prompt(
     on_stop_confirmed: Callable[[str | None], None] | None = None,
     defer_final_rendering: bool = False,
     turn_health: _TurnHealth | None = None,
+    tui_archive: TUIArchive | None = None,
+    archive_turn_id: str | None = None,
 ) -> int:
     if result_out is not None:
         result_out.clear()
@@ -2165,6 +2189,19 @@ def _send_chat_prompt(
                 write_conversation_ref = candidate.strip()
                 if not is_temporary and not active_ref:
                     active_ref = write_conversation_ref
+                if (
+                    not is_temporary
+                    and tui_archive is not None
+                    and archive_turn_id
+                ):
+                    try:
+                        tui_archive.bind_turn(
+                            archive_turn_id,
+                            write_conversation_ref,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - archive is best-effort.
+                        if renderer is not None:
+                            renderer.warning(f"TUI archive bind failed: {exc}")
             if event_type == "browser_native_write_completed":
                 write_committed.set()
         if stopped_by_user or local_quit_requested:
@@ -2446,6 +2483,33 @@ def _send_chat_prompt(
             print(text, file=stdout)
 
         conversation_ref = extract_conversation_ref(response) or active_ref
+        if (
+            not is_temporary
+            and conversation_ref
+            and tui_archive is not None
+            and archive_turn_id
+        ):
+            archive_status = (
+                "stopped"
+                if stopped_by_user
+                else "incomplete"
+                if incomplete_turn
+                else "complete"
+            )
+            try:
+                tui_archive.record_assistant(
+                    archive_turn_id,
+                    conversation_ref=conversation_ref,
+                    text=rendered_text,
+                    title=response_title(response),
+                    model=model,
+                    status=archive_status,
+                )
+            except Exception as exc:  # noqa: BLE001 - local archive is best-effort.
+                if renderer is not None:
+                    renderer.warning(f"TUI archive write failed: {exc}")
+                else:
+                    print(f"gptty: TUI archive write failed: {exc}", file=stderr)
         if is_temporary:
             if temporary_turn_recorder is not None:
                 temporary_turn_recorder(

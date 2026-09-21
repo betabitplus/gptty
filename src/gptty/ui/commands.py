@@ -22,6 +22,7 @@ from ..goal import (
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
 from ..state import ChatState, GoalState, StateError, save_chat_state
+from ..tui_archive import TUIArchive
 from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
@@ -51,12 +52,14 @@ class InteractiveCommands:
         get_client: Callable[[], Any],
         ui: InteractiveSession,
         renderer: PrettyRenderer,
+        tui_archive: TUIArchive | None = None,
     ) -> None:
         self.state = state
         self.state_path = state_path
         self.get_client = get_client
         self.ui = ui
         self.renderer = renderer
+        self.tui_archive = tui_archive
         self._pending_media: list[str] = []
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
