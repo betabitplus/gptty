@@ -101,6 +101,27 @@ class PrettyRenderer:
         line.append(url, style=f"underline link {url}")
         self.console.print(line)
 
+    def answer_model(
+        self,
+        observed_model: str | None,
+        *,
+        requested_model: str | None = None,
+        sent_model: str | None = None,
+    ) -> None:
+        observed = str(observed_model or "").strip()
+        requested = str(requested_model or "").strip()
+        sent = str(sent_model or "").strip()
+
+        line = Text("model: ", style="dim")
+        line.append(observed or "unknown")
+        if requested and requested != observed:
+            line.append(" · requested: ", style="dim")
+            line.append(requested)
+        if sent and sent not in {observed, requested}:
+            line.append(" · sent: ", style="dim")
+            line.append(sent)
+        self.console.print(line)
+
     def clear_context(self) -> None:
         self.turn_abort()
         clear = getattr(self.stdout, "clear", None)

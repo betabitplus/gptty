@@ -145,6 +145,28 @@ def test_renderer_header_shows_full_chat_link() -> None:
     assert "latest frontier · High" in text
 
 
+def test_renderer_answer_model_shows_observed_model_and_mismatch() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.answer_model(
+        "gpt-5-4-thinking",
+        requested_model="gpt-5-6-thinking",
+        sent_model="gpt-5-6-thinking",
+    )
+
+    assert out.getvalue() == "model: gpt-5-4-thinking · requested: gpt-5-6-thinking\n"
+
+
+def test_renderer_answer_model_is_explicit_when_observation_is_missing() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.answer_model(None, requested_model="gpt-5-6-thinking")
+
+    assert out.getvalue() == "model: unknown · requested: gpt-5-6-thinking\n"
+
+
 def test_elapsed_format_scales_to_hours() -> None:
     assert _format_elapsed(0) == "00:00"
     assert _format_elapsed(65.9) == "01:05"

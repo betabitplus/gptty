@@ -362,6 +362,23 @@ def response_finish_reason(response: Any) -> str | None:
     return normalized or None
 
 
+def response_model_diagnostics(response: Any) -> tuple[str | None, str | None, str | None]:
+    request = (
+        response.get("request")
+        if isinstance(response, dict)
+        else getattr(response, "request", None)
+    )
+
+    def field(name: str) -> str | None:
+        value = request.get(name) if isinstance(request, dict) else getattr(request, name, None)
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    return field("observed_model"), field("requested_model"), field("sent_model")
+
+
 def run_chat(
     args: Any,
     *,
@@ -1678,6 +1695,11 @@ async def _finish_enhanced_turn(
         )
     else:
         renderer.answer(final_text)
+        renderer.answer_model(
+            turn.result.get("observed_model"),
+            requested_model=turn.result.get("requested_model"),
+            sent_model=turn.result.get("sent_model"),
+        )
     if stopped_by_user:
         renderer.info("Stopped by user.")
         if queued_prompts:
@@ -2457,6 +2479,7 @@ def _send_chat_prompt(
         text = response_text(response)
         rendered_text = text or "".join(stream_tokens)
         finish_reason = response_finish_reason(response)
+        observed_model, requested_model, sent_model = response_model_diagnostics(response)
         incomplete_turn = finish_reason == "incomplete"
         if renderer is not None and not defer_final_rendering:
             if incomplete_turn:
@@ -2502,7 +2525,7 @@ def _send_chat_prompt(
                     conversation_ref=conversation_ref,
                     text=rendered_text,
                     title=response_title(response),
-                    model=model,
+                    model=observed_model or sent_model or model,
                     status=archive_status,
                 )
             except Exception as exc:  # noqa: BLE001 - local archive is best-effort.
@@ -2548,6 +2571,9 @@ def _send_chat_prompt(
                 title=response_title(response),
                 conversation_ref=conversation_ref,
                 finish_reason=finish_reason,
+                observed_model=observed_model,
+                requested_model=requested_model,
+                sent_model=sent_model,
                 stopped_by_user=stopped_by_user,
                 incomplete_without_terminal=incomplete_turn,
                 is_temporary=is_temporary,

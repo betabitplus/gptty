@@ -80,6 +80,24 @@ class _FakeRenderer:
     def answer(self, text: str) -> None:
         self.events.append(("answer", text))
 
+    def answer_model(
+        self,
+        observed_model: str | None,
+        *,
+        requested_model: str | None = None,
+        sent_model: str | None = None,
+    ) -> None:
+        self.events.append(
+            (
+                "answer_model",
+                {
+                    "observed_model": observed_model,
+                    "requested_model": requested_model,
+                    "sent_model": sent_model,
+                },
+            )
+        )
+
     def chat_link(self, ref: str) -> None:
         self.events.append(("chat_link", ref))
 

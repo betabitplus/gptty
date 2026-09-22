@@ -10,6 +10,7 @@ from gptty.commands.chat import (
     LOCAL_QUIT_CODE,
     _send_chat_prompt,
     extract_conversation_ref,
+    response_model_diagnostics,
     run_chat,
 )
 from gptty.state import ChatState, load_chat_state, save_chat_state
@@ -120,6 +121,22 @@ def test_first_prompt_persists_nested_cwa_conversation_shape(tmp_path) -> None:
 
     assert code == 0
     assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "nested-conv"
+
+
+def test_response_model_diagnostics_reads_cwa_request_metadata() -> None:
+    response = SimpleNamespace(
+        request=SimpleNamespace(
+            observed_model="gpt-5-4-thinking",
+            requested_model="gpt-5-6-thinking",
+            sent_model="gpt-5-6-thinking",
+        )
+    )
+
+    assert response_model_diagnostics(response) == (
+        "gpt-5-4-thinking",
+        "gpt-5-6-thinking",
+        "gpt-5-6-thinking",
+    )
 
 
 def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
