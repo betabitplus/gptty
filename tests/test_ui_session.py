@@ -482,6 +482,38 @@ def test_alternate_scroll_cursor_key_scrolls_transcript(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_alternate_scroll_still_scrolls_with_single_line_draft(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            session.append_transcript("".join(f"line {i}\n" for i in range(80)))
+            await session.start_async()
+            buffer = session._session.default_buffer
+            buffer.text = "draft message"
+            buffer.cursor_position = len(buffer.text)
+            session.application.invalidate()
+            await asyncio.sleep(0.05)
+            before = session._transcript_scroll_row
+            cursor_before = buffer.cursor_position
+
+            pipe.send_bytes(b"\x1b[A")
+            await asyncio.sleep(0.05)
+
+            assert session._transcript_follow_tail is False
+            assert session._transcript_scroll_row == before - 3
+            assert buffer.text == "draft message"
+            assert buffer.cursor_position == cursor_before
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
 def test_raw_pageup_then_ctrl_end_toggles_transcript_follow(tmp_path) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe:

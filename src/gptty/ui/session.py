@@ -557,6 +557,10 @@ class InteractiveSession:
         )
         main_draft = main_input & Condition(lambda: bool(self._session.default_buffer.text))
         visual_draft = main_draft & Condition(self._input_has_multiple_visual_rows)
+        # DECSET 1007 delivers wheel motion as Up/Down keys. A single visual
+        # draft row has no vertical cursor navigation to preserve, so keep wheel
+        # scrolling attached to the transcript until the draft actually wraps.
+        transcript_arrow_scroll = main_input & ~visual_draft
         empty_input = main_input & Condition(lambda: not self._session.default_buffer.text)
 
         @bindings.add(Keys.PageUp, filter=visual_draft, eager=True)
@@ -583,19 +587,19 @@ class InteractiveSession:
         def _scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
-        @bindings.add(Keys.Up, filter=main_draft, eager=True)
+        @bindings.add(Keys.Up, filter=visual_draft, eager=True)
         def _draft_up(event: Any) -> None:
             self._move_input_visual_rows(-1)
 
-        @bindings.add(Keys.Down, filter=main_draft, eager=True)
+        @bindings.add(Keys.Down, filter=visual_draft, eager=True)
         def _draft_down(event: Any) -> None:
             self._move_input_visual_rows(1)
 
-        @bindings.add(Keys.Up, filter=empty_input, eager=True)
+        @bindings.add(Keys.Up, filter=transcript_arrow_scroll, eager=True)
         def _alternate_scroll_up(event: Any) -> None:
             self.scroll_transcript(-3)
 
-        @bindings.add(Keys.Down, filter=empty_input, eager=True)
+        @bindings.add(Keys.Down, filter=transcript_arrow_scroll, eager=True)
         def _alternate_scroll_down(event: Any) -> None:
             self.scroll_transcript(3)
 
