@@ -122,6 +122,17 @@ class PrettyRenderer:
             line.append(sent)
         self.console.print(line)
 
+    def turn_marker(self, label: str, status: str, message: str) -> None:
+        prefix = str(label or "turn").strip() or "turn"
+        state = str(status or "abnormal").strip() or "abnormal"
+        detail = str(message or "").strip()
+        line = Text(f"{prefix}: ", style="dim")
+        line.append(state, style="bold")
+        if detail:
+            line.append(" · ", style="dim")
+            line.append(detail)
+        self.console.print(line)
+
     def clear_context(self) -> None:
         self.turn_abort()
         clear = getattr(self.stdout, "clear", None)

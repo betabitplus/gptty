@@ -120,6 +120,33 @@ class TUIArchive:
         self._write_meta(conversation_id, title=title)
         self._refresh_projection(conversation_id)
 
+    def record_terminal(
+        self,
+        turn_id: str,
+        *,
+        conversation_ref: str,
+        label: str,
+        status: str,
+        text: str,
+        source: str | None = None,
+    ) -> None:
+        conversation_id = self.bind_turn(turn_id, conversation_ref)
+        event = {
+            "schema": 1,
+            "event_id": f"{turn_id}:terminal",
+            "turn_id": turn_id,
+            "observed_at": _now_iso(),
+            "source": "gptty-tui",
+            "scope": "tui-observed",
+            "role": str(label or "turn").strip() or "turn",
+            "text": text,
+            "status": status,
+            "terminal_source": source,
+            "conversation_id": conversation_id,
+        }
+        self._append_conversation_event(conversation_id, event)
+        self._refresh_projection(conversation_id)
+
     def conversation_paths(self, conversation_ref: str) -> dict[str, Path]:
         conversation_id = _conversation_id(conversation_ref)
         directory = self.conversations_dir / conversation_id

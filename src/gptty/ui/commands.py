@@ -197,15 +197,32 @@ class InteractiveCommands:
                 snapshot.get("canonical_status_before_override") or "unfinished"
             ).strip()
             if snapshot.get("canonical_terminal_text_missing") is True:
-                self.renderer.warning(
-                    f"Backend reports {backend_status}; canonical status={canonical_status} is stale. "
-                    "Opened chat idle; final assistant text is not yet present in canonical history."
+                self.renderer.turn_marker(
+                    "turn",
+                    "unresolved",
+                    "ChatGPT is terminal, but canonical history contains no final assistant response.",
                 )
             else:
                 self.renderer.info(
                     f"Backend reports {backend_status}; ignored stale canonical status={canonical_status}."
                 )
         status = _snapshot_status(snapshot)
+        if (
+            status not in UNFINISHED_STATUSES
+            and status != "awaiting_tool_approval"
+            and messages
+            and _field_text(messages[-1], "role") == "user"
+            and not (
+                isinstance(snapshot, dict)
+                and snapshot.get("canonical_terminal_text_missing") is True
+                and snapshot.get("backend_terminal_status_proven") is True
+            )
+        ):
+            self.renderer.turn_marker(
+                "turn",
+                "unresolved",
+                "Canonical history ends after a user message; no final assistant response is recorded.",
+            )
         if status == "awaiting_tool_approval":
             self.renderer.warning("Conversation is waiting for tool approval.")
         elif status in UNFINISHED_STATUSES:

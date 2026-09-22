@@ -167,6 +167,23 @@ def test_renderer_answer_model_is_explicit_when_observation_is_missing() -> None
     assert out.getvalue() == "model: unknown · requested: gpt-5-6-thinking\n"
 
 
+def test_renderer_turn_marker_is_persistent_metadata_line() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.turn_marker(
+        "turn",
+        "unconfirmed",
+        "A final ChatGPT completion was not observed; this turn may be incomplete.",
+    )
+
+    rendered = " ".join(out.getvalue().split())
+    assert rendered == (
+        "turn: unconfirmed · A final ChatGPT completion was not observed; "
+        "this turn may be incomplete."
+    )
+
+
 def test_elapsed_format_scales_to_hours() -> None:
     assert _format_elapsed(0) == "00:00"
     assert _format_elapsed(65.9) == "01:05"

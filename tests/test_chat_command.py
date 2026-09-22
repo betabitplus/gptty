@@ -9,8 +9,11 @@ from typing import Any, ClassVar
 from gptty.commands.chat import (
     LOCAL_QUIT_CODE,
     _send_chat_prompt,
+    _turn_failure_marker,
+    _turn_terminal_marker,
     extract_conversation_ref,
     response_model_diagnostics,
+    response_terminal_diagnostics,
     run_chat,
 )
 from gptty.state import ChatState, load_chat_state, save_chat_state
@@ -136,6 +139,57 @@ def test_response_model_diagnostics_reads_cwa_request_metadata() -> None:
         "gpt-5-4-thinking",
         "gpt-5-6-thinking",
         "gpt-5-6-thinking",
+    )
+
+
+def test_terminal_diagnostics_distinguish_proof_from_finish_reason() -> None:
+    response = SimpleNamespace(
+        conversation=SimpleNamespace(finish_reason="stop"),
+        request=SimpleNamespace(terminal_observed=False, terminal_source=None),
+    )
+
+    assert response_terminal_diagnostics(response) == (False, None)
+    assert _turn_terminal_marker(
+        finish_reason="stop",
+        terminal_observed=False,
+    ) == (
+        "turn",
+        "unconfirmed",
+        "A final ChatGPT completion was not observed; this turn may be incomplete.",
+    )
+
+
+def test_terminal_marker_classifies_known_nonstandard_finishes() -> None:
+    assert _turn_terminal_marker(
+        finish_reason="stop",
+        terminal_observed=True,
+    ) is None
+    assert _turn_terminal_marker(
+        finish_reason="max_tokens",
+        terminal_observed=True,
+    ) == (
+        "turn",
+        "truncated",
+        "ChatGPT ended the response at an output-length limit.",
+    )
+    assert _turn_terminal_marker(
+        finish_reason="content_filter",
+        terminal_observed=True,
+    ) == (
+        "turn",
+        "filtered",
+        "ChatGPT ended the response because of a content/safety filter.",
+    )
+
+
+def test_failure_marker_classifies_conversation_length_limit() -> None:
+    marker = _turn_failure_marker(
+        RuntimeError("maximum length reached; start a new chat to continue")
+    )
+    assert marker == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its length limit; start a new chat to continue.",
     )
 
 

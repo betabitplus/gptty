@@ -109,3 +109,32 @@ def test_stopped_answer_remains_local_observation(tmp_path) -> None:
         encoding="utf-8"
     )
     assert "## ASSISTANT — stopped" in transcript
+
+
+def test_terminal_marker_is_persisted_as_separate_archive_event(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "question",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+
+    archive.record_terminal(
+        turn_id,
+        conversation_ref="conv-12345678",
+        label="turn",
+        status="unconfirmed",
+        text="A final ChatGPT completion was not observed; this turn may be incomplete.",
+        source="stream",
+    )
+
+    events = _events(archive, "conv-12345678")
+    assert events[-1]["event_id"] == f"{turn_id}:terminal"
+    assert events[-1]["role"] == "turn"
+    assert events[-1]["status"] == "unconfirmed"
+    assert events[-1]["terminal_source"] == "stream"
+    transcript = archive.conversation_paths("conv-12345678")["transcript"].read_text(
+        encoding="utf-8"
+    )
+    assert "## TURN — unconfirmed" in transcript
+    assert "A final ChatGPT completion was not observed" in transcript

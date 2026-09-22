@@ -56,6 +56,14 @@ class FakeRenderer:
     def warning(self, text):
         self.events.append(("warning", text))
 
+    def turn_marker(self, label, status, message):
+        self.events.append(
+            (
+                "turn_marker",
+                {"label": label, "status": status, "message": message},
+            )
+        )
+
     def messages(self, messages):
         self.events.append(("messages", messages))
 
@@ -255,12 +263,43 @@ def test_resume_terminal_backend_override_opens_idle_and_warns_about_missing_fin
         },
     )
 
-    warnings = [event[1] for event in renderer.events if event[0] == "warning"]
-    assert warnings == [
-        "Backend reports COMPLETE; canonical status=tool_running is stale. "
-        "Opened chat idle; final assistant text is not yet present in canonical history."
+    markers = [event[1] for event in renderer.events if event[0] == "turn_marker"]
+    assert markers == [
+        {
+            "label": "turn",
+            "status": "unresolved",
+            "message": "ChatGPT is terminal, but canonical history contains no final assistant response.",
+        }
     ]
+    warnings = [event[1] for event in renderer.events if event[0] == "warning"]
     assert not any("unfinished turn" in warning for warning in warnings)
+
+
+def test_resume_completed_user_tail_marks_historical_turn_unresolved(tmp_path) -> None:
+    commands, renderer, _client, _state_path = make_commands(tmp_path)
+
+    commands.handle("/resume conv-user-tail")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.complete_resume(
+        request,
+        {
+            "status": SimpleNamespace(status="completed"),
+            "messages": [
+                {"message_id": "a1", "role": "assistant", "text": "previous answer"},
+                {"message_id": "u2", "role": "user", "text": "unanswered question"},
+            ],
+        },
+    )
+
+    markers = [event[1] for event in renderer.events if event[0] == "turn_marker"]
+    assert markers == [
+        {
+            "label": "turn",
+            "status": "unresolved",
+            "message": "Canonical history ends after a user message; no final assistant response is recorded.",
+        }
+    ]
 
 
 def test_resume_terminal_backend_override_with_recovered_final_is_informational(

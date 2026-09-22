@@ -379,6 +379,131 @@ def response_model_diagnostics(response: Any) -> tuple[str | None, str | None, s
     return field("observed_model"), field("requested_model"), field("sent_model")
 
 
+_NORMAL_FINISH_REASONS = {
+    "stop",
+    "end_turn",
+    "completed",
+    "complete",
+    "finished",
+    "done",
+    "success",
+    "succeeded",
+    "finished_successfully",
+}
+_OUTPUT_LIMIT_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens", "max_length"}
+_FILTER_FINISH_REASONS = {"content_filter", "safety", "blocked"}
+
+
+def response_terminal_diagnostics(response: Any) -> tuple[bool | None, str | None]:
+    request = (
+        response.get("request")
+        if isinstance(response, dict)
+        else getattr(response, "request", None)
+    )
+    if request is None:
+        return None, None
+    raw_observed = (
+        request.get("terminal_observed")
+        if isinstance(request, dict)
+        else getattr(request, "terminal_observed", None)
+    )
+    observed = raw_observed if isinstance(raw_observed, bool) else None
+    raw_source = (
+        request.get("terminal_source")
+        if isinstance(request, dict)
+        else getattr(request, "terminal_source", None)
+    )
+    source = raw_source.strip() if isinstance(raw_source, str) and raw_source.strip() else None
+    return observed, source
+
+
+def _turn_terminal_marker(
+    *,
+    finish_reason: str | None,
+    terminal_observed: bool | None,
+    stopped_by_user: bool = False,
+) -> tuple[str, str, str] | None:
+    if stopped_by_user:
+        return None
+    reason = str(finish_reason or "").strip().lower()
+    if reason == "incomplete":
+        return (
+            "turn",
+            "incomplete",
+            "ChatGPT stream ended before a final assistant completion.",
+        )
+    if reason in _OUTPUT_LIMIT_FINISH_REASONS:
+        return (
+            "turn",
+            "truncated",
+            "ChatGPT ended the response at an output-length limit.",
+        )
+    if reason in _FILTER_FINISH_REASONS:
+        return (
+            "turn",
+            "filtered",
+            "ChatGPT ended the response because of a content/safety filter.",
+        )
+    if terminal_observed is False:
+        return (
+            "turn",
+            "unconfirmed",
+            "A final ChatGPT completion was not observed; this turn may be incomplete.",
+        )
+    if terminal_observed is True and reason and reason not in _NORMAL_FINISH_REASONS:
+        return (
+            "turn",
+            "abnormal",
+            f"ChatGPT ended with terminal reason {reason!r}.",
+        )
+    return None
+
+
+def _turn_failure_marker(error: BaseException) -> tuple[str, str, str]:
+    message = str(error).strip()
+    normalized = message.casefold()
+    if any(
+        token in normalized
+        for token in (
+            "maximum length",
+            "max conversation",
+            "conversation too long",
+            "conversation length",
+            "conversation_limit_exceeded",
+            "conversation limit exceeded",
+            "start a new chat",
+            "new chat to continue",
+            "context length",
+        )
+    ):
+        return (
+            "chat",
+            "limit-reached",
+            "This conversation reached its length limit; start a new chat to continue.",
+        )
+    if "429" in normalized or "rate limit" in normalized:
+        return ("turn", "rate-limited", "ChatGPT rate-limited this turn before final completion.")
+    if any(token in normalized for token in ("turnstile", "verify you are human", "verification")):
+        return (
+            "turn",
+            "blocked",
+            "ChatGPT requires browser verification before this turn can continue.",
+        )
+    if "handoff" in normalized and any(token in normalized for token in ("final", "completed", "recovery")):
+        return (
+            "turn",
+            "unconfirmed",
+            "Stream handoff did not reach a confirmed final assistant completion.",
+        )
+    if "timeout" in normalized or "timed out" in normalized:
+        return (
+            "turn",
+            "failed",
+            "Response transport timed out before a final assistant completion was confirmed.",
+        )
+    return ("turn", "failed", "ChatGPT request ended with an error before final completion.")
+
+
 def run_chat(
     args: Any,
     *,
@@ -1680,6 +1805,9 @@ async def _finish_enhanced_turn(
         return _EnhancedLoopOutcome(exit_code=0)
     if code != 0:
         renderer.turn_abort()
+        marker = turn.result.get("terminal_marker")
+        if isinstance(marker, (tuple, list)) and len(marker) == 3:
+            renderer.turn_marker(str(marker[0]), str(marker[1]), str(marker[2]))
         if turn.goal_turn:
             commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
         await _cancel_prompt_task(prompt_task)
@@ -1688,11 +1816,15 @@ async def _finish_enhanced_turn(
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
     stopped_by_user = bool(turn.result.get("stopped_by_user"))
     final_text = str(turn.result.get("text") or "")
+    marker = turn.result.get("terminal_marker")
+    terminal_marker = (
+        (str(marker[0]), str(marker[1]), str(marker[2]))
+        if isinstance(marker, (tuple, list)) and len(marker) == 3
+        else None
+    )
+    abnormal_turn = terminal_marker is not None
     if incomplete_turn:
         renderer.turn_abort()
-        renderer.warning(
-            "ChatGPT stream ended without a final answer; returned control to gptty."
-        )
     else:
         renderer.answer(final_text)
         renderer.answer_model(
@@ -1700,6 +1832,8 @@ async def _finish_enhanced_turn(
             requested_model=turn.result.get("requested_model"),
             sent_model=turn.result.get("sent_model"),
         )
+    if terminal_marker is not None:
+        renderer.turn_marker(*terminal_marker)
     if stopped_by_user:
         renderer.info("Stopped by user.")
         if queued_prompts:
@@ -1718,17 +1852,17 @@ async def _finish_enhanced_turn(
         commands.clear_automatic_prompts()
 
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
-    if incomplete_turn:
+    if abnormal_turn:
         queued_count = len(queued_prompts)
         queued_prompts.clear()
         commands.clear_automatic_prompts()
         if queued_count:
             renderer.info(
-                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after incomplete turn."
+                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after abnormal turn."
             )
         if turn.goal_turn:
             commands.handle_goal_interruption(
-                "ChatGPT stream ended without a final answer"
+                terminal_marker[2] if terminal_marker is not None else "ChatGPT turn ended abnormally"
             )
     elif turn.goal_turn:
         commands.handle_goal_turn_result(turn.result)
@@ -2467,8 +2601,37 @@ def _send_chat_prompt(
                                 )
                             ),
                         )
+                    marker = _turn_failure_marker(error)
+                    marker_ref = active_ref or write_conversation_ref or state.current_conversation
+                    if result_out is not None:
+                        result_out.update(
+                            terminal_marker=marker,
+                            terminal_source="request_error",
+                            conversation_ref=marker_ref,
+                        )
+                    if (
+                        not is_temporary
+                        and isinstance(marker_ref, str)
+                        and marker_ref.strip()
+                        and tui_archive is not None
+                        and archive_turn_id
+                    ):
+                        try:
+                            tui_archive.record_terminal(
+                                archive_turn_id,
+                                conversation_ref=marker_ref.strip(),
+                                label=marker[0],
+                                status=marker[1],
+                                text=marker[2],
+                                source="request_error",
+                            )
+                        except Exception:
+                            pass
                     renderer.turn_abort()
                     print(f"gptty: chat request failed: {error}", file=stderr)
+                    if defer_final_rendering:
+                        return 1
+                    renderer.turn_marker(*marker)
                     return 1
                 raise error
             if "response" in outcome:
@@ -2480,7 +2643,14 @@ def _send_chat_prompt(
         rendered_text = text or "".join(stream_tokens)
         finish_reason = response_finish_reason(response)
         observed_model, requested_model, sent_model = response_model_diagnostics(response)
+        terminal_observed, terminal_source = response_terminal_diagnostics(response)
+        terminal_marker = _turn_terminal_marker(
+            finish_reason=finish_reason,
+            terminal_observed=terminal_observed,
+            stopped_by_user=stopped_by_user,
+        )
         incomplete_turn = finish_reason == "incomplete"
+        abnormal_turn = terminal_marker is not None
         if renderer is not None and not defer_final_rendering:
             if incomplete_turn:
                 renderer.turn_abort()
@@ -2489,6 +2659,8 @@ def _send_chat_prompt(
                 )
             else:
                 renderer.answer(rendered_text)
+            if terminal_marker is not None:
+                renderer.turn_marker(*terminal_marker)
             if stopped_by_user:
                 renderer.info("Stopped by user.")
         elif renderer is None and incomplete_turn:
@@ -2515,8 +2687,8 @@ def _send_chat_prompt(
             archive_status = (
                 "stopped"
                 if stopped_by_user
-                else "incomplete"
-                if incomplete_turn
+                else terminal_marker[1]
+                if terminal_marker is not None
                 else "complete"
             )
             try:
@@ -2528,6 +2700,15 @@ def _send_chat_prompt(
                     model=observed_model or sent_model or model,
                     status=archive_status,
                 )
+                if terminal_marker is not None:
+                    tui_archive.record_terminal(
+                        archive_turn_id,
+                        conversation_ref=conversation_ref,
+                        label=terminal_marker[0],
+                        status=terminal_marker[1],
+                        text=terminal_marker[2],
+                        source=terminal_source,
+                    )
             except Exception as exc:  # noqa: BLE001 - local archive is best-effort.
                 if renderer is not None:
                     renderer.warning(f"TUI archive write failed: {exc}")
@@ -2574,8 +2755,12 @@ def _send_chat_prompt(
                 observed_model=observed_model,
                 requested_model=requested_model,
                 sent_model=sent_model,
+                terminal_observed=terminal_observed,
+                terminal_source=terminal_source,
+                terminal_marker=terminal_marker,
                 stopped_by_user=stopped_by_user,
                 incomplete_without_terminal=incomplete_turn,
+                abnormal_terminal=abnormal_turn,
                 is_temporary=is_temporary,
             )
         completed_successfully = True
@@ -2590,6 +2775,7 @@ def _send_chat_prompt(
             and completed_successfully
             and not stopped_by_user
             and not incomplete_turn
+            and not abnormal_turn
             and notify_completion
         ):
             notify_response_complete(

@@ -98,6 +98,14 @@ class _FakeRenderer:
             )
         )
 
+    def turn_marker(self, label: str, status: str, message: str) -> None:
+        self.events.append(
+            (
+                "turn_marker",
+                {"label": label, "status": status, "message": message},
+            )
+        )
+
     def chat_link(self, ref: str) -> None:
         self.events.append(("chat_link", ref))
 
@@ -702,8 +710,12 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
             (
                 lambda: bool(_FakeRenderer.instances)
                 and (
-                    "warning",
-                    "ChatGPT stream ended without a final answer; returned control to gptty.",
+                    "turn_marker",
+                    {
+                        "label": "turn",
+                        "status": "incomplete",
+                        "message": "ChatGPT stream ended before a final assistant completion.",
+                    },
                 )
                 in _FakeRenderer.instances[0].events,
                 "/exit",
@@ -737,10 +749,14 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
     assert state.current_conversation == "conv-incomplete"
     renderer = _FakeRenderer.instances[0]
     assert (
-        "warning",
-        "ChatGPT stream ended without a final answer; returned control to gptty.",
+        "turn_marker",
+        {
+            "label": "turn",
+            "status": "incomplete",
+            "message": "ChatGPT stream ended before a final assistant completion.",
+        },
     ) in renderer.events
-    assert ("info", "Cleared 1 queued prompt after incomplete turn.") in renderer.events
+    assert ("info", "Cleared 1 queued prompt after abnormal turn.") in renderer.events
     assert notifications == []
 
 
@@ -805,7 +821,7 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(
     state = load_chat_state(tmp_path / "state.json")
     assert state.goal is not None
     assert state.goal.status == "interrupted"
-    assert state.goal.reason == "ChatGPT stream ended without a final answer"
+    assert state.goal.reason == "ChatGPT stream ended before a final assistant completion."
 
 
 def test_resume_loading_queues_text_without_concurrent_cwa_request(
@@ -2279,8 +2295,9 @@ def test_resume_terminal_backend_override_does_not_enter_follow(
             (
                 lambda: bool(_FakeRenderer.instances)
                 and any(
-                    event[0] == "warning"
-                    and "Opened chat idle" in str(event[1])
+                    event[0] == "turn_marker"
+                    and isinstance(event[1], dict)
+                    and event[1].get("status") == "unresolved"
                     for event in _FakeRenderer.instances[0].events
                 ),
                 "/exit",
