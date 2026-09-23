@@ -103,3 +103,58 @@ def test_steering_prompt_preserves_user_message_and_repeats_protocol() -> None:
     assert prompt.startswith("Do not touch the other repository.")
     assert "steering/refinement" in prompt
     assert "GPTTY_GOAL: COMPLETE" in prompt
+
+
+def test_goal_aware_recovery_reanchors_objective_checkpoint_and_stale_context_rule() -> None:
+    from gptty.goal import abnormal_recovery_prompt
+
+    goal = GoalState(
+        goal_id="goal-anchor",
+        generation=3,
+        objective="Acceptance only; do not call tools or modify anything.",
+        active_operation_id="goal-anchor:g3:t7",
+        checkpoint=GoalCheckpoint(
+            summary="No side effects are allowed.",
+            completed=["previous verification retained"],
+            pending=["finish acceptance"],
+            next_step="verify without tools",
+        ),
+    )
+    prompt = abnormal_recovery_prompt(
+        "process restarted",
+        goal=goal,
+        journal_context=["user steering history: do not call tools"],
+    )
+
+    assert "Goal ID: goal-anchor" in prompt
+    assert "Generation: 3" in prompt
+    assert "Objective: Acceptance only; do not call tools or modify anything." in prompt
+    assert "No side effects are allowed." in prompt
+    assert "goal-anchor:g3:t7" in prompt
+    assert "user steering history: do not call tools" in prompt
+    assert "Do not drift back into unrelated older work" in prompt
+    assert "If the active Goal forbids tools" in prompt
+
+
+def test_goal_aware_continuation_and_steering_repeat_objective() -> None:
+    goal = GoalState(
+        goal_id="goal-repeat",
+        objective="Keep API v1 and finish only the agreed verification.",
+    )
+    continuation = continuation_prompt(goal=goal)
+    steering = steering_prompt("Also keep the CLI stable.", goal=goal)
+    for prompt in (continuation, steering):
+        assert "Goal ID: goal-repeat" in prompt
+        assert "Keep API v1 and finish only the agreed verification." in prompt
+        assert "Do not drift back into unrelated older work" in prompt
+
+
+def test_complete_requires_at_least_one_verified_completed_claim() -> None:
+    from gptty.goal import completion_checkpoint_error
+
+    parsed = parse_goal_response(
+        "GPTTY_GOAL: COMPLETE\n"
+        'GPTTY_CHECKPOINT: {"summary":"done","completed":[],"decisions":[],"pending":[],"next":"none"}\n'
+        "Done."
+    )
+    assert completion_checkpoint_error(parsed) == "COMPLETE checkpoint has no verified completed work"

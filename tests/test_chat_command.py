@@ -1273,3 +1273,66 @@ def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation(
         == "nested-dict"
     )
     assert extract_conversation_ref(object()) is None
+
+
+def test_send_forwards_machine_observed_tool_events_to_goal_journal_callback(tmp_path) -> None:
+    observed: list[dict[str, Any]] = []
+
+    class ToolEventClient:
+        def send(self, prompt: str, **options):
+            on_event = options["on_event"]
+            on_event(
+                {
+                    "type": "browser_native_write_completed",
+                    "conversation_id": "conv-tools",
+                    "submission_id": "submit-tools",
+                }
+            )
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": "call-1",
+                    "message_kind": "tool_call",
+                    "tool_name": "api_tool.call_tool",
+                    "label": "write marker",
+                    "text": '{"path":"/CodexTool/link/bash","args":{"command":"touch marker"}}',
+                }
+            )
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": "result-1",
+                    "message_kind": "tool_result",
+                    "tool_name": "api_tool.call_tool",
+                    "label": "marker written",
+                    "text": '{"exitCode":0}',
+                }
+            )
+            return Response(text="done", conversation_id="conv-tools")
+
+    code = _send_chat_prompt(
+        ToolEventClient(),
+        state=ChatState(),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="do tool work",
+        model=None,
+        media=None,
+        stream=True,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        defer_final_rendering=True,
+        goal_event_recorder=observed.append,
+    )
+
+    assert code == 0
+    assert [event["type"] for event in observed] == [
+        "browser_native_write_completed",
+        "canonical_intermediate_message",
+        "canonical_intermediate_message",
+    ]
+    assert observed[0]["conversation_id"] == "conv-tools"
+    assert observed[1]["message_kind"] == "tool_call"
+    assert observed[1]["message_id"] == "call-1"
+    assert observed[2]["message_kind"] == "tool_result"
+    assert observed[2]["message_id"] == "result-1"

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import shlex
+import sqlite3
 import shutil
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,12 +23,15 @@ from ..goal import (
     GoalSignal,
     abnormal_recovery_prompt,
     activation_prompt,
+    completion_checkpoint_error,
     continuation_prompt,
+    operation_identity_instruction,
+    ParsedGoalResponse,
     parse_goal_response,
     rollover_prompt,
     steering_prompt,
 )
-from ..goal_store import GoalStore, ensure_goal_id
+from ..goal_store import GoalConflictError, GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
 from ..state import ChatState, GoalState, StateError, save_chat_state
@@ -58,6 +66,7 @@ class InteractiveCommands:
         ui: InteractiveSession,
         renderer: PrettyRenderer,
         tui_archive: TUIArchive | None = None,
+        runner_id: str | None = None,
     ) -> None:
         self.state = state
         self.state_path = state_path
@@ -66,6 +75,7 @@ class InteractiveCommands:
         self.renderer = renderer
         self.tui_archive = tui_archive
         self.goal_store = GoalStore(state_path)
+        self.runner_id = runner_id or uuid.uuid4().hex
         self._pending_media: list[str] = []
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
@@ -133,12 +143,43 @@ class InteractiveCommands:
     def pending_media_count(self) -> int:
         return len(self._pending_media)
 
+    def _owns_goal_run(self, goal: GoalState | None = None) -> bool:
+        goal = goal or self.state.goal
+        if goal is None:
+            return False
+        # Legacy pre-lease Goal state is adopted only inside the already-running
+        # process/test path. Startup recovery normalizes it before interactive use.
+        if not goal.runner_id:
+            return True
+        return goal.runner_id == self.runner_id and goal.runner_pid == os.getpid()
+
+    @property
+    def goal_owned_elsewhere(self) -> bool:
+        goal = self.state.goal
+        return bool(
+            goal is not None
+            and goal.status == "active"
+            and not self._owns_goal_run(goal)
+        )
+
+    def _reject_remote_goal_mutation(self, action: str) -> bool:
+        if not self.goal_owned_elsewhere:
+            return False
+        goal = self.state.goal
+        assert goal is not None
+        self.renderer.warning(
+            f"Goal is active in another live gptty process (owner pid {goal.runner_pid or '?'}); "
+            f"{action} is blocked for this shared state/profile."
+        )
+        return True
+
     @property
     def goal_active(self) -> bool:
         goal = self.state.goal
         if (
             goal is None
             or goal.status != "active"
+            or not self._owns_goal_run(goal)
             or self._conversation_mode != "normal"
         ):
             return False
@@ -298,10 +339,121 @@ class InteractiveCommands:
             f"{action} failed for {_short_ref(request.conversation_ref)}: {error}"
         )
 
-    def prepare_goal_user_prompt(self, prompt: str) -> str:
+    def prepare_goal_user_prompt(self, prompt: str) -> str | None:
         if not self.goal_active:
             return prompt
-        return steering_prompt(prompt)
+        goal = self.state.goal
+        assert goal is not None
+        if not self._save_state(
+            event_type="user_steering",
+            event_payload={
+                "text": prompt,
+                "conversation_ref": goal.conversation_ref,
+                "turn": goal.turn_count + 1,
+            },
+        ):
+            return None
+        return steering_prompt(prompt, goal=goal)
+
+    def mark_goal_turn_started(self, prompt: str, *, automatic: bool) -> str | None:
+        """Persist an operation boundary before dispatching any Goal model turn."""
+        if not self.goal_active:
+            return prompt
+        goal = self.state.goal
+        assert goal is not None
+        operation_id = goal.active_operation_id
+        event_type = "operation_resumed"
+        if not operation_id:
+            operation_id = (
+                f"{ensure_goal_id(goal)}:g{goal.generation}:t{goal.turn_count + 1}"
+            )
+            goal.active_operation_id = operation_id
+            goal.active_operation_turn = goal.turn_count + 1
+            event_type = "operation_started"
+        payload = {
+            "operation_id": operation_id,
+            "turn": goal.active_operation_turn,
+            "automatic": bool(automatic),
+            "conversation_ref": goal.conversation_ref,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }
+        if not self._save_state(event_type=event_type, event_payload=payload):
+            return None
+        return f"{prompt.rstrip()}\n\n{operation_identity_instruction(operation_id)}"
+
+    def record_goal_tool_event(self, event: dict[str, Any]) -> None:
+        """Persist machine-observed Goal transport/tool evidence without mutating revision.
+
+        Despite the historical method name this also records a committed new-chat
+        identity. That event is deliberately independent from the later terminal
+        Goal transition so restart can recover a chat created just before a crash.
+        """
+        goal = self.state.goal
+        if goal is None or not goal.goal_id or not goal.active_operation_id:
+            return
+        event_type = str(event.get("type") or "")
+        if event_type == "browser_native_write_completed":
+            conversation_ref = str(
+                event.get("conversation_id") or event.get("conversationId") or ""
+            ).strip()
+            if not conversation_ref or conversation_ref.startswith("WEB:"):
+                return
+            payload = {
+                "operation_id": goal.active_operation_id,
+                "conversation_ref": conversation_ref,
+                "submission_id": event.get("submission_id"),
+                "turn_exchange_id": event.get("turn_exchange_id"),
+                "source_event": event_type,
+            }
+            event_key = hashlib.sha256(
+                f"conversation-write:{goal.active_operation_id}:{conversation_ref}".encode("utf-8")
+            ).hexdigest()
+            try:
+                self.goal_store.record_observed_event(
+                    goal,
+                    "conversation_write_committed",
+                    payload,
+                    event_key=event_key,
+                )
+            except (OSError, sqlite3.Error) as exc:
+                self.renderer.warning(f"Goal journal route evidence write failed: {exc}")
+            return
+
+        if event_type != "canonical_intermediate_message":
+            return
+        kind = str(event.get("message_kind") or "")
+        if kind not in {"tool_call", "tool_result"}:
+            return
+        payload = {
+            "operation_id": goal.active_operation_id,
+            "conversation_ref": goal.conversation_ref or self.state.current_conversation,
+            "message_id": event.get("message_id"),
+            "source_offset": event.get("source_offset"),
+            "tool_name": event.get("tool_name"),
+            "label": event.get("label"),
+            "text": str(event.get("text") or ""),
+        }
+        message_id = str(event.get("message_id") or "").strip()
+        if message_id:
+            event_key = hashlib.sha256(
+                f"{kind}:message:{message_id}".encode("utf-8")
+            ).hexdigest()
+        else:
+            stable = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            event_key = hashlib.sha256(
+                f"{kind}:{stable}".encode("utf-8")
+            ).hexdigest()
+        try:
+            self.goal_store.record_observed_event(
+                goal,
+                "tool_call_observed" if kind == "tool_call" else "tool_result_observed",
+                payload,
+                event_key=event_key,
+            )
+        except (OSError, sqlite3.Error) as exc:
+            # The turn remains ambiguous. Do not falsify evidence; terminal handling
+            # will keep the operation open if delivery itself becomes uncertain.
+            self.renderer.warning(f"Goal journal tool evidence write failed: {exc}")
 
     def pause_goal_after_user_stop(self, conversation_ref: str | None) -> None:
         goal = self.state.goal
@@ -322,13 +474,45 @@ class InteractiveCommands:
         goal.turn_count += 1
         goal.status = "paused"
         goal.reason = "stopped by user"
+        goal.runner_id = None
+        goal.runner_pid = 0
         self.clear_automatic_prompts()
-        self._save_state()
+        self._save_state(
+            event_type="goal_paused",
+            event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
+        )
         self.renderer.info("Goal · paused · stopped by user")
 
     def goal_display_text(self, text: str) -> str:
         parsed = parse_goal_response(text)
         return parsed.body if parsed.signal is not None else text
+
+    def _goal_result_event_payload(
+        self, result: dict[str, Any], parsed: Any | None = None
+    ) -> dict[str, Any]:
+        goal = self.state.goal
+        marker = self._goal_terminal_marker(result)
+        if parsed is None:
+            parsed = parse_goal_response(str(result.get("text") or ""))
+        payload: dict[str, Any] = {
+            "operation_id": goal.active_operation_id if goal is not None else None,
+            "conversation_ref": str(result.get("conversation_ref") or "").strip() or None,
+            "signal": parsed.signal.value if parsed.signal is not None else None,
+            "body": parsed.body,
+            "text": str(result.get("text") or ""),
+        }
+        if marker is not None:
+            payload["status"] = marker[1]
+            payload["detail"] = marker[2]
+        if parsed.checkpoint is not None:
+            payload["checkpoint"] = {
+                "summary": parsed.checkpoint.summary,
+                "completed": list(parsed.checkpoint.completed),
+                "decisions": list(parsed.checkpoint.decisions),
+                "pending": list(parsed.checkpoint.pending),
+                "next": parsed.checkpoint.next_step,
+            }
+        return payload
 
     def handle_goal_turn_result(self, result: dict[str, Any]) -> None:
         goal = self.state.goal
@@ -343,12 +527,23 @@ class InteractiveCommands:
         if bool(result.get("stopped_by_user")):
             goal.status = "paused"
             goal.reason = "stopped by user"
+            goal.runner_id = None
+            goal.runner_pid = 0
             self.clear_automatic_prompts()
-            self._save_state()
+            self._save_state(
+                event_type="goal_paused",
+                event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
+            )
             self.renderer.info("Goal · paused · stopped by user")
             return
 
         parsed = parse_goal_response(str(result.get("text") or ""))
+        completion_error = completion_checkpoint_error(parsed)
+        if completion_error is not None:
+            self.renderer.warning(f"Goal · rejected COMPLETE · {completion_error}")
+            parsed = ParsedGoalResponse(
+                signal=None, body=parsed.body, checkpoint=parsed.checkpoint
+            )
         if parsed.checkpoint is not None:
             self._update_goal_checkpoint(goal, parsed)
         marker = self._goal_terminal_marker(result)
@@ -362,13 +557,25 @@ class InteractiveCommands:
             if final_goal_signal_survives_dead_chat:
                 marker = None
             elif label == "chat" and status in {"limit-reached", "unavailable"}:
+                self._save_state(
+                    event_type="turn_abnormal",
+                    event_payload=self._goal_result_event_payload(result, parsed),
+                )
                 self._rollover_goal(detail)
                 return
             if status in {"filtered", "blocked"}:
+                blocked_payload = self._goal_result_event_payload(result, parsed)
                 goal.status = "blocked"
                 goal.reason = detail
+                goal.runner_id = None
+                goal.runner_pid = 0
+                goal.active_operation_id = None
+                goal.active_operation_turn = 0
                 self.clear_automatic_prompts()
-                self._save_state()
+                self._save_state(
+                    event_type="turn_terminal",
+                    event_payload=blocked_payload,
+                )
                 self.renderer.warning("Goal · blocked · user action required")
                 notify_response_complete(
                     chat_title=str(result.get("title") or "").strip() or None,
@@ -376,6 +583,10 @@ class InteractiveCommands:
                 )
                 return
             if status == "rate-limited":
+                self._save_state(
+                    event_type="turn_abnormal",
+                    event_payload=self._goal_result_event_payload(result, parsed),
+                )
                 self._pause_goal_for_service_condition(detail)
                 return
             if status in {
@@ -390,18 +601,91 @@ class InteractiveCommands:
                 self._recover_goal_same_chat(
                     detail,
                     allow_rollover=status != "truncated",
+                    event_payload=self._goal_result_event_payload(result, parsed),
                 )
                 return
 
+        machine_evidence = {"tool_calls": 0, "tool_results": 0, "unresolved_tool_calls": 0}
+        reconciliation_evidence: dict[str, int | bool] = {
+            "verification_calls": 0,
+            "verification_results": 0,
+            "unresolved_verification_calls": 0,
+            "ready": False,
+        }
+        reconciled_ambiguity = False
+        if goal.active_operation_id:
+            machine_evidence = self.goal_store.operation_evidence(
+                goal, goal.active_operation_id
+            )
+            reconciliation_evidence = self.goal_store.operation_reconciliation_evidence(
+                goal, goal.active_operation_id
+            )
+            if machine_evidence["unresolved_tool_calls"]:
+                can_accept_reconciliation = bool(
+                    parsed.signal is GoalSignal.COMPLETE
+                    and parsed.checkpoint is not None
+                    and not parsed.checkpoint.pending
+                    and reconciliation_evidence["ready"]
+                )
+                if can_accept_reconciliation:
+                    reconciled_ambiguity = True
+                    self.goal_store.record_observed_event(
+                        goal,
+                        "operation_reconciled",
+                        {
+                            "operation_id": goal.active_operation_id,
+                            "original_evidence": machine_evidence,
+                            "verification_evidence": reconciliation_evidence,
+                            "checkpoint_summary": parsed.checkpoint.summary,
+                            "completed": list(parsed.checkpoint.completed),
+                        },
+                        event_key=f"operation-reconciled:{goal.active_operation_id}",
+                    )
+                else:
+                    detail = (
+                        f"machine journal has {machine_evidence['unresolved_tool_calls']} observed tool call(s) "
+                        f"without observed result for durable operation {goal.active_operation_id}"
+                    )
+                    if parsed.signal is GoalSignal.COMPLETE:
+                        self.renderer.warning(
+                            f"Goal · rejected COMPLETE · {detail}"
+                        )
+                    self._update_goal_checkpoint(goal, parsed)
+                    payload = self._goal_result_event_payload(result, parsed)
+                    payload["machine_evidence"] = machine_evidence
+                    payload["reconciliation_evidence"] = reconciliation_evidence
+                    self._recover_goal_same_chat(
+                        detail,
+                        allow_rollover=True,
+                        event_payload=payload,
+                    )
+                    return
+
+        terminal_payload = self._goal_result_event_payload(result, parsed)
+        terminal_payload["machine_validation"] = {
+            "structured_checkpoint": parsed.checkpoint is not None,
+            "completed_count": len(parsed.checkpoint.completed) if parsed.checkpoint is not None else 0,
+            "pending_count": len(parsed.checkpoint.pending) if parsed.checkpoint is not None else 0,
+            "operation_evidence": machine_evidence,
+            "reconciliation_evidence": reconciliation_evidence,
+            "reconciled_ambiguity": reconciled_ambiguity,
+        }
+        goal.active_operation_id = None
+        goal.active_operation_turn = 0
         self._update_goal_checkpoint(goal, parsed)
 
         if parsed.signal is GoalSignal.COMPLETE:
             goal.status = "complete"
+            goal.runner_id = None
+            goal.runner_pid = 0
             goal.protocol_failures = 0
             goal.recovery_count = 0
             goal.reason = None
             self.clear_automatic_prompts()
-            self._save_state()
+            self._save_state(
+                event_type="turn_terminal",
+                event_payload=terminal_payload,
+            )
             self.renderer.info(
                 f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
             )
@@ -413,11 +697,16 @@ class InteractiveCommands:
 
         if parsed.signal is GoalSignal.BLOCKED:
             goal.status = "blocked"
+            goal.runner_id = None
+            goal.runner_pid = 0
             goal.protocol_failures = 0
             goal.recovery_count = 0
             goal.reason = parsed.body or "agent reported a blocker"
             self.clear_automatic_prompts()
-            self._save_state()
+            self._save_state(
+                event_type="turn_terminal",
+                event_payload=terminal_payload,
+            )
             self.renderer.warning("Goal · blocked · user action required")
             notify_response_complete(
                 chat_title=str(result.get("title") or "").strip() or None,
@@ -438,7 +727,10 @@ class InteractiveCommands:
             goal.recovery_count = 0
 
         goal.reason = None
-        if not self._save_state():
+        if not self._save_state(
+            event_type="turn_terminal",
+            event_payload=terminal_payload,
+        ):
             self._interrupt_goal("failed to persist goal progress", notify=False)
             return
         self._queue_goal_continuation(protocol_recovery=protocol_recovery)
@@ -458,13 +750,21 @@ class InteractiveCommands:
             return False
         goal.turn_count += 1
         label, status, detail = marker
+        failure_payload = self._goal_result_event_payload(result)
+        failure_payload["detail"] = detail
+        failure_payload["status"] = status
         if label == "chat" and status in {"limit-reached", "unavailable"}:
+            self._save_state(event_type="turn_failed", event_payload=failure_payload)
             return self._rollover_goal(detail)
         if status in {"blocked", "filtered"}:
             goal.status = "blocked"
             goal.reason = detail
+            goal.runner_id = None
+            goal.runner_pid = 0
             self.clear_automatic_prompts()
-            self._save_state()
+            goal.active_operation_id = None
+            goal.active_operation_turn = 0
+            self._save_state(event_type="turn_terminal", event_payload=failure_payload)
             self.renderer.warning("Goal · blocked · user action required")
             notify_response_complete(
                 chat_title=chat_title,
@@ -472,6 +772,7 @@ class InteractiveCommands:
             )
             return True
         if status == "rate-limited":
+            self._save_state(event_type="turn_failed", event_payload=failure_payload)
             return self._pause_goal_for_service_condition(detail)
         if status in {
             "abnormal",
@@ -485,6 +786,7 @@ class InteractiveCommands:
             return self._recover_goal_same_chat(
                 detail,
                 allow_rollover=status != "truncated",
+                event_payload=failure_payload,
             )
         return False
 
@@ -531,6 +833,7 @@ class InteractiveCommands:
         reason: str,
         *,
         allow_rollover: bool,
+        event_payload: dict[str, Any] | None = None,
     ) -> bool:
         goal = self.state.goal
         if goal is None or goal.status != "active":
@@ -539,8 +842,17 @@ class InteractiveCommands:
         if not allow_rollover:
             goal.recovery_count = 0
             self.clear_automatic_prompts()
-            self._automatic_prompts.append(abnormal_recovery_prompt(reason))
-            if not self._save_state():
+            self._automatic_prompts.append(
+                abnormal_recovery_prompt(
+                    reason,
+                    goal=goal,
+                    journal_context=self.goal_store.recovery_context(goal),
+                )
+            )
+            if not self._save_state(
+                event_type="turn_abnormal",
+                event_payload=event_payload or {"detail": reason, "operation_id": goal.active_operation_id},
+            ):
                 self._interrupt_goal("failed to persist goal recovery state", notify=False)
                 return False
             self.renderer.info("Goal · continuing · response was truncated")
@@ -550,8 +862,17 @@ class InteractiveCommands:
         if goal.recovery_count > MAX_RECOVERY_ATTEMPTS:
             return self._rollover_goal(f"repeated non-standard turns: {reason}")
         self.clear_automatic_prompts()
-        self._automatic_prompts.append(abnormal_recovery_prompt(reason))
-        if not self._save_state():
+        self._automatic_prompts.append(
+            abnormal_recovery_prompt(
+                reason,
+                goal=goal,
+                journal_context=self.goal_store.recovery_context(goal),
+            )
+        )
+        if not self._save_state(
+            event_type="turn_abnormal",
+            event_payload=event_payload or {"detail": reason, "operation_id": goal.active_operation_id},
+        ):
             self._interrupt_goal("failed to persist goal recovery state", notify=False)
             return False
         self.renderer.info(
@@ -573,17 +894,31 @@ class InteractiveCommands:
         if old_ref and old_ref not in goal.conversations:
             goal.conversations.append(old_ref)
         goal.conversation_ref = None
+        previous_generation = goal.generation
+        goal.generation += 1
         goal.rollover_count += 1
         goal.recovery_count = 0
         goal.protocol_failures = 0
         goal.reason = f"recovering in a new chat: {reason}"
         self.state.current_conversation = None
         self.clear_automatic_prompts()
-        self._automatic_prompts.append(rollover_prompt(goal, reason=reason))
-        self._goal_bootstrap_pending = True
-        if not self._save_state():
+        if not self._save_state(
+            event_type="rollover",
+            event_payload={
+                "reason": reason,
+                "old_conversation": old_ref,
+                "from_generation": previous_generation,
+                "to_generation": goal.generation,
+                "ambiguous_operation": goal.active_operation_id,
+            },
+        ):
             self._interrupt_goal("failed to persist goal rollover state", notify=False)
             return False
+        journal_context = self.goal_store.recovery_context(goal)
+        self._automatic_prompts.append(
+            rollover_prompt(goal, reason=reason, journal_context=journal_context)
+        )
+        self._goal_bootstrap_pending = True
         self.renderer.info(
             f"Goal · recovering · new chat · rollover {goal.rollover_count}"
         )
@@ -663,7 +998,10 @@ class InteractiveCommands:
         self._conversation_mode = "normal"
         self._reset_temporary_context()
 
-    def _capture_goal_context_seed(self, conversation_ref: str | None) -> list[str]:
+    def _capture_goal_context_history(
+        self, conversation_ref: str | None
+    ) -> list[str]:
+        """Capture the full visible user/assistant branch for durable recovery."""
         if not conversation_ref:
             return []
         try:
@@ -672,8 +1010,7 @@ class InteractiveCommands:
             return []
 
         captured: list[str] = []
-        total = 0
-        for message in reversed(messages):
+        for message in messages:
             role = _field_text(message, "role")
             if role not in {"user", "assistant"}:
                 continue
@@ -681,18 +1018,35 @@ class InteractiveCommands:
                 recipient = _field_text(message, "recipient")
                 if recipient and recipient not in {"all", "assistant"}:
                     continue
-            text = " ".join(_message_text(message).split()).strip()
+            text = _message_text(message).strip()
             if not text:
                 continue
-            entry = f"{role}: {text[:1600]}"
-            if total + len(entry) > 12000 and captured:
+            captured.append(f"{role}: {text}")
+        return captured
+
+    @staticmethod
+    def _compact_goal_context_seed(history: list[str]) -> list[str]:
+        captured: list[str] = []
+        total = 0
+        for entry in reversed(history):
+            role, separator, text = entry.partition(": ")
+            compact = " ".join((text if separator else entry).split()).strip()
+            if not compact:
+                continue
+            compact_entry = f"{role}: {compact[:1600]}" if separator else compact[:1600]
+            if total + len(compact_entry) > 12000 and captured:
                 break
-            captured.append(entry)
-            total += len(entry)
+            captured.append(compact_entry)
+            total += len(compact_entry)
             if len(captured) >= 12:
                 break
         captured.reverse()
         return captured
+
+    def _capture_goal_context_seed(self, conversation_ref: str | None) -> list[str]:
+        return self._compact_goal_context_seed(
+            self._capture_goal_context_history(conversation_ref)
+        )
 
     def _cmd_goal(self, argv: list[str]) -> None:
         if self._conversation_mode == "temporary":
@@ -704,6 +1058,15 @@ class InteractiveCommands:
         action = argv[0].strip().lower() if argv else ""
         if action in {"pause", "resume", "clear", "status"} and len(argv) == 1:
             if action == "pause":
+                if (
+                    self.state.goal is not None
+                    and self.state.goal.status == "active"
+                    and not self._owns_goal_run(self.state.goal)
+                ):
+                    self.renderer.warning(
+                        "Goal is active in another live gptty process; pause it from that process."
+                    )
+                    return
                 if self._pause_active_goal("paused by user"):
                     self.renderer.info("Goal · paused")
                 elif self.state.goal is None:
@@ -719,9 +1082,14 @@ class InteractiveCommands:
                     self.renderer.info("No goal is configured.")
                     return
                 previous_goal = self.state.goal
+                if previous_goal.status == "active" and not self._owns_goal_run(previous_goal):
+                    self.renderer.warning(
+                        "Goal is active in another live gptty process; it cannot be cleared here."
+                    )
+                    return
                 try:
                     self.goal_store.clear_current()
-                except OSError as exc:
+                except (OSError, sqlite3.Error) as exc:
                     self.renderer.warning(f"failed to clear Goal pointer: {exc}")
                     return
                 self.state.goal = None
@@ -732,7 +1100,7 @@ class InteractiveCommands:
                     self.state.goal = previous_goal
                     try:
                         self.goal_store.save(previous_goal)
-                    except OSError as exc:
+                    except (OSError, sqlite3.Error) as exc:
                         self.renderer.warning(
                             f"failed to restore Goal pointer after state save failure: {exc}"
                         )
@@ -763,6 +1131,9 @@ class InteractiveCommands:
             self._render_goal_status()
             return
 
+        context_history = self._capture_goal_context_history(
+            self.state.current_conversation
+        )
         self.state.goal = GoalState(
             conversation_ref=self.state.current_conversation,
             conversations=(
@@ -770,21 +1141,28 @@ class InteractiveCommands:
                 if self.state.current_conversation
                 else []
             ),
-            context_seed=self._capture_goal_context_seed(
-                self.state.current_conversation
-            ),
+            context_seed=self._compact_goal_context_seed(context_history),
             status="active",
             objective=objective,
+            runner_id=self.runner_id,
+            runner_pid=os.getpid(),
         )
         ensure_goal_id(self.state.goal)
-        if not self._save_state():
+        if not self._save_state(
+            event_type="goal_created",
+            event_payload={
+                "objective": objective,
+                "conversation_ref": self.state.current_conversation,
+                "context_snapshot": context_history,
+            },
+        ):
             self.state.goal = existing
             try:
                 if existing is None:
                     self.goal_store.clear_current()
                 else:
                     self.goal_store.save(existing)
-            except OSError as exc:
+            except (OSError, sqlite3.Error) as exc:
                 self.renderer.warning(
                     f"failed to restore Goal pointer after state save failure: {exc}"
                 )
@@ -801,6 +1179,8 @@ class InteractiveCommands:
         return 0
 
     def _cmd_new(self, argv: list[str]) -> None:
+        if self._reject_remote_goal_mutation("starting a new conversation"):
+            return
         self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         previous = self.state.current_conversation
@@ -814,6 +1194,8 @@ class InteractiveCommands:
         self.renderer.info("Started a new conversation.")
 
     def _cmd_temporary(self, argv: list[str]) -> None:
+        if self._reject_remote_goal_mutation("starting a Temporary chat"):
+            return
         if argv:
             self.renderer.warning("/temporary takes no arguments.")
             return
@@ -837,6 +1219,8 @@ class InteractiveCommands:
         self._cmd_temporary(argv)
 
     def _cmd_detach(self, argv: list[str]) -> None:
+        if self._reject_remote_goal_mutation("detaching the conversation"):
+            return
         self._pause_active_goal("conversation detached")
         if self._conversation_mode == "temporary":
             self._leave_temporary_mode()
@@ -861,6 +1245,8 @@ class InteractiveCommands:
         )
 
     def _cmd_stop(self, argv: list[str]) -> None:
+        if self._reject_remote_goal_mutation("stopping the active response"):
+            return
         if argv:
             self.renderer.warning("/stop takes no arguments.")
             return
@@ -971,6 +1357,12 @@ class InteractiveCommands:
 
     def _begin_resume(self, ref: str, *, reload: bool = False) -> None:
         attached_ref = _canonical_conversation_ref(str(ref))
+        if (
+            self.goal_owned_elsewhere
+            and attached_ref != (self.state.current_conversation or "")
+        ):
+            self._reject_remote_goal_mutation("switching conversations")
+            return
         if (
             self.state.current_conversation
             and attached_ref != self.state.current_conversation
@@ -1091,6 +1483,8 @@ class InteractiveCommands:
         return options
 
     def _apply_model(self, selected: str) -> None:
+        if self._reject_remote_goal_mutation("changing the model"):
+            return
         previous = self.state.model
         self.state.model = selected or None
         if not self._save_state():
@@ -1143,6 +1537,10 @@ class InteractiveCommands:
             self.renderer.info("Goal · complete")
             return
         if goal.status == "active":
+            if not self._owns_goal_run(goal):
+                self.renderer.warning(
+                    "Goal is active in another live gptty process; this session will not take ownership."
+                )
             self._render_goal_status()
             return
         if (
@@ -1153,17 +1551,41 @@ class InteractiveCommands:
                 f"Goal belongs to {_short_ref(goal.conversation_ref)}. Resume that conversation before /goal resume."
             )
             return
+        if goal.conversation_ref is None and goal.active_operation_id:
+            try:
+                committed_ref = self.goal_store.operation_committed_conversation(
+                    goal, goal.active_operation_id
+                )
+            except (OSError, sqlite3.Error) as exc:
+                self.renderer.warning(f"Goal journal recovery failed: {exc}")
+                return
+            # An open durable operation may only attach to machine-observed write
+            # identity. Ignore an arbitrary/stale current chat from gptty_state.json.
+            self.state.current_conversation = committed_ref
+            if committed_ref:
+                goal.conversation_ref = committed_ref
+                if committed_ref not in goal.conversations:
+                    goal.conversations.append(committed_ref)
         bootstrap_without_chat = (
             goal.conversation_ref is None and self.state.current_conversation is None
         )
-        if goal.conversation_ref is None and self.state.current_conversation:
+        if (
+            goal.conversation_ref is None
+            and self.state.current_conversation
+            and not goal.active_operation_id
+        ):
             goal.conversation_ref = self.state.current_conversation
             if self.state.current_conversation not in goal.conversations:
                 goal.conversations.append(self.state.current_conversation)
         previous_reason = goal.reason
         goal.status = "active"
         goal.reason = None
-        if not self._save_state():
+        goal.runner_id = self.runner_id
+        goal.runner_pid = os.getpid()
+        if not self._save_state(
+            event_type="goal_resumed",
+            event_payload={"conversation_ref": goal.conversation_ref, "ambiguous_operation": goal.active_operation_id},
+        ):
             return
         self.clear_automatic_prompts()
         if bootstrap_without_chat and goal.conversations:
@@ -1171,15 +1593,25 @@ class InteractiveCommands:
                 rollover_prompt(
                     goal,
                     reason=previous_reason or "resuming durable Goal state",
+                    journal_context=self.goal_store.recovery_context(goal),
                 )
             )
             self._goal_bootstrap_pending = True
         else:
-            self._automatic_prompts.append(
-                activation_prompt(goal.objective)
-                if bootstrap_without_chat
-                else continuation_prompt()
-            )
+            if goal.active_operation_id and not bootstrap_without_chat:
+                self._automatic_prompts.append(
+                    abnormal_recovery_prompt(
+                        f"durable operation {goal.active_operation_id} has no confirmed terminal state after restart/pause",
+                        goal=goal,
+                        journal_context=self.goal_store.recovery_context(goal),
+                    )
+                )
+            else:
+                self._automatic_prompts.append(
+                    activation_prompt(goal.objective)
+                    if bootstrap_without_chat
+                    else continuation_prompt(goal=goal)
+                )
         self.renderer.info(
             f"Goal · active · resuming after {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
         )
@@ -1196,6 +1628,8 @@ class InteractiveCommands:
             details.append(_short_ref(goal.conversation_ref))
         if goal.rollover_count:
             details.append(f"rollovers {goal.rollover_count}")
+        if goal.status == "active" and not self._owns_goal_run(goal):
+            details.append(f"owner pid {goal.runner_pid or '?'}")
         if goal.protocol_failures:
             details.append(
                 f"protocol misses {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}"
@@ -1215,8 +1649,13 @@ class InteractiveCommands:
             return False
         goal.status = "paused"
         goal.reason = f"service backoff required: {reason}"
+        goal.runner_id = None
+        goal.runner_pid = 0
         self.clear_automatic_prompts()
-        if not self._save_state():
+        if not self._save_state(
+            event_type="goal_paused",
+            event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
+        ):
             return False
         self.renderer.warning(
             "Goal · paused · service backoff required · use /goal resume later"
@@ -1225,12 +1664,17 @@ class InteractiveCommands:
 
     def _pause_active_goal(self, reason: str) -> bool:
         goal = self.state.goal
-        if goal is None or goal.status != "active":
+        if goal is None or goal.status != "active" or not self._owns_goal_run(goal):
             return False
         goal.status = "paused"
         goal.reason = reason
+        goal.runner_id = None
+        goal.runner_pid = 0
         self.clear_automatic_prompts()
-        self._save_state()
+        self._save_state(
+            event_type="goal_paused",
+            event_payload={"reason": reason, "ambiguous_operation": goal.active_operation_id},
+        )
         return True
 
     def _interrupt_goal(
@@ -1245,8 +1689,13 @@ class InteractiveCommands:
             return
         goal.status = "interrupted"
         goal.reason = reason
+        goal.runner_id = None
+        goal.runner_pid = 0
         self.clear_automatic_prompts()
-        self._save_state()
+        self._save_state(
+            event_type="goal_interrupted",
+            event_payload={"reason": reason, "ambiguous_operation": goal.active_operation_id},
+        )
         self.renderer.warning(f"Goal · interrupted · {reason}")
         if notify:
             notify_response_complete(
@@ -1259,7 +1708,9 @@ class InteractiveCommands:
         if goal is None or goal.status != "active":
             return
         self._automatic_prompts.append(
-            continuation_prompt(protocol_recovery=protocol_recovery)
+            continuation_prompt(
+                protocol_recovery=protocol_recovery, goal=goal
+            )
         )
         if protocol_recovery:
             self.renderer.warning(
@@ -1268,12 +1719,51 @@ class InteractiveCommands:
         else:
             self.renderer.info(f"Goal · continuing · next turn {goal.turn_count + 1}")
 
-    def _save_state(self) -> bool:
+    def _save_state(
+        self,
+        *,
+        event_type: str = "state_saved",
+        event_payload: dict[str, Any] | None = None,
+    ) -> bool:
         try:
             if self.state.goal is not None:
-                self.goal_store.save(self.state.goal)
+                if (
+                    self.state.goal.status == "active"
+                    and not self._owns_goal_run(self.state.goal)
+                ):
+                    authoritative = self.goal_store.load_current()
+                    if authoritative is not None:
+                        self.state.goal = authoritative
+                        if authoritative.status == "active":
+                            self.state.current_conversation = authoritative.conversation_ref
+                else:
+                    self.goal_store.save(
+                        self.state.goal,
+                        event_type=event_type,
+                        event_payload=event_payload,
+                    )
+                    if self.goal_store.last_projection_error is not None:
+                        self.renderer.warning(
+                            "Goal authoritative state committed, but portable projection "
+                            f"could not be refreshed: {self.goal_store.last_projection_error}"
+                        )
             save_chat_state(self.state_path, self.state)
-        except (OSError, StateError) as exc:
+        except GoalConflictError as exc:
+            try:
+                current = self.goal_store.load_current()
+            except (OSError, sqlite3.Error) as reload_exc:
+                self.clear_automatic_prompts()
+                self.renderer.warning(
+                    f"Goal state conflict and authoritative reload failed: {reload_exc}"
+                )
+                return False
+            if current is not None:
+                self.state.goal = current
+                self.state.current_conversation = current.conversation_ref
+            self.clear_automatic_prompts()
+            self.renderer.warning(f"Goal state changed in another process; reloaded authoritative state: {exc}")
+            return False
+        except (OSError, sqlite3.Error, StateError) as exc:
             self.renderer.warning(str(exc))
             return False
         return True

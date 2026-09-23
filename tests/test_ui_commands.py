@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from gptty.goal import MAX_ROLLOVERS
+from gptty.goal_store import GoalStore
 from gptty.state import (
     ChatState,
     GoalState,
@@ -142,7 +143,9 @@ class FakeClient:
         ]
 
 
-def make_commands(tmp_path, *, state=None, ui=None, client=None, tui_archive=None):
+def make_commands(
+    tmp_path, *, state=None, ui=None, client=None, tui_archive=None, runner_id=None
+):
     state = state or ChatState()
     ui = ui or FakeUI()
     client = client or FakeClient()
@@ -155,6 +158,7 @@ def make_commands(tmp_path, *, state=None, ui=None, client=None, tui_archive=Non
         ui=ui,
         renderer=renderer,
         tui_archive=tui_archive,
+        runner_id=runner_id,
     )
     return commands, renderer, client, state_path
 
@@ -1092,7 +1096,9 @@ def test_goal_complete_stops_loop_and_sends_single_clean_notification(
 
     commands.handle_goal_turn_result(
         {
-            "text": "GPTTY_GOAL: COMPLETE\nEverything is implemented and verified.",
+            "text": "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],"decisions":[],"pending":[],"next":"none"}\n'
+                "Everything is implemented and verified.",
             "title": "Goal chat",
             "conversation_ref": "conv-1",
             "stopped_by_user": False,
@@ -1538,3 +1544,447 @@ def test_goal_is_rejected_in_temporary_chat(tmp_path) -> None:
         "warning",
         "Goal mode is only available for normal ChatGPT conversations.",
     )
+
+
+def test_goal_complete_without_structured_checkpoint_is_rejected(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "GPTTY_GOAL: COMPLETE\nI think it is done.",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.protocol_failures == 1
+    assert commands.has_automatic_prompt is True
+    assert "missing status" in renderer.events[-1][1]
+    assert any(
+        kind == "warning" and "rejected COMPLETE" in str(message)
+        for kind, message in renderer.events
+    )
+
+
+def test_goal_complete_with_pending_work_is_rejected(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(conversation_ref="conv-1", status="active"),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"almost","completed":["code"],'
+                '"decisions":[],"pending":["live test"],"next":"run live test"}\n'
+                "Done."
+            ),
+            "conversation_ref": "conv-1",
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.checkpoint.pending == ["live test"]
+    assert commands.has_automatic_prompt is True
+    assert any(
+        kind == "warning" and "still lists pending work" in str(message)
+        for kind, message in renderer.events
+    )
+
+
+def test_goal_operation_identity_and_tool_evidence_survive_pause_resume(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    commands.handle('/goal "durable side effect test"')
+    activation = commands.pop_automatic_prompt()
+    assert activation is not None
+
+    outgoing = commands.mark_goal_turn_started(activation, automatic=True)
+    assert outgoing is not None
+    assert state.goal is not None
+    operation_id = state.goal.active_operation_id
+    assert operation_id
+    assert operation_id in outgoing
+
+    call_event = {
+        "type": "canonical_intermediate_message",
+        "message_kind": "tool_call",
+        "message_id": "tool-call-1",
+        "tool_name": "api_tool.call_tool",
+        "label": "write marker",
+        "text": '{"path":"/CodexTool/link/bash","args":{"command":"touch marker"}}',
+    }
+    commands.record_goal_tool_event(call_event)
+    commands.record_goal_tool_event(call_event)
+    commands.record_goal_tool_event(
+        {
+            **call_event,
+            "message_kind": "tool_result",
+            "message_id": "tool-result-1",
+            "label": "marker written",
+            "text": '{"exitCode":0}',
+        }
+    )
+
+    commands.handle("/goal pause")
+    assert state.goal.status == "paused"
+    assert state.goal.active_operation_id == operation_id
+    commands.handle("/goal resume")
+    recovery = commands.pop_automatic_prompt() or ""
+    assert operation_id in recovery
+    assert "Do not blindly repeat" in recovery
+
+    events = commands.goal_store.events(state.goal)
+    kinds = [event["type"] for event in events]
+    assert kinds.count("tool_call_observed") == 1
+    assert kinds.count("tool_result_observed") == 1
+    assert "operation_started" in kinds
+    assert "goal_paused" in kinds
+    assert "goal_resumed" in kinds
+
+
+def test_goal_rollover_is_continue_as_new_generation_with_machine_journal(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-old",
+        goal=GoalState(
+            goal_id="goal-generation",
+            conversation_ref="conv-old",
+            conversations=["conv-old"],
+            status="active",
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    prepared = commands.prepare_goal_user_prompt(
+        "Keep the public API unchanged even after rollover."
+    )
+    assert prepared is not None
+
+    assert commands._rollover_goal("conversation exhausted") is True
+
+    assert state.goal is not None
+    assert state.goal.generation == 2
+    assert state.goal.rollover_count == 1
+    assert state.goal.conversation_ref is None
+    handoff = commands.pop_automatic_prompt() or ""
+    assert "Goal generation: 2" in handoff
+    assert "Keep the public API unchanged even after rollover." in handoff
+    assert "rollover: generation 1 -> 2" in handoff
+
+
+def test_goal_start_journals_full_visible_context_while_seed_stays_compact(tmp_path) -> None:
+    class LongContextClient(FakeClient):
+        def get_messages(self, ref):
+            self.calls.append(("get_messages", ref))
+            return [
+                {"role": "user" if index % 2 == 0 else "assistant", "text": f"message-{index}-" + "x" * 200}
+                for index in range(20)
+            ]
+
+    client = LongContextClient()
+    state = ChatState(current_conversation="conv-context")
+    commands, _, _, _ = make_commands(tmp_path, state=state, client=client)
+
+    commands.handle('/goal "preserve all context"')
+
+    assert state.goal is not None
+    assert len(state.goal.context_seed) == 12
+    events = commands.goal_store.events(state.goal)
+    created = next(event for event in events if event["type"] == "goal_created")
+    snapshot = created["payload"]["context_snapshot"]
+    assert len(snapshot) == 20
+    assert "message-0-" in snapshot[0]
+    assert not any("message-0-" in item for item in state.goal.context_seed)
+    portable_journal = commands.goal_store.goal_dir(state.goal) / "events.jsonl"
+    assert portable_journal.exists()
+    assert "message-0-" in portable_journal.read_text(encoding="utf-8")
+
+
+def test_remote_live_goal_owner_is_read_only_in_second_commands_instance(tmp_path) -> None:
+    import os
+
+    owner = InteractiveCommands(
+        state=ChatState(current_conversation="conv-owner"),
+        state_path=tmp_path / "gptty_state.json",
+        get_client=lambda: FakeClient(),
+        ui=FakeUI(),
+        renderer=FakeRenderer(),
+        runner_id="owner-runner",
+    )
+    owner.handle('/goal "owned work"')
+    assert owner.state.goal is not None
+    owner.state.goal.runner_pid = os.getpid()
+    owner._save_state(event_type="owner_heartbeat")
+
+    remote_state = ChatState(
+        current_conversation="conv-owner",
+        goal=owner.goal_store.load_current(),
+    )
+    remote, renderer, _, _ = make_commands(
+        tmp_path, state=remote_state, runner_id="other-runner"
+    )
+    assert remote.goal_active is False
+    remote.handle("/goal pause")
+    remote.handle("/goal clear")
+
+    authoritative = remote.goal_store.load_current()
+    assert authoritative is not None
+    assert authoritative.status == "active"
+    assert authoritative.runner_id == "owner-runner"
+    warnings = [str(message) for kind, message in renderer.events if kind == "warning"]
+    assert any("another live gptty process" in message for message in warnings)
+
+
+def test_remote_live_goal_blocks_shared_profile_context_mutations(tmp_path) -> None:
+    import os
+
+    owner_state = ChatState(
+        current_conversation="conv-owner",
+        goal=GoalState(
+            goal_id="goal-owner-guard",
+            conversation_ref="conv-owner",
+            conversations=["conv-owner"],
+            status="active",
+            runner_id="owner-runner",
+            runner_pid=os.getpid(),
+        ),
+    )
+    owner, _, _, _ = make_commands(
+        tmp_path, state=owner_state, runner_id="owner-runner"
+    )
+    owner._save_state(event_type="owner_ready")
+
+    remote_state = ChatState(
+        current_conversation="conv-owner",
+        goal=owner.goal_store.load_current(),
+    )
+    remote, renderer, _, _ = make_commands(
+        tmp_path, state=remote_state, runner_id="remote-runner"
+    )
+
+    remote.handle("/new")
+    assert remote.state.current_conversation == "conv-owner"
+    remote.handle("/detach")
+    assert remote.state.current_conversation == "conv-owner"
+    remote._begin_resume("conv-other")
+    assert remote.has_pending_resume is False
+    remote._apply_model("different-model")
+    assert remote.state.model is None
+
+    authoritative = remote.goal_store.load_current()
+    assert authoritative is not None
+    assert authoritative.status == "active"
+    assert authoritative.runner_id == "owner-runner"
+    warnings = [str(message) for kind, message in renderer.events if kind == "warning"]
+    assert any("starting a new conversation is blocked" in message for message in warnings)
+    assert any("detaching the conversation is blocked" in message for message in warnings)
+    assert any("switching conversations is blocked" in message for message in warnings)
+    assert any("changing the model is blocked" in message for message in warnings)
+
+
+def test_unresolved_machine_observed_tool_call_forces_reconciliation_before_complete(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-evidence",
+        goal=GoalState(
+            goal_id="goal-evidence-veto",
+            conversation_ref="conv-evidence",
+            conversations=["conv-evidence"],
+            status="active",
+            active_operation_id="goal-evidence-veto:g1:t1",
+            active_operation_turn=1,
+        ),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    assert commands._save_state(event_type="operation_started") is True
+    commands.goal_store.record_observed_event(
+        state.goal,
+        "tool_call_observed",
+        {
+            "operation_id": state.goal.active_operation_id,
+            "label": "write marker",
+            "text": "touch marker.txt",
+        },
+        event_key="unresolved-call",
+    )
+    complete = {
+        "text": (
+            "GPTTY_GOAL: COMPLETE\n"
+            'GPTTY_CHECKPOINT: {"summary":"done","completed":["marker written"],'
+            '"decisions":[],"pending":[],"next":"none"}\n'
+            "Everything is done."
+        ),
+        "conversation_ref": "conv-evidence",
+    }
+
+    commands.handle_goal_turn_result(complete)
+
+    assert state.goal.status == "active"
+    assert state.goal.active_operation_id == "goal-evidence-veto:g1:t1"
+    assert state.goal.recovery_count == 1
+    recovery = commands.pop_automatic_prompt() or ""
+    assert "machine journal has 1 observed tool call" in recovery
+    assert "touch marker.txt" in recovery
+    assert any(
+        kind == "warning" and "rejected COMPLETE" in str(message)
+        for kind, message in renderer.events
+    )
+
+    commands.goal_store.record_observed_event(
+        state.goal,
+        "tool_result_observed",
+        {
+            "operation_id": state.goal.active_operation_id,
+            "label": "marker written",
+            "text": "exit 0",
+        },
+        event_key="resolved-result",
+    )
+    commands.handle_goal_turn_result(complete)
+    assert state.goal.status == "complete"
+    assert state.goal.active_operation_id is None
+
+
+def test_two_goal_runners_racing_resume_have_single_authoritative_owner(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    state_path = tmp_path / "gptty_state.json"
+    store = GoalStore(state_path)
+    paused = GoalState(
+        goal_id="goal-resume-race",
+        conversation_ref="conv-race",
+        conversations=["conv-race"],
+        status="paused",
+        objective="resume exactly once",
+    )
+    store.save(paused, event_type="goal_created")
+
+    first_state = ChatState(
+        current_conversation="conv-race",
+        goal=store.load("goal-resume-race"),
+    )
+    second_state = ChatState(
+        current_conversation="conv-race",
+        goal=store.load("goal-resume-race"),
+    )
+    first, _, _, _ = make_commands(
+        tmp_path, state=first_state, runner_id="runner-A"
+    )
+    second, _, _, _ = make_commands(
+        tmp_path, state=second_state, runner_id="runner-B"
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda command: command._resume_goal(), (first, second)))
+
+    authoritative = store.load_current()
+    assert authoritative is not None
+    assert authoritative.status == "active"
+    assert authoritative.runner_id in {"runner-A", "runner-B"}
+    winners = [
+        command
+        for command in (first, second)
+        if command.state.goal is not None
+        and command.state.goal.runner_id == authoritative.runner_id
+        and command.has_automatic_prompt
+    ]
+    assert len(winners) == 1
+    losers = [command for command in (first, second) if command not in winners]
+    assert len(losers) == 1
+    assert losers[0].has_automatic_prompt is False
+    assert losers[0].state.goal is not None
+    assert losers[0].state.goal.runner_id == authoritative.runner_id
+
+
+def test_accepted_complete_journals_machine_validation_evidence(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-validation",
+        goal=GoalState(
+            goal_id="goal-validation",
+            conversation_ref="conv-validation",
+            conversations=["conv-validation"],
+            status="active",
+            active_operation_id="goal-validation:g1:t1",
+            active_operation_turn=1,
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    assert commands._save_state(event_type="operation_started") is True
+    commands.goal_store.record_observed_event(
+        state.goal,
+        "tool_call_observed",
+        {
+            "operation_id": state.goal.active_operation_id,
+            "tool_name": "verify_api",
+            "text": "verify state",
+        },
+        event_key="validation-call",
+    )
+    commands.goal_store.record_observed_event(
+        state.goal,
+        "tool_result_observed",
+        {
+            "operation_id": state.goal.active_operation_id,
+            "tool_name": "verify_api",
+            "text": "verified ok",
+        },
+        event_key="validation-result",
+    )
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"verified complete","completed":["state verified"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Done."
+            ),
+            "conversation_ref": "conv-validation",
+        }
+    )
+
+    assert state.goal is not None and state.goal.status == "complete"
+    terminal = commands.goal_store.events(state.goal)[-1]
+    assert terminal["type"] == "turn_terminal"
+    validation = terminal["payload"]["machine_validation"]
+    assert validation["structured_checkpoint"] is True
+    assert validation["completed_count"] == 1
+    assert validation["pending_count"] == 0
+    assert validation["operation_evidence"]["unresolved_tool_calls"] == 0
+
+
+def test_goal_transport_write_completion_is_durably_journaled(tmp_path) -> None:
+    operation_id = "goal-route-ui:g2:t3"
+    state = ChatState(
+        goal=GoalState(
+            goal_id="goal-route-ui",
+            generation=2,
+            status="active",
+            active_operation_id=operation_id,
+            active_operation_turn=3,
+        )
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    assert commands._save_state(event_type="operation_resumed") is True
+
+    event = {
+        "type": "browser_native_write_completed",
+        "conversation_id": "conv-route-ui-12345678",
+        "submission_id": "submit-1",
+        "turn_exchange_id": "exchange-1",
+    }
+    commands.record_goal_tool_event(event)
+    commands.record_goal_tool_event(event)
+
+    events = commands.goal_store.events(state.goal)
+    committed = [event for event in events if event["type"] == "conversation_write_committed"]
+    assert len(committed) == 1
+    assert committed[0]["payload"]["operation_id"] == operation_id
+    assert committed[0]["payload"]["conversation_ref"] == "conv-route-ui-12345678"

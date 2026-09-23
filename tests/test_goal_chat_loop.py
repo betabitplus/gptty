@@ -36,7 +36,9 @@ class _GoalLoopClient:
     def send_to_conversation(self, ref: str, prompt: str, **options):
         self.calls.append(("send_to_conversation", prompt, ref))
         return SimpleNamespace(
-            text="GPTTY_GOAL: COMPLETE\nAll agreed work is done and verified.",
+            text=("GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],"decisions":[],"pending":[],"next":"none"}\n'
+                "All agreed work is done and verified."),
             conversation_id=ref,
             title="Goal loop test",
         )
@@ -586,7 +588,9 @@ def test_goal_queued_steering_replaces_pending_auto_continuation(
         def send_to_conversation(self, ref: str, prompt: str, **options):
             self.calls.append(("send_to_conversation", prompt, ref))
             return SimpleNamespace(
-                text="GPTTY_GOAL: COMPLETE\nSteering was applied and the goal is complete.",
+                text=("GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"done","completed":["steering applied"],"decisions":[],"pending":[],"next":"none"}\n'
+                    "Steering was applied and the goal is complete."),
                 conversation_id=ref,
                 title="Steering test",
             )
@@ -978,7 +982,7 @@ def test_goal_incomplete_turn_reconciles_same_chat_then_completes(
     client = IncompleteGoalClient.instances[0]
     assert [call[0] for call in client.calls] == ["send", "send_to_conversation"]
     recovery_prompt = client.calls[1][1]
-    assert "non-standard transport/chat state" in recovery_prompt
+    assert "non-standard transport/chat/process state" in recovery_prompt
     assert "Do not blindly repeat the previous action" in recovery_prompt
     state = load_chat_state(tmp_path / "state.json")
     assert state.goal is not None
@@ -2605,3 +2609,443 @@ def test_working_status_keeps_transport_error_as_reconnecting(monkeypatch) -> No
 
     status = chat_module._working_status(650.0, 0, health=health)
     assert status == "reconnecting delivery · attempt 2"
+
+
+def test_starting_second_process_does_not_pause_goal_owned_by_live_process(tmp_path) -> None:
+    import os
+
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    owned = GoalState(
+        goal_id="goal-live-owner",
+        conversation_ref="conv-owned",
+        conversations=["conv-owned"],
+        status="active",
+        objective="keep running",
+        runner_id="live-owner-token",
+        runner_pid=os.getpid(),
+        turn_count=3,
+    )
+    store.save(owned, event_type="goal_created")
+    before = store.load_current()
+    assert before is not None
+    before_revision = before.revision
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("second process must not contact ChatGPT")
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    after = store.load_current()
+    assert after is not None
+    assert after.status == "active"
+    assert after.runner_id == "live-owner-token"
+    assert after.runner_pid == os.getpid()
+    assert after.turn_count == 3
+    assert after.revision == before_revision
+
+
+def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_path, monkeypatch) -> None:
+    import os
+
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    store.save(
+        GoalState(
+            goal_id="goal-live-dispatch-guard",
+            conversation_ref="conv-owned",
+            conversations=["conv-owned"],
+            status="active",
+            objective="owned task",
+            runner_id="live-owner-token",
+            runner_pid=os.getpid(),
+        ),
+        event_type="goal_created",
+    )
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            "MUST_NOT_BE_SENT",
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    kind == "warning" and "message dispatch is blocked" in str(message)
+                    for kind, message in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+            raise AssertionError("remote process must not create a ChatGPT client")
+
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert created == []
+    authoritative = store.load_current()
+    assert authoritative is not None
+    assert authoritative.status == "active"
+    assert authoritative.runner_id == "live-owner-token"
+
+
+def test_goal_transport_tool_evidence_is_in_reconciliation_prompt_after_incomplete_turn(tmp_path, monkeypatch) -> None:
+    class EvidenceClient:
+        instances: list["EvidenceClient"] = []
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str, str | None]] = []
+            self.__class__.instances.append(self)
+
+        def send(self, prompt: str, **options):
+            self.calls.append(("send", prompt, None))
+            on_event = options["on_event"]
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_kind": "tool_call",
+                    "message_id": "call-side-effect",
+                    "tool_name": "api_tool.call_tool",
+                    "label": "write marker",
+                    "text": "touch durable-marker.txt",
+                }
+            )
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_kind": "tool_result",
+                    "message_id": "result-side-effect",
+                    "tool_name": "api_tool.call_tool",
+                    "label": "marker written",
+                    "text": "exit 0",
+                }
+            )
+            return SimpleNamespace(
+                text="",
+                title="Evidence goal",
+                conversation=SimpleNamespace(
+                    conversation_id="conv-evidence-loop",
+                    finish_reason="incomplete",
+                ),
+            )
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt, ref))
+            return SimpleNamespace(
+                text=(
+                    "GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"reconciled","completed":'
+                    '["marker result preserved"],"decisions":["do not repeat write"],'
+                    '"pending":[],"next":"none"}\n'
+                    "Verified the already-observed result without repeating the write."
+                ),
+                conversation_id=ref,
+                title="Evidence goal",
+            )
+
+    EvidenceClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            '/goal "Write marker once and recover safely"',
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    kind == "info" and "Goal · complete" in str(message)
+                    for kind, message in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=EvidenceClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = EvidenceClient.instances[0]
+    assert [kind for kind, _, _ in client.calls] == ["send", "send_to_conversation"]
+    recovery = client.calls[1][1]
+    assert "Write marker once and recover safely" in recovery
+    assert "tool_call_observed" in recovery
+    assert "touch durable-marker.txt" in recovery
+    assert "tool_result_observed" in recovery
+    assert "do not blindly repeat" in recovery.lower()
+    final_state = load_chat_state(tmp_path / "state.json")
+    assert final_state.goal is not None
+    assert final_state.goal.status == "complete"
+    events = GoalStore(tmp_path / "state.json").events(final_state.goal)
+    assert [event["type"] for event in events].count("tool_call_observed") == 1
+    assert [event["type"] for event in events].count("tool_result_observed") == 1
+
+
+def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay(
+    tmp_path, monkeypatch
+) -> None:
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    operation_id = "goal-restart-ambiguous:g1:t4"
+    goal = GoalState(
+        goal_id="goal-restart-ambiguous",
+        conversation_ref="conv-ambiguous",
+        conversations=["conv-ambiguous"],
+        status="active",
+        objective="Preserve the external write and finish safely",
+        turn_count=3,
+        active_operation_id=operation_id,
+        active_operation_turn=4,
+        runner_id="dead-runner",
+        runner_pid=999_999_999,
+        checkpoint=GoalCheckpoint(
+            summary="A write may already have happened.",
+            completed=["earlier read-only checks"],
+            decisions=["never repeat an ambiguous write blindly"],
+            pending=["reconcile write outcome"],
+            next_step="inspect actual external state before any retry",
+            updated_turn=3,
+        ),
+    )
+    store.save(goal, event_type="operation_started")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "conversation_ref": "conv-ambiguous",
+            "tool_name": "write_api",
+            "label": "create record",
+            "text": "create record idempotently if absent",
+        },
+        event_key="restart-ambiguous-call",
+    )
+    save_chat_state(
+        state_path,
+        ChatState(current_conversation="conv-ambiguous", goal=goal),
+    )
+
+    class ReconcileClient:
+        instances: list["ReconcileClient"] = []
+
+        def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
+            self.calls: list[tuple[str, str]] = []
+            self.__class__.instances.append(self)
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append((ref, prompt))
+            assert ref == "conv-ambiguous"
+            assert operation_id in prompt
+            assert "Do not blindly repeat" in prompt
+            assert "create record idempotently if absent" in prompt
+            assert "inspect actual external state before any retry" in prompt
+            on_event = options["on_event"]
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_kind": "tool_call",
+                    "message_id": "reconcile-read-call",
+                    "tool_name": "read_api",
+                    "label": "verify existing record",
+                    "text": "read record without writing",
+                }
+            )
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_kind": "tool_result",
+                    "message_id": "reconcile-read-result",
+                    "tool_name": "read_api",
+                    "label": "record exists",
+                    "text": "record exists exactly once",
+                }
+            )
+            return SimpleNamespace(
+                text=(
+                    "GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"reconciled safely",'
+                    '"completed":["verified existing record; no duplicate write"],'
+                    '"decisions":["preserved original external side effect"],'
+                    '"pending":[],"next":"none"}\n'
+                    "Reconciled the ambiguous operation without replaying it."
+                ),
+                conversation_id=ref,
+                title="Restart reconciliation",
+            )
+
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            "/goal resume",
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and ("info", "Goal · complete · 4 turns")
+                in _FakeRenderer.instances[0].events,
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: None,
+    )
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=ReconcileClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert len(ReconcileClient.instances) == 1
+    assert len(ReconcileClient.instances[0].calls) == 1
+    recovered = store.load_current()
+    assert recovered is not None
+    assert recovered.status == "complete"
+    assert recovered.turn_count == 4
+    events = store.events(recovered)
+    paused = [event for event in events if event["type"] == "goal_paused"]
+    assert paused
+    assert paused[-1]["payload"]["recovered_after_process_exit"] is True
+    assert paused[-1]["payload"]["ambiguous_operation"] == operation_id
+    assert any(event["type"] == "goal_resumed" for event in events)
+
+
+def test_restart_binds_fresh_chat_from_machine_write_commit_before_pausing_goal(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    operation_id = "goal-route-restart:g2:t4"
+    goal = GoalState(
+        goal_id="goal-route-restart",
+        generation=2,
+        status="active",
+        conversations=["conv-old-12345678"],
+        rollover_count=1,
+        active_operation_id=operation_id,
+        active_operation_turn=4,
+        runner_id="dead-runner",
+        runner_pid=999_999_999,
+    )
+    store.save(goal, event_type="operation_resumed")
+    store.record_observed_event(
+        goal,
+        "conversation_write_committed",
+        {"operation_id": operation_id, "conversation_ref": "conv-fresh-12345678"},
+        event_key="fresh-route",
+    )
+    # Simulate the exact crash window: legacy chat state still points at the dead chat.
+    save_chat_state(
+        state_path,
+        ChatState(current_conversation="conv-old-12345678", goal=goal),
+    )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert created == []
+    recovered = store.load_current()
+    assert recovered is not None
+    assert recovered.status == "paused"
+    assert recovered.conversation_ref == "conv-fresh-12345678"
+    assert recovered.conversations == ["conv-old-12345678", "conv-fresh-12345678"]
+    chat_state = load_chat_state(state_path)
+    assert chat_state.current_conversation == "conv-fresh-12345678"
+    types = [event["type"] for event in store.events(recovered)]
+    assert "conversation_bound_from_journal" in types
+    assert types[-1] == "goal_paused"
+
+
+def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidence(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    operation_id = "goal-no-route:g2:t4"
+    goal = GoalState(
+        goal_id="goal-no-route",
+        generation=2,
+        status="active",
+        conversations=["conv-old-12345678"],
+        rollover_count=1,
+        active_operation_id=operation_id,
+        active_operation_turn=4,
+        runner_id="dead-runner",
+        runner_pid=999_999_999,
+    )
+    store.save(goal, event_type="operation_resumed")
+    save_chat_state(
+        state_path,
+        ChatState(current_conversation="conv-old-12345678", goal=goal),
+    )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert created == []
+    recovered = store.load_current()
+    assert recovered is not None
+    assert recovered.status == "paused"
+    assert recovered.conversation_ref is None
+    assert load_chat_state(state_path).current_conversation is None

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,12 @@ class GoalCheckpoint:
 @dataclass
 class GoalState:
     goal_id: str | None = None
+    revision: int = 0
+    generation: int = 1
+    active_operation_id: str | None = None
+    active_operation_turn: int = 0
+    runner_id: str | None = None
+    runner_pid: int = 0
     conversation_ref: str | None = None
     conversations: list[str] = field(default_factory=list)
     context_seed: list[str] = field(default_factory=list)
@@ -71,7 +79,9 @@ def load_chat_state(path: str | Path) -> ChatState:
 
 def save_chat_state(path: str | Path, state: ChatState) -> None:
     state_path = Path(path)
-    tmp_path = state_path.with_name(f".{state_path.name}.tmp")
+    tmp_path = state_path.with_name(
+        f".{state_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
     data = asdict(state)
     if data.get("goal") is None:
         data.pop("goal", None)
@@ -93,6 +103,12 @@ def goal_state_from_dict(value: Any) -> GoalState | None:
         status = "paused"
     return GoalState(
         goal_id=_optional_str(value.get("goal_id")),
+        revision=_non_negative_int(value.get("revision")),
+        generation=max(1, _non_negative_int(value.get("generation"))),
+        active_operation_id=_optional_str(value.get("active_operation_id")),
+        active_operation_turn=_non_negative_int(value.get("active_operation_turn")),
+        runner_id=_optional_str(value.get("runner_id")),
+        runner_pid=_non_negative_int(value.get("runner_pid")),
         conversation_ref=_optional_str(value.get("conversation_ref")),
         conversations=_string_list(value.get("conversations")),
         context_seed=_string_list(value.get("context_seed")),
