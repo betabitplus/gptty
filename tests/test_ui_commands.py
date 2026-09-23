@@ -3,7 +3,14 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from gptty.state import ChatState, GoalState, StateError, load_chat_state, save_chat_state
+from gptty.state import (
+    ChatState,
+    GoalState,
+    StateError,
+    load_chat_state,
+    save_chat_state,
+)
+from gptty.tui_archive import TUIArchive
 from gptty.ui.commands import InteractiveCommands
 
 
@@ -134,7 +141,7 @@ class FakeClient:
         ]
 
 
-def make_commands(tmp_path, *, state=None, ui=None, client=None):
+def make_commands(tmp_path, *, state=None, ui=None, client=None, tui_archive=None):
     state = state or ChatState()
     ui = ui or FakeUI()
     client = client or FakeClient()
@@ -146,6 +153,7 @@ def make_commands(tmp_path, *, state=None, ui=None, client=None):
         get_client=lambda: client,
         ui=ui,
         renderer=renderer,
+        tui_archive=tui_archive,
     )
     return commands, renderer, client, state_path
 
@@ -210,7 +218,11 @@ def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> N
         ("snapshot", "conv-2"),
     ]
     assert load_chat_state(state_path).current_conversation == "conv-2"
-    clear_index = next(index for index, event in enumerate(renderer.events) if event[0] == "clear_context")
+    clear_index = next(
+        index
+        for index, event in enumerate(renderer.events)
+        if event[0] == "clear_context"
+    )
     assert clear_index > 0
     rendered = [event for event in renderer.events if event[0] == "messages"][-1][1]
     assert [message.text for message in rendered] == ["question", "answer"]
@@ -236,7 +248,10 @@ def test_resume_warns_when_history_comes_from_rate_limit_cache(tmp_path) -> None
     )
 
     warnings = [event[1] for event in renderer.events if event[0] == "warning"]
-    assert "Canonical history is rate-limited; showing cached history (12s old)." in warnings
+    assert (
+        "Canonical history is rate-limited; showing cached history (12s old)."
+        in warnings
+    )
 
 
 def test_resume_terminal_backend_override_opens_idle_and_warns_about_missing_final_text(
@@ -302,6 +317,59 @@ def test_resume_completed_user_tail_marks_historical_turn_unresolved(tmp_path) -
     ]
 
 
+def test_resume_prefers_persistent_chat_terminal_marker_over_generic_unresolved(
+    tmp_path,
+) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "old question",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+    archive.record_terminal(
+        turn_id,
+        conversation_ref="conv-12345678",
+        label="chat",
+        status="limit-reached",
+        text="This conversation reached its maximum length; start a new chat to continue.",
+        source="stream",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+
+    commands.handle("/resume conv-12345678")
+    request = commands.take_pending_resume()
+    assert request is not None
+    commands.complete_resume(
+        request,
+        {
+            "status": SimpleNamespace(status="completed"),
+            "messages": [
+                {"message_id": "u1", "role": "user", "text": "question"},
+            ],
+            "backend_stream_status": "COMPLETE",
+            "backend_terminal_status_proven": True,
+            "canonical_status_overridden": True,
+            "canonical_status_before_override": "user_last_message",
+            "canonical_terminal_text_missing": True,
+        },
+    )
+
+    markers = [event[1] for event in renderer.events if event[0] == "turn_marker"]
+    assert markers == [
+        {
+            "label": "chat",
+            "status": "limit-reached",
+            "message": (
+                "This conversation reached its maximum length; "
+                "start a new chat to continue."
+            ),
+        }
+    ]
+
+
 def test_resume_terminal_backend_override_with_recovered_final_is_informational(
     tmp_path,
 ) -> None:
@@ -327,7 +395,10 @@ def test_resume_terminal_backend_override_with_recovered_final_is_informational(
     )
 
     infos = [event[1] for event in renderer.events if event[0] == "info"]
-    assert "Backend reports COMPLETE; ignored stale canonical status=tool_running." in infos
+    assert (
+        "Backend reports COMPLETE; ignored stale canonical status=tool_running."
+        in infos
+    )
     warnings = [event[1] for event in renderer.events if event[0] == "warning"]
     assert not any("unfinished turn" in warning for warning in warnings)
 
@@ -464,7 +535,9 @@ def test_stop_command_stops_current_chat_without_detaching(tmp_path) -> None:
     assert ("info", "Stop requested.") in renderer.events
 
 
-def test_temporary_command_clears_persistent_attachment_without_persisting_temp_id(tmp_path) -> None:
+def test_temporary_command_clears_persistent_attachment_without_persisting_temp_id(
+    tmp_path,
+) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, renderer, _, state_path = make_commands(tmp_path, state=state)
 
@@ -474,10 +547,15 @@ def test_temporary_command_clears_persistent_attachment_without_persisting_temp_
     assert commands.conversation_ref is None
     assert state.current_conversation is None
     assert load_chat_state(state_path).current_conversation is None
-    assert any(event == ("header", {"model": "latest frontier · High", "temporary": True}) for event in renderer.events)
+    assert any(
+        event == ("header", {"model": "latest frontier · High", "temporary": True})
+        for event in renderer.events
+    )
 
 
-def test_temporary_export_uses_live_transcript_and_prints_exact_path(tmp_path, monkeypatch) -> None:
+def test_temporary_export_uses_live_transcript_and_prints_exact_path(
+    tmp_path, monkeypatch
+) -> None:
     commands, renderer, client, _ = make_commands(tmp_path)
     exported: list[tuple[list[object], str | None]] = []
     export_path = tmp_path / "temporary.md"
@@ -503,7 +581,9 @@ def test_temporary_export_uses_live_transcript_and_prints_exact_path(tmp_path, m
     assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
 
 
-def test_normal_export_reads_complete_attached_history_from_cwa(tmp_path, monkeypatch) -> None:
+def test_normal_export_reads_complete_attached_history_from_cwa(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, renderer, client, _ = make_commands(tmp_path, state=state)
     exported: list[list[object]] = []
@@ -575,8 +655,12 @@ def test_image_clear_removes_pending_clipboard_temp_file(tmp_path, monkeypatch) 
     clipboard_image = tmp_path / "clipboard.png"
     clipboard_image.write_bytes(b"png")
     commands, renderer, _, _ = make_commands(tmp_path)
-    monkeypatch.setattr("gptty.ui.commands.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path))
-    monkeypatch.setattr("gptty.ui.commands.capture_clipboard_image", lambda _directory: clipboard_image)
+    monkeypatch.setattr(
+        "gptty.ui.commands.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path)
+    )
+    monkeypatch.setattr(
+        "gptty.ui.commands.capture_clipboard_image", lambda _directory: clipboard_image
+    )
 
     commands.handle("/paste")
     assert commands.pending_media == [str(clipboard_image)]
@@ -745,7 +829,9 @@ def test_new_clears_current_conversation(tmp_path) -> None:
     assert renderer.events[0] == ("clear_context", None)
 
 
-def test_state_save_failure_rolls_back_interactive_change(tmp_path, monkeypatch) -> None:
+def test_state_save_failure_rolls_back_interactive_change(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, renderer, _, _ = make_commands(tmp_path, state=state)
 
@@ -759,7 +845,9 @@ def test_state_save_failure_rolls_back_interactive_change(tmp_path, monkeypatch)
     assert renderer.events[-1] == ("warning", "disk failed")
 
 
-def test_goal_command_starts_on_attached_conversation_and_queues_activation(tmp_path) -> None:
+def test_goal_command_starts_on_attached_conversation_and_queues_activation(
+    tmp_path,
+) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, renderer, _, state_path = make_commands(tmp_path, state=state)
 
@@ -799,14 +887,19 @@ def test_goal_command_requires_objective_when_no_chat_context_exists(tmp_path) -
     )
 
 
-def test_goal_continue_queues_next_turn_without_notification(tmp_path, monkeypatch) -> None:
+def test_goal_continue_queues_next_turn_without_notification(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(
         current_conversation="conv-1",
         goal=GoalState(conversation_ref="conv-1", status="active"),
     )
     commands, renderer, _, _ = make_commands(tmp_path, state=state)
     notified: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
 
     commands.handle_goal_turn_result(
         {
@@ -822,19 +915,26 @@ def test_goal_continue_queues_next_turn_without_notification(tmp_path, monkeypat
     assert state.goal.turn_count == 1
     assert state.goal.protocol_failures == 0
     assert commands.has_automatic_prompt is True
-    assert "Continue pursuing the active goal" in (commands.pop_automatic_prompt() or "")
+    assert "Continue pursuing the active goal" in (
+        commands.pop_automatic_prompt() or ""
+    )
     assert notified == []
     assert ("info", "Goal · continuing · next turn 2") in renderer.events
 
 
-def test_goal_complete_stops_loop_and_sends_single_clean_notification(tmp_path, monkeypatch) -> None:
+def test_goal_complete_stops_loop_and_sends_single_clean_notification(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(
         current_conversation="conv-1",
         goal=GoalState(conversation_ref="conv-1", status="active", turn_count=2),
     )
     commands, renderer, _, _ = make_commands(tmp_path, state=state)
     notified: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
 
     commands.handle_goal_turn_result(
         {
@@ -850,19 +950,27 @@ def test_goal_complete_stops_loop_and_sends_single_clean_notification(tmp_path, 
     assert state.goal.turn_count == 3
     assert commands.has_automatic_prompt is False
     assert notified == [
-        {"chat_title": "Goal chat", "final_response": "Everything is implemented and verified."}
+        {
+            "chat_title": "Goal chat",
+            "final_response": "Everything is implemented and verified.",
+        }
     ]
     assert ("info", "Goal · complete · 3 turns") in renderer.events
 
 
-def test_goal_blocked_stops_loop_and_notifies_for_user_action(tmp_path, monkeypatch) -> None:
+def test_goal_blocked_stops_loop_and_notifies_for_user_action(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(
         current_conversation="conv-1",
         goal=GoalState(conversation_ref="conv-1", status="active"),
     )
     commands, renderer, _, _ = make_commands(tmp_path, state=state)
     notified: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
 
     commands.handle_goal_turn_result(
         {
@@ -877,19 +985,27 @@ def test_goal_blocked_stops_loop_and_notifies_for_user_action(tmp_path, monkeypa
     assert state.goal.status == "blocked"
     assert commands.has_automatic_prompt is False
     assert notified == [
-        {"chat_title": "Goal chat", "final_response": "Goal blocked. Please log in to the provider account."}
+        {
+            "chat_title": "Goal chat",
+            "final_response": "Goal blocked. Please log in to the provider account.",
+        }
     ]
     assert ("warning", "Goal · blocked · user action required") in renderer.events
 
 
-def test_goal_missing_status_recovers_twice_then_interrupts(tmp_path, monkeypatch) -> None:
+def test_goal_missing_status_recovers_twice_then_interrupts(
+    tmp_path, monkeypatch
+) -> None:
     state = ChatState(
         current_conversation="conv-1",
         goal=GoalState(conversation_ref="conv-1", status="active"),
     )
     commands, _, _, _ = make_commands(tmp_path, state=state)
     notified: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
 
     for expected_failures in (1, 2):
         commands.handle_goal_turn_result(
@@ -934,7 +1050,10 @@ def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -
     )
     commands, renderer, _, _ = make_commands(tmp_path, state=state)
     notified: list[dict[str, object]] = []
-    monkeypatch.setattr("gptty.ui.commands.notify_response_complete", lambda **kwargs: notified.append(kwargs))
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
 
     commands.pause_goal_after_user_stop("conv-1")
 

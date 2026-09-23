@@ -147,6 +147,24 @@ class TUIArchive:
         self._append_conversation_event(conversation_id, event)
         self._refresh_projection(conversation_id)
 
+    def conversation_terminal_marker(
+        self,
+        conversation_ref: str,
+    ) -> tuple[str, str, str, str | None] | None:
+        """Return the latest persistent chat-level terminal state, if known."""
+
+        paths = self.conversation_paths(conversation_ref)
+        for event in reversed(self._read_events(paths["events"])):
+            if str(event.get("role") or "").strip().lower() != "chat":
+                continue
+            status = str(event.get("status") or "").strip()
+            text = str(event.get("text") or "").strip()
+            if not status or not text:
+                continue
+            source = str(event.get("terminal_source") or "").strip() or None
+            return ("chat", status, text, source)
+        return None
+
     def conversation_paths(self, conversation_ref: str) -> dict[str, Path]:
         conversation_id = _conversation_id(conversation_ref)
         directory = self.conversations_dir / conversation_id
@@ -169,7 +187,9 @@ class TUIArchive:
         event_id = str(event.get("event_id") or "")
         if event_id and self._event_exists(events_path, event_id):
             return
-        payload = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        payload = (
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
         fd = os.open(events_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             written = os.write(fd, payload)

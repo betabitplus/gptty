@@ -116,7 +116,9 @@ class _TurnHealth:
                 and event.get("message_kind") == "tool_call"
             ):
                 try:
-                    self.codexpro_tracker.observe_tool_call(self.conversation_ref, event)
+                    self.codexpro_tracker.observe_tool_call(
+                        self.conversation_ref, event
+                    )
                 except Exception:
                     # Observability must never break a live ChatGPT turn.
                     pass
@@ -362,7 +364,9 @@ def response_finish_reason(response: Any) -> str | None:
     return normalized or None
 
 
-def response_model_diagnostics(response: Any) -> tuple[str | None, str | None, str | None]:
+def response_model_diagnostics(
+    response: Any,
+) -> tuple[str | None, str | None, str | None]:
     request = (
         response.get("request")
         if isinstance(response, dict)
@@ -370,7 +374,11 @@ def response_model_diagnostics(response: Any) -> tuple[str | None, str | None, s
     )
 
     def field(name: str) -> str | None:
-        value = request.get(name) if isinstance(request, dict) else getattr(request, name, None)
+        value = (
+            request.get(name)
+            if isinstance(request, dict)
+            else getattr(request, name, None)
+        )
         if not isinstance(value, str):
             return None
         normalized = value.strip()
@@ -390,7 +398,12 @@ _NORMAL_FINISH_REASONS = {
     "succeeded",
     "finished_successfully",
 }
-_OUTPUT_LIMIT_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens", "max_length"}
+_OUTPUT_LIMIT_FINISH_REASONS = {
+    "length",
+    "max_tokens",
+    "max_output_tokens",
+    "max_length",
+}
 _FILTER_FINISH_REASONS = {"content_filter", "safety", "blocked"}
 
 
@@ -413,18 +426,74 @@ def response_terminal_diagnostics(response: Any) -> tuple[bool | None, str | Non
         if isinstance(request, dict)
         else getattr(request, "terminal_source", None)
     )
-    source = raw_source.strip() if isinstance(raw_source, str) and raw_source.strip() else None
+    source = (
+        raw_source.strip()
+        if isinstance(raw_source, str) and raw_source.strip()
+        else None
+    )
     return observed, source
+
+
+def response_terminal_error(response: Any) -> tuple[str | None, str | None]:
+    request = (
+        response.get("request")
+        if isinstance(response, dict)
+        else getattr(response, "request", None)
+    )
+    if request is None:
+        return None, None
+
+    def field(name: str) -> str | None:
+        value = (
+            request.get(name)
+            if isinstance(request, dict)
+            else getattr(request, name, None)
+        )
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    return field("terminal_error_code"), field("terminal_error")
 
 
 def _turn_terminal_marker(
     *,
     finish_reason: str | None,
     terminal_observed: bool | None,
+    terminal_error_code: str | None = None,
+    terminal_error: str | None = None,
     stopped_by_user: bool = False,
 ) -> tuple[str, str, str] | None:
     if stopped_by_user:
         return None
+    error_code = str(terminal_error_code or "").strip().lower()
+    error_text = str(terminal_error or "").strip()
+    normalized_error_text = error_text.casefold()
+    conversation_limit_text = any(
+        token in normalized_error_text
+        for token in (
+            "maximum length for this conversation",
+            "max conversation",
+            "conversation too long",
+            "conversation length",
+            "conversation_limit_exceeded",
+            "conversation limit exceeded",
+            "start a new chat",
+            "new chat to continue",
+        )
+    )
+    if error_code == "conversation_too_large" or conversation_limit_text:
+        return (
+            "chat",
+            "limit-reached",
+            "This conversation reached its maximum length; start a new chat to continue.",
+        )
+    if error_code:
+        detail = f"ChatGPT reported server error {error_code!r} after this turn."
+        if error_text:
+            detail = f"{detail} {error_text}"
+        return ("turn", "abnormal", detail)
     reason = str(finish_reason or "").strip().lower()
     if reason == "incomplete":
         return (
@@ -482,14 +551,23 @@ def _turn_failure_marker(error: BaseException) -> tuple[str, str, str]:
             "This conversation reached its length limit; start a new chat to continue.",
         )
     if "429" in normalized or "rate limit" in normalized:
-        return ("turn", "rate-limited", "ChatGPT rate-limited this turn before final completion.")
-    if any(token in normalized for token in ("turnstile", "verify you are human", "verification")):
+        return (
+            "turn",
+            "rate-limited",
+            "ChatGPT rate-limited this turn before final completion.",
+        )
+    if any(
+        token in normalized
+        for token in ("turnstile", "verify you are human", "verification")
+    ):
         return (
             "turn",
             "blocked",
             "ChatGPT requires browser verification before this turn can continue.",
         )
-    if "handoff" in normalized and any(token in normalized for token in ("final", "completed", "recovery")):
+    if "handoff" in normalized and any(
+        token in normalized for token in ("final", "completed", "recovery")
+    ):
         return (
             "turn",
             "unconfirmed",
@@ -501,7 +579,11 @@ def _turn_failure_marker(error: BaseException) -> tuple[str, str, str]:
             "failed",
             "Response transport timed out before a final assistant completion was confirmed.",
         )
-    return ("turn", "failed", "ChatGPT request ended with an error before final completion.")
+    return (
+        "turn",
+        "failed",
+        "ChatGPT request ended with an error before final completion.",
+    )
 
 
 def run_chat(
@@ -1837,9 +1919,7 @@ async def _finish_enhanced_turn(
     if stopped_by_user:
         renderer.info("Stopped by user.")
         if queued_prompts:
-            renderer.info(
-                f"Queued · {len(queued_prompts)} · will send next"
-            )
+            renderer.info(f"Queued · {len(queued_prompts)} · will send next")
     conversation_ref = turn.result.get("conversation_ref")
     if (
         not turn.result.get("is_temporary")
@@ -1862,7 +1942,9 @@ async def _finish_enhanced_turn(
             )
         if turn.goal_turn:
             commands.handle_goal_interruption(
-                terminal_marker[2] if terminal_marker is not None else "ChatGPT turn ended abnormally"
+                terminal_marker[2]
+                if terminal_marker is not None
+                else "ChatGPT turn ended abnormally"
             )
     elif turn.goal_turn:
         commands.handle_goal_turn_result(turn.result)
@@ -2070,7 +2152,9 @@ def _working_status(
 ) -> str:
     elapsed = max(0.0, time.monotonic() - started_at)
     elapsed_label = _format_status_duration(elapsed)
-    codexpro = health.codexpro_snapshot() if health is not None else CodexProActivitySnapshot()
+    codexpro = (
+        health.codexpro_snapshot() if health is not None else CodexProActivitySnapshot()
+    )
     if health is not None and health.state == "stalled":
         if health.answer_progress_seen:
             status = (
@@ -2107,7 +2191,9 @@ def _working_status(
             )
     elif health is not None and health.state == "reconnecting":
         if health.reconnect_reason == "topic_idle":
-            status = f"checking delivery · idle lease · attempt {health.reconnect_attempt}"
+            status = (
+                f"checking delivery · idle lease · attempt {health.reconnect_attempt}"
+            )
         else:
             status = f"reconnecting delivery · attempt {health.reconnect_attempt}"
     else:
@@ -2124,7 +2210,7 @@ def _working_status(
                     " · do not resend yet"
                 )
             elif progress_age >= 30.0:
-                status += f" · server { _format_status_duration(progress_age) } ago"
+                status += f" · server {_format_status_duration(progress_age)} ago"
     if health is not None:
         progress_age = max(0.0, time.monotonic() - health.last_server_progress_at)
         if health.state in {"quiet", "stalled"} or progress_age >= 30.0:
@@ -2345,11 +2431,7 @@ def _send_chat_prompt(
                 write_conversation_ref = candidate.strip()
                 if not is_temporary and not active_ref:
                     active_ref = write_conversation_ref
-                if (
-                    not is_temporary
-                    and tui_archive is not None
-                    and archive_turn_id
-                ):
+                if not is_temporary and tui_archive is not None and archive_turn_id:
                     try:
                         tui_archive.bind_turn(
                             archive_turn_id,
@@ -2602,7 +2684,11 @@ def _send_chat_prompt(
                             ),
                         )
                     marker = _turn_failure_marker(error)
-                    marker_ref = active_ref or write_conversation_ref or state.current_conversation
+                    marker_ref = (
+                        active_ref
+                        or write_conversation_ref
+                        or state.current_conversation
+                    )
                     if result_out is not None:
                         result_out.update(
                             terminal_marker=marker,
@@ -2642,13 +2728,32 @@ def _send_chat_prompt(
         text = response_text(response)
         rendered_text = text or "".join(stream_tokens)
         finish_reason = response_finish_reason(response)
-        observed_model, requested_model, sent_model = response_model_diagnostics(response)
+        observed_model, requested_model, sent_model = response_model_diagnostics(
+            response
+        )
         terminal_observed, terminal_source = response_terminal_diagnostics(response)
+        terminal_error_code, terminal_error = response_terminal_error(response)
         terminal_marker = _turn_terminal_marker(
             finish_reason=finish_reason,
             terminal_observed=terminal_observed,
+            terminal_error_code=terminal_error_code,
+            terminal_error=terminal_error,
             stopped_by_user=stopped_by_user,
         )
+        if (
+            terminal_marker is None
+            and not stopped_by_user
+            and not is_temporary
+            and tui_archive is not None
+            and active_ref
+        ):
+            try:
+                persistent_marker = tui_archive.conversation_terminal_marker(active_ref)
+            except Exception:
+                persistent_marker = None
+            if persistent_marker is not None:
+                terminal_marker = persistent_marker[:3]
+                terminal_source = "conversation_archive"
         incomplete_turn = finish_reason == "incomplete"
         abnormal_turn = terminal_marker is not None
         if renderer is not None and not defer_final_rendering:
@@ -2757,6 +2862,8 @@ def _send_chat_prompt(
                 sent_model=sent_model,
                 terminal_observed=terminal_observed,
                 terminal_source=terminal_source,
+                terminal_error_code=terminal_error_code,
+                terminal_error=terminal_error,
                 terminal_marker=terminal_marker,
                 stopped_by_user=stopped_by_user,
                 incomplete_without_terminal=incomplete_turn,

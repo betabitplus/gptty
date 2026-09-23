@@ -129,7 +129,11 @@ class InteractiveCommands:
     @property
     def goal_active(self) -> bool:
         goal = self.state.goal
-        if goal is None or goal.status != "active" or self._conversation_mode != "normal":
+        if (
+            goal is None
+            or goal.status != "active"
+            or self._conversation_mode != "normal"
+        ):
             return False
         if goal.conversation_ref is None:
             return self.state.current_conversation is None
@@ -175,6 +179,16 @@ class InteractiveCommands:
         self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
+        persistent_chat_marker: tuple[str, str, str, str | None] | None = None
+        if self.tui_archive is not None:
+            try:
+                persistent_chat_marker = self.tui_archive.conversation_terminal_marker(
+                    attached_ref
+                )
+            except Exception:
+                persistent_chat_marker = None
+        if persistent_chat_marker is not None:
+            self.renderer.turn_marker(*persistent_chat_marker[:3])
         if isinstance(snapshot, dict) and snapshot.get("canonical_cache_stale") is True:
             age_value = snapshot.get("canonical_cache_age_seconds")
             if isinstance(age_value, (int, float)) and not isinstance(age_value, bool):
@@ -192,11 +206,16 @@ class InteractiveCommands:
             and snapshot.get("backend_terminal_status_proven") is True
             and snapshot.get("canonical_status_overridden") is True
         ):
-            backend_status = str(snapshot.get("backend_stream_status") or "terminal").strip()
+            backend_status = str(
+                snapshot.get("backend_stream_status") or "terminal"
+            ).strip()
             canonical_status = str(
                 snapshot.get("canonical_status_before_override") or "unfinished"
             ).strip()
-            if snapshot.get("canonical_terminal_text_missing") is True:
+            if (
+                snapshot.get("canonical_terminal_text_missing") is True
+                and persistent_chat_marker is None
+            ):
                 self.renderer.turn_marker(
                     "turn",
                     "unresolved",
@@ -212,6 +231,7 @@ class InteractiveCommands:
             and status != "awaiting_tool_approval"
             and messages
             and _field_text(messages[-1], "role") == "user"
+            and persistent_chat_marker is None
             and not (
                 isinstance(snapshot, dict)
                 and snapshot.get("canonical_terminal_text_missing") is True
@@ -249,8 +269,14 @@ class InteractiveCommands:
         normalized_ref = str(conversation_ref or "").strip() or None
         if goal.conversation_ref is None and normalized_ref:
             goal.conversation_ref = normalized_ref
-        if goal.conversation_ref and normalized_ref and goal.conversation_ref != normalized_ref:
-            self._interrupt_goal("conversation changed while stopping goal", notify=True)
+        if (
+            goal.conversation_ref
+            and normalized_ref
+            and goal.conversation_ref != normalized_ref
+        ):
+            self._interrupt_goal(
+                "conversation changed while stopping goal", notify=True
+            )
             return
         goal.turn_count += 1
         goal.status = "paused"
@@ -267,7 +293,11 @@ class InteractiveCommands:
         conversation_ref = str(result.get("conversation_ref") or "").strip() or None
         if goal.conversation_ref is None and conversation_ref:
             goal.conversation_ref = conversation_ref
-        if goal.conversation_ref and conversation_ref and goal.conversation_ref != conversation_ref:
+        if (
+            goal.conversation_ref
+            and conversation_ref
+            and goal.conversation_ref != conversation_ref
+        ):
             self._interrupt_goal("conversation changed during goal turn", notify=True)
             return
 
@@ -287,7 +317,9 @@ class InteractiveCommands:
             goal.reason = None
             self._automatic_prompts.clear()
             self._save_state()
-            self.renderer.info(f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}")
+            self.renderer.info(
+                f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
+            )
             notify_response_complete(
                 chat_title=str(result.get("title") or "").strip() or None,
                 final_response=parsed.body or "Goal complete.",
@@ -326,7 +358,9 @@ class InteractiveCommands:
             return
         self._queue_goal_continuation(protocol_recovery=protocol_recovery)
 
-    def handle_goal_interruption(self, reason: str, *, chat_title: str | None = None) -> None:
+    def handle_goal_interruption(
+        self, reason: str, *, chat_title: str | None = None
+    ) -> None:
         self._interrupt_goal(reason, notify=True, chat_title=chat_title)
 
     def pause_goal_for_local_quit(self) -> None:
@@ -348,7 +382,9 @@ class InteractiveCommands:
             self._temporary_title = title
         self._temporary_messages.append(OutputMessage(role="user", text=prompt))
         if answer:
-            self._temporary_messages.append(OutputMessage(role="assistant", text=answer))
+            self._temporary_messages.append(
+                OutputMessage(role="assistant", text=answer)
+            )
 
     def take_pending_media(self) -> list[str]:
         media = list(self._pending_media)
@@ -398,7 +434,9 @@ class InteractiveCommands:
 
     def _cmd_goal(self, argv: list[str]) -> None:
         if self._conversation_mode == "temporary":
-            self.renderer.warning("Goal mode is only available for normal ChatGPT conversations.")
+            self.renderer.warning(
+                "Goal mode is only available for normal ChatGPT conversations."
+            )
             return
 
         action = argv[0].strip().lower() if argv else ""
@@ -442,7 +480,9 @@ class InteractiveCommands:
             return
         if existing is not None and existing.status not in {"complete"}:
             if objective:
-                self.renderer.warning("An unfinished goal already exists. Use /goal clear before replacing it.")
+                self.renderer.warning(
+                    "An unfinished goal already exists. Use /goal clear before replacing it."
+                )
                 return
             if existing.status in {"paused", "blocked", "interrupted"}:
                 self._resume_goal()
@@ -496,7 +536,9 @@ class InteractiveCommands:
         self._reset_temporary_context()
         self.clear_pending_media()
         self.renderer.clear_context()
-        self.renderer.header(model=self.state.model or "latest frontier · High", temporary=True)
+        self.renderer.header(
+            model=self.state.model or "latest frontier · High", temporary=True
+        )
         self.renderer.info("Started a new Temporary ChatGPT conversation.")
 
     def _cmd_temp(self, argv: list[str]) -> None:
@@ -522,7 +564,9 @@ class InteractiveCommands:
         self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(model=self.state.model or "latest frontier · High")
-        self.renderer.info("Detached locally. The ChatGPT conversation was not changed.")
+        self.renderer.info(
+            "Detached locally. The ChatGPT conversation was not changed."
+        )
 
     def _cmd_stop(self, argv: list[str]) -> None:
         if argv:
@@ -545,7 +589,11 @@ class InteractiveCommands:
         if not ref:
             self.renderer.info("No conversation is attached.")
             return
-        title = self._temporary_title if self._conversation_mode == "temporary" else self._conversation_titles.get(ref)
+        title = (
+            self._temporary_title
+            if self._conversation_mode == "temporary"
+            else self._conversation_titles.get(ref)
+        )
         try:
             if self._conversation_mode == "temporary":
                 messages = list(self._temporary_messages)
@@ -590,13 +638,17 @@ class InteractiveCommands:
             return
         if media not in self._pending_media:
             self._pending_media.append(media)
-        self.renderer.info(f"Attached for next prompt: {Path(media).name or media} · pending: {self.pending_media_count}")
+        self.renderer.info(
+            f"Attached for next prompt: {Path(media).name or media} · pending: {self.pending_media_count}"
+        )
 
     def _cmd_image(self, argv: list[str]) -> None:
         if argv and argv[0].strip().lower() == "clear":
             count = self.pending_media_count
             self.clear_pending_media()
-            self.renderer.info(f"Cleared {count} pending image{'s' if count != 1 else ''}.")
+            self.renderer.info(
+                f"Cleared {count} pending image{'s' if count != 1 else ''}."
+            )
             return
 
         raw = " ".join(argv).strip() if argv else self.ui.read_image_path()
@@ -608,7 +660,9 @@ class InteractiveCommands:
 
     def _cmd_paste(self, argv: list[str]) -> None:
         if argv:
-            self.renderer.warning("/paste takes no arguments; it attaches the current clipboard image.")
+            self.renderer.warning(
+                "/paste takes no arguments; it attaches the current clipboard image."
+            )
             return
         if self._clipboard_dir is None:
             self._clipboard_dir = Path(tempfile.mkdtemp(prefix="gptty-clipboard-"))
@@ -619,11 +673,16 @@ class InteractiveCommands:
             return
         self._owned_media.add(path)
         self._pending_media.append(str(path))
-        self.renderer.info(f"Attached clipboard image for next prompt · pending: {self.pending_media_count}")
+        self.renderer.info(
+            f"Attached clipboard image for next prompt · pending: {self.pending_media_count}"
+        )
 
     def _begin_resume(self, ref: str, *, reload: bool = False) -> None:
         attached_ref = _canonical_conversation_ref(str(ref))
-        if self.state.current_conversation and attached_ref != self.state.current_conversation:
+        if (
+            self.state.current_conversation
+            and attached_ref != self.state.current_conversation
+        ):
             self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         self._pending_resume = ResumeRequest(
@@ -638,7 +697,9 @@ class InteractiveCommands:
             self.renderer.warning("/reload takes no arguments.")
             return
         if self._conversation_mode == "temporary":
-            self.renderer.warning("/reload is unavailable for Temporary ChatGPT conversations.")
+            self.renderer.warning(
+                "/reload is unavailable for Temporary ChatGPT conversations."
+            )
             return
         ref = self.state.current_conversation
         if not ref:
@@ -756,7 +817,9 @@ class InteractiveCommands:
         if argv:
             selected = argv[0].strip()
             if selected not in by_slug:
-                self.renderer.warning("Unknown model slug. Run /model and choose from the live ChatGPT list.")
+                self.renderer.warning(
+                    "Unknown model slug. Run /model and choose from the live ChatGPT list."
+                )
                 return
         else:
             value = self.ui.choose_searchable(
@@ -790,12 +853,17 @@ class InteractiveCommands:
         if goal.status == "active":
             self._render_goal_status()
             return
-        if goal.conversation_ref and goal.conversation_ref != self.state.current_conversation:
+        if (
+            goal.conversation_ref
+            and goal.conversation_ref != self.state.current_conversation
+        ):
             self.renderer.warning(
                 f"Goal belongs to {_short_ref(goal.conversation_ref)}. Resume that conversation before /goal resume."
             )
             return
-        bootstrap_without_chat = goal.conversation_ref is None and self.state.current_conversation is None
+        bootstrap_without_chat = (
+            goal.conversation_ref is None and self.state.current_conversation is None
+        )
         if goal.conversation_ref is None and self.state.current_conversation:
             goal.conversation_ref = self.state.current_conversation
         goal.status = "active"
@@ -804,9 +872,13 @@ class InteractiveCommands:
             return
         self._automatic_prompts.clear()
         self._automatic_prompts.append(
-            activation_prompt(goal.objective) if bootstrap_without_chat else continuation_prompt()
+            activation_prompt(goal.objective)
+            if bootstrap_without_chat
+            else continuation_prompt()
         )
-        self.renderer.info(f"Goal · active · resuming after {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}")
+        self.renderer.info(
+            f"Goal · active · resuming after {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
+        )
 
     def _render_goal_status(self) -> None:
         goal = self.state.goal
@@ -817,7 +889,9 @@ class InteractiveCommands:
         if goal.conversation_ref:
             details.append(_short_ref(goal.conversation_ref))
         if goal.protocol_failures:
-            details.append(f"protocol misses {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}")
+            details.append(
+                f"protocol misses {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}"
+            )
         self.renderer.info(" · ".join(details))
         if goal.reason:
             self.renderer.info(f"Goal reason: {goal.reason}")
@@ -857,7 +931,9 @@ class InteractiveCommands:
         goal = self.state.goal
         if goal is None or goal.status != "active":
             return
-        self._automatic_prompts.append(continuation_prompt(protocol_recovery=protocol_recovery))
+        self._automatic_prompts.append(
+            continuation_prompt(protocol_recovery=protocol_recovery)
+        )
         if protocol_recovery:
             self.renderer.warning(
                 f"Goal · continuing · missing status {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}"
@@ -1031,4 +1107,4 @@ def _field_text(value: Any, name: str) -> str:
 def _short_ref(ref: str, *, max_len: int = 44) -> str:
     if len(ref) <= max_len:
         return ref
-    return f"…{ref[-(max_len - 1):]}"
+    return f"…{ref[-(max_len - 1) :]}"

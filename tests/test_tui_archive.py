@@ -10,7 +10,9 @@ def _events(archive: TUIArchive, conversation_id: str) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_new_chat_prompt_is_pending_until_conversation_identity_is_known(tmp_path) -> None:
+def test_new_chat_prompt_is_pending_until_conversation_identity_is_known(
+    tmp_path,
+) -> None:
     archive = TUIArchive(tmp_path / "archive")
 
     turn_id = archive.record_user(
@@ -138,3 +140,39 @@ def test_terminal_marker_is_persisted_as_separate_archive_event(tmp_path) -> Non
     )
     assert "## TURN — unconfirmed" in transcript
     assert "A final ChatGPT completion was not observed" in transcript
+
+
+def test_chat_level_terminal_marker_is_persistent_but_turn_marker_is_not(
+    tmp_path,
+) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "question",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+    archive.record_terminal(
+        turn_id,
+        conversation_ref="conv-12345678",
+        label="turn",
+        status="unconfirmed",
+        text="turn-only",
+        source="stream",
+    )
+    assert archive.conversation_terminal_marker("conv-12345678") is None
+
+    archive.record_terminal(
+        turn_id + "b",
+        conversation_ref="conv-12345678",
+        label="chat",
+        status="limit-reached",
+        text="This conversation reached its maximum length; start a new chat to continue.",
+        source="stream",
+    )
+
+    assert archive.conversation_terminal_marker("conv-12345678") == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its maximum length; start a new chat to continue.",
+        "stream",
+    )
