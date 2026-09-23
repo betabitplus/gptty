@@ -435,6 +435,54 @@ def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
     assert load_chat_state(state_path).current_conversation == "direct"
 
 
+def test_resume_renders_and_persists_historical_web_ui_error(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+        ],
+        "backend_terminal_status_proven": True,
+        "canonical_status_overridden": True,
+        "canonical_terminal_text_missing": True,
+        "historical_ui_state": {
+            "code": "response_error",
+            "scope": "turn",
+            "status": "abnormal",
+            "detail": "ChatGPT web UI reports an error for the last turn; Retry may be available.",
+            "source": "web-ui",
+        },
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert (
+        "turn_marker",
+        {
+            "label": "turn",
+            "status": "abnormal",
+            "message": "ChatGPT web UI reports an error for the last turn; Retry may be available.",
+        },
+    ) in renderer.events
+    assert not any(
+        event[0] == "turn_marker" and event[1].get("status") == "unresolved"
+        for event in renderer.events
+    )
+    transcript = archive.conversation_paths("conv-direct")["transcript"].read_text(
+        encoding="utf-8"
+    )
+    assert "## TURN — abnormal" in transcript
+    assert "Retry may be available." in transcript
+
+
 def test_reload_refreshes_same_chat_without_detach_or_goal_pause(tmp_path) -> None:
     image = tmp_path / "queued.png"
     image.write_bytes(b"png")

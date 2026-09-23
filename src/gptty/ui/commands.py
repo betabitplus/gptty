@@ -179,8 +179,29 @@ class InteractiveCommands:
         self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
         messages = _snapshot_messages(snapshot)
         self.renderer.messages(normalize_messages(messages))
+        historical_ui_marker: tuple[str, str, str, str] | None = None
+        if isinstance(snapshot, dict):
+            ui_state = snapshot.get("historical_ui_state")
+            if isinstance(ui_state, dict):
+                label = str(ui_state.get("scope") or "").strip()
+                marker_status = str(ui_state.get("status") or "").strip()
+                detail = str(ui_state.get("detail") or "").strip()
+                source = str(ui_state.get("source") or "web-ui").strip() or "web-ui"
+                if label in {"chat", "turn", "session"} and marker_status and detail:
+                    historical_ui_marker = (label, marker_status, detail, source)
         persistent_chat_marker: tuple[str, str, str, str | None] | None = None
         if self.tui_archive is not None:
+            if historical_ui_marker is not None:
+                try:
+                    self.tui_archive.record_observed_terminal(
+                        conversation_ref=attached_ref,
+                        label=historical_ui_marker[0],
+                        status=historical_ui_marker[1],
+                        text=historical_ui_marker[2],
+                        source=historical_ui_marker[3],
+                    )
+                except Exception:
+                    pass
             try:
                 persistent_chat_marker = self.tui_archive.conversation_terminal_marker(
                     attached_ref
@@ -189,6 +210,8 @@ class InteractiveCommands:
                 persistent_chat_marker = None
         if persistent_chat_marker is not None:
             self.renderer.turn_marker(*persistent_chat_marker[:3])
+        elif historical_ui_marker is not None:
+            self.renderer.turn_marker(*historical_ui_marker[:3])
         if isinstance(snapshot, dict) and snapshot.get("canonical_cache_stale") is True:
             age_value = snapshot.get("canonical_cache_age_seconds")
             if isinstance(age_value, (int, float)) and not isinstance(age_value, bool):
@@ -215,6 +238,7 @@ class InteractiveCommands:
             if (
                 snapshot.get("canonical_terminal_text_missing") is True
                 and persistent_chat_marker is None
+                and historical_ui_marker is None
             ):
                 self.renderer.turn_marker(
                     "turn",
@@ -232,6 +256,7 @@ class InteractiveCommands:
             and messages
             and _field_text(messages[-1], "role") == "user"
             and persistent_chat_marker is None
+            and historical_ui_marker is None
             and not (
                 isinstance(snapshot, dict)
                 and snapshot.get("canonical_terminal_text_missing") is True

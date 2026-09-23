@@ -41,6 +41,8 @@ class ChatGPTWebClientProtocol(Protocol):
 
     def conversation_follow_stream(self, url_or_id: Any, **options: Any) -> Any: ...
 
+    def conversation_ui_state(self, url_or_id: Any, **options: Any) -> Any: ...
+
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any: ...
 
     def send_temporary(self, prompt: str, **options: Any) -> Any: ...
@@ -200,6 +202,12 @@ class _ProductRuntimeClient:
             raise RuntimeError("live topic follow is unavailable")
         return helper(url_or_id, **options)
 
+    def conversation_ui_state(self, url_or_id: Any, **options: Any) -> Any:
+        helper = getattr(self.runtime, "conversation_ui_state", None)
+        if not callable(helper):
+            return None
+        return helper(url_or_id, **options)
+
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:
         return self.runtime.stop_generation(url_or_id, **options)
 
@@ -342,6 +350,12 @@ class GpttyClient:
         helper = getattr(self._client, "conversation_follow_stream", None)
         if not callable(helper):
             raise RuntimeError("live topic follow is unavailable")
+        return helper(url_or_id, **options)
+
+    def conversation_ui_state(self, url_or_id: Any, **options: Any) -> Any:
+        helper = getattr(self._client, "conversation_ui_state", None)
+        if not callable(helper):
+            return None
         return helper(url_or_id, **options)
 
     def stop_generation(self, url_or_id: Any = None, **options: Any) -> Any:

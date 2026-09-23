@@ -1325,6 +1325,41 @@ def _start_enhanced_resume(
                 )
             else:
                 payload = client.conversation_snapshot(request.conversation_ref)
+            persistent_chat_terminal_known = False
+            archive = getattr(commands, "tui_archive", None)
+            if archive is not None:
+                try:
+                    persistent_chat_terminal_known = (
+                        archive.conversation_terminal_marker(request.conversation_ref)
+                        is not None
+                    )
+                except Exception:
+                    persistent_chat_terminal_known = False
+            if (
+                isinstance(payload, dict)
+                and payload.get("backend_terminal_status_proven") is True
+                and payload.get("canonical_status_overridden") is True
+                and payload.get("canonical_terminal_text_missing") is True
+                and not persistent_chat_terminal_known
+            ):
+                inspect_ui = getattr(client, "conversation_ui_state", None)
+                if callable(inspect_ui):
+                    try:
+                        ui_state = inspect_ui(
+                            request.conversation_ref,
+                            timeout=15.0,
+                        )
+                    except Exception:  # noqa: BLE001 - optional historical UI evidence.
+                        ui_state = None
+                    if (
+                        isinstance(ui_state, dict)
+                        and isinstance(ui_state.get("code"), str)
+                        and ui_state.get("code", "").strip()
+                    ):
+                        payload = {
+                            **payload,
+                            "historical_ui_state": ui_state,
+                        }
             result: tuple[bool, Any] = (True, payload)
         except BaseException as exc:  # noqa: BLE001 - background resume boundary.
             result = (False, exc)

@@ -147,6 +147,40 @@ class TUIArchive:
         self._append_conversation_event(conversation_id, event)
         self._refresh_projection(conversation_id)
 
+    def record_observed_terminal(
+        self,
+        *,
+        conversation_ref: str,
+        label: str,
+        status: str,
+        text: str,
+        source: str,
+    ) -> None:
+        conversation_id = _conversation_id(conversation_ref)
+        normalized_label = str(label or "turn").strip() or "turn"
+        normalized_status = str(status or "").strip()
+        normalized_text = str(text or "").strip()
+        normalized_source = str(source or "").strip()
+        if not normalized_status or not normalized_text or not normalized_source:
+            return
+        paths = self.conversation_paths(conversation_id)
+        for event in reversed(self._read_events(paths["events"])):
+            if (
+                str(event.get("role") or "").strip() == normalized_label
+                and str(event.get("status") or "").strip() == normalized_status
+                and str(event.get("text") or "").strip() == normalized_text
+                and str(event.get("terminal_source") or "").strip() == normalized_source
+            ):
+                return
+        self.record_terminal(
+            uuid.uuid4().hex,
+            conversation_ref=conversation_id,
+            label=normalized_label,
+            status=normalized_status,
+            text=normalized_text,
+            source=normalized_source,
+        )
+
     def conversation_terminal_marker(
         self,
         conversation_ref: str,
