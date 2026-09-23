@@ -179,7 +179,7 @@ def test_renderer_turn_marker_is_persistent_metadata_line() -> None:
 
     rendered = " ".join(out.getvalue().split())
     assert rendered == (
-        "turn: unconfirmed · A final ChatGPT completion was not observed; "
+        "▌ ! TURN · UNCONFIRMED ▌ A final ChatGPT completion was not observed; "
         "this turn may be incomplete."
     )
 

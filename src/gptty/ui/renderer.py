@@ -126,12 +126,31 @@ class PrettyRenderer:
         prefix = str(label or "turn").strip() or "turn"
         state = str(status or "abnormal").strip() or "abnormal"
         detail = str(message or "").strip()
-        line = Text(f"{prefix}: ", style="dim")
-        line.append(state, style="bold")
-        if detail:
-            line.append(" · ", style="dim")
-            line.append(detail)
-        self.console.print(line)
+        caution_states = {
+            "filtered",
+            "incomplete",
+            "truncated",
+            "unconfirmed",
+            "unresolved",
+        }
+        accent = "yellow" if state.lower() in caution_states else "bright_red"
+
+        header = Text()
+        header.append("▌", style=f"bold {accent}")
+        header.append(" !  ", style=f"bold {accent}")
+        header.append(prefix.upper(), style="dim")
+        header.append(" · ", style="dim")
+        header.append(state.upper(), style=f"bold {accent}")
+
+        body = Text()
+        body.append("▌", style=f"bold {accent}")
+        body.append("    ")
+        body.append(detail or "ChatGPT ended this turn in a non-standard state.")
+
+        self.console.print()
+        self.console.print(header, soft_wrap=True)
+        self.console.print(body, soft_wrap=True)
+        self.console.print()
 
     def clear_context(self) -> None:
         self.turn_abort()
