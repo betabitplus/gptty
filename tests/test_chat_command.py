@@ -243,6 +243,144 @@ def test_failure_marker_classifies_conversation_length_limit() -> None:
     )
 
 
+def test_failure_and_terminal_markers_classify_unavailable_conversation() -> None:
+    assert _turn_failure_marker(RuntimeError("conversation not found")) == (
+        "chat",
+        "unavailable",
+        "This conversation is no longer available; continue in a new chat.",
+    )
+    assert _turn_terminal_marker(
+        finish_reason=None,
+        terminal_observed=True,
+        terminal_error_code="conversation_unavailable",
+        terminal_error="Unable to load conversation",
+    ) == (
+        "chat",
+        "unavailable",
+        "This conversation is no longer available; continue in a new chat.",
+    )
+
+
+def test_goal_recovery_can_suppress_raw_request_error_output(tmp_path) -> None:
+    class LimitClient:
+        def send(self, prompt: str, **options):
+            raise RuntimeError("CHATGPT_CONVERSATION_LIMIT_EXCEEDED")
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+    stderr = StringIO()
+    result: dict[str, Any] = {}
+
+    code = _send_chat_prompt(
+        LimitClient(),
+        state=ChatState(),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="goal protocol prompt",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=stderr,
+        renderer=FakeRenderer(),
+        defer_final_rendering=True,
+        suppress_request_error_output=True,
+        result_out=result,
+    )
+
+    assert code == 1
+    assert stderr.getvalue() == ""
+    assert result["terminal_marker"][:2] == ("chat", "limit-reached")
+
+
+
+def test_send_can_suppress_live_answer_events_for_goal_protocol(tmp_path) -> None:
+    class EventClient:
+        def send(self, prompt: str, **options):
+            on_event = options["on_event"]
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": "reasoning-1",
+                    "message_kind": "reasoning",
+                    "text": "working",
+                }
+            )
+            on_event(
+                {
+                    "type": "assistant_text_delta",
+                    "message_id": "answer-1",
+                    "delta": "GPTTY_GOAL: COMPLETE\\n",
+                }
+            )
+            return Response(
+                text=(
+                    "GPTTY_GOAL: COMPLETE\\n"
+                    'GPTTY_CHECKPOINT: {"summary":"done","completed":[],"decisions":[],"pending":[],"next":"none"}\\n'
+                    "Visible answer."
+                ),
+                conversation_id="conv-goal-live",
+            )
+
+    class FakeRenderer:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def live_event(self, event):
+            self.events.append(("live_event", event))
+
+        def warning(self, text):
+            self.events.append(("warning", text))
+
+        def turn_abort(self):
+            self.events.append(("turn_abort", None))
+
+    renderer = FakeRenderer()
+    result: dict[str, Any] = {}
+    stdout = StringIO()
+
+    code = _send_chat_prompt(
+        EventClient(),
+        state=ChatState(),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="goal protocol prompt",
+        model=None,
+        media=None,
+        stream=True,
+        stdout=stdout,
+        stderr=StringIO(),
+        renderer=renderer,
+        defer_final_rendering=True,
+        suppress_live_answer=True,
+        result_out=result,
+    )
+
+    assert code == 0
+    assert any(
+        event[0] == "live_event"
+        and isinstance(event[1], dict)
+        and event[1].get("type") == "canonical_intermediate_message"
+        for event in renderer.events
+    )
+    assert not any(
+        event[0] == "live_event"
+        and isinstance(event[1], dict)
+        and event[1].get("type") == "assistant_text_delta"
+        for event in renderer.events
+    )
+    assert result["text"].endswith("Visible answer.")
+    assert stdout.getvalue() == ""
+
+
 def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
     save_chat_state(

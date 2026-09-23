@@ -13,12 +13,17 @@ from urllib.parse import urlparse
 from ..commands.export import save_markdown_export
 from ..goal import (
     MAX_PROTOCOL_FAILURES,
+    MAX_RECOVERY_ATTEMPTS,
+    MAX_ROLLOVERS,
     GoalSignal,
+    abnormal_recovery_prompt,
     activation_prompt,
     continuation_prompt,
     parse_goal_response,
+    rollover_prompt,
     steering_prompt,
 )
+from ..goal_store import GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
 from ..state import ChatState, GoalState, StateError, save_chat_state
@@ -60,6 +65,7 @@ class InteractiveCommands:
         self.ui = ui
         self.renderer = renderer
         self.tui_archive = tui_archive
+        self.goal_store = GoalStore(state_path)
         self._pending_media: list[str] = []
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
@@ -69,6 +75,7 @@ class InteractiveCommands:
         self._temporary_messages: list[OutputMessage] = []
         self._temporary_title: str | None = None
         self._automatic_prompts: list[str] = []
+        self._goal_bootstrap_pending = False
         self._pending_resume: ResumeRequest | None = None
 
     def handle(self, raw: str) -> int | None:
@@ -145,11 +152,20 @@ class InteractiveCommands:
 
     def pop_automatic_prompt(self) -> str | None:
         if not self._automatic_prompts:
+            self._goal_bootstrap_pending = False
             return None
-        return self._automatic_prompts.pop(0)
+        prompt = self._automatic_prompts.pop(0)
+        if self._goal_bootstrap_pending:
+            self._goal_bootstrap_pending = False
+        return prompt
 
     def clear_automatic_prompts(self) -> None:
         self._automatic_prompts.clear()
+        self._goal_bootstrap_pending = False
+
+    @property
+    def goal_bootstrap_pending(self) -> bool:
+        return self._goal_bootstrap_pending and bool(self._automatic_prompts)
 
     @property
     def has_pending_resume(self) -> bool:
@@ -306,9 +322,13 @@ class InteractiveCommands:
         goal.turn_count += 1
         goal.status = "paused"
         goal.reason = "stopped by user"
-        self._automatic_prompts.clear()
+        self.clear_automatic_prompts()
         self._save_state()
         self.renderer.info("Goal · paused · stopped by user")
+
+    def goal_display_text(self, text: str) -> str:
+        parsed = parse_goal_response(text)
+        return parsed.body if parsed.signal is not None else text
 
     def handle_goal_turn_result(self, result: dict[str, Any]) -> None:
         goal = self.state.goal
@@ -316,31 +336,71 @@ class InteractiveCommands:
             return
 
         conversation_ref = str(result.get("conversation_ref") or "").strip() or None
-        if goal.conversation_ref is None and conversation_ref:
-            goal.conversation_ref = conversation_ref
-        if (
-            goal.conversation_ref
-            and conversation_ref
-            and goal.conversation_ref != conversation_ref
-        ):
-            self._interrupt_goal("conversation changed during goal turn", notify=True)
+        if not self._bind_goal_conversation(goal, conversation_ref):
             return
 
         goal.turn_count += 1
         if bool(result.get("stopped_by_user")):
             goal.status = "paused"
             goal.reason = "stopped by user"
-            self._automatic_prompts.clear()
+            self.clear_automatic_prompts()
             self._save_state()
             self.renderer.info("Goal · paused · stopped by user")
             return
 
         parsed = parse_goal_response(str(result.get("text") or ""))
+        if parsed.checkpoint is not None:
+            self._update_goal_checkpoint(goal, parsed)
+        marker = self._goal_terminal_marker(result)
+        if marker is not None:
+            label, status, detail = marker
+            final_goal_signal_survives_dead_chat = (
+                label == "chat"
+                and status in {"limit-reached", "unavailable"}
+                and parsed.signal in {GoalSignal.COMPLETE, GoalSignal.BLOCKED}
+            )
+            if final_goal_signal_survives_dead_chat:
+                marker = None
+            elif label == "chat" and status in {"limit-reached", "unavailable"}:
+                self._rollover_goal(detail)
+                return
+            if status in {"filtered", "blocked"}:
+                goal.status = "blocked"
+                goal.reason = detail
+                self.clear_automatic_prompts()
+                self._save_state()
+                self.renderer.warning("Goal · blocked · user action required")
+                notify_response_complete(
+                    chat_title=str(result.get("title") or "").strip() or None,
+                    final_response=f"Goal blocked. {detail}",
+                )
+                return
+            if status == "rate-limited":
+                self._pause_goal_for_service_condition(detail)
+                return
+            if status in {
+                "abnormal",
+                "delivery-timeout",
+                "failed",
+                "incomplete",
+                "truncated",
+                "unconfirmed",
+                "unresolved",
+            }:
+                self._recover_goal_same_chat(
+                    detail,
+                    allow_rollover=status != "truncated",
+                )
+                return
+
+        self._update_goal_checkpoint(goal, parsed)
+
         if parsed.signal is GoalSignal.COMPLETE:
             goal.status = "complete"
             goal.protocol_failures = 0
+            goal.recovery_count = 0
             goal.reason = None
-            self._automatic_prompts.clear()
+            self.clear_automatic_prompts()
             self._save_state()
             self.renderer.info(
                 f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
@@ -354,8 +414,9 @@ class InteractiveCommands:
         if parsed.signal is GoalSignal.BLOCKED:
             goal.status = "blocked"
             goal.protocol_failures = 0
+            goal.recovery_count = 0
             goal.reason = parsed.body or "agent reported a blocker"
-            self._automatic_prompts.clear()
+            self.clear_automatic_prompts()
             self._save_state()
             self.renderer.warning("Goal · blocked · user action required")
             notify_response_complete(
@@ -368,20 +429,165 @@ class InteractiveCommands:
         if protocol_recovery:
             goal.protocol_failures += 1
             if goal.protocol_failures >= MAX_PROTOCOL_FAILURES:
-                self._interrupt_goal(
-                    f"missing valid GPTTY_GOAL status for {goal.protocol_failures} consecutive turns",
-                    notify=True,
-                    chat_title=str(result.get("title") or "").strip() or None,
+                self._rollover_goal(
+                    f"missing valid GPTTY_GOAL status for {goal.protocol_failures} consecutive turns"
                 )
                 return
         else:
             goal.protocol_failures = 0
+            goal.recovery_count = 0
 
         goal.reason = None
         if not self._save_state():
             self._interrupt_goal("failed to persist goal progress", notify=False)
             return
         self._queue_goal_continuation(protocol_recovery=protocol_recovery)
+
+    def handle_goal_turn_failure(
+        self,
+        result: dict[str, Any],
+        reason: str,
+        *,
+        chat_title: str | None = None,
+    ) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        marker = self._goal_terminal_marker(result)
+        if marker is None:
+            return False
+        goal.turn_count += 1
+        label, status, detail = marker
+        if label == "chat" and status in {"limit-reached", "unavailable"}:
+            return self._rollover_goal(detail)
+        if status in {"blocked", "filtered"}:
+            goal.status = "blocked"
+            goal.reason = detail
+            self.clear_automatic_prompts()
+            self._save_state()
+            self.renderer.warning("Goal · blocked · user action required")
+            notify_response_complete(
+                chat_title=chat_title,
+                final_response=f"Goal blocked. {detail}",
+            )
+            return True
+        if status == "rate-limited":
+            return self._pause_goal_for_service_condition(detail)
+        if status in {
+            "abnormal",
+            "delivery-timeout",
+            "failed",
+            "incomplete",
+            "truncated",
+            "unconfirmed",
+            "unresolved",
+        }:
+            return self._recover_goal_same_chat(
+                detail,
+                allow_rollover=status != "truncated",
+            )
+        return False
+
+    @staticmethod
+    def _goal_terminal_marker(
+        result: dict[str, Any],
+    ) -> tuple[str, str, str] | None:
+        marker = result.get("terminal_marker")
+        if not isinstance(marker, (tuple, list)) or len(marker) != 3:
+            return None
+        return (str(marker[0]), str(marker[1]), str(marker[2]))
+
+    def _bind_goal_conversation(
+        self,
+        goal: GoalState,
+        conversation_ref: str | None,
+    ) -> bool:
+        if goal.conversation_ref is None and conversation_ref:
+            goal.conversation_ref = conversation_ref
+        if (
+            goal.conversation_ref
+            and conversation_ref
+            and goal.conversation_ref != conversation_ref
+        ):
+            self._interrupt_goal("conversation changed during goal turn", notify=True)
+            return False
+        if conversation_ref and conversation_ref not in goal.conversations:
+            goal.conversations.append(conversation_ref)
+        return True
+
+    def _update_goal_checkpoint(self, goal: GoalState, parsed: Any) -> None:
+        checkpoint = parsed.checkpoint
+        if checkpoint is not None:
+            checkpoint.updated_turn = goal.turn_count
+            goal.checkpoint = checkpoint
+            return
+        body = " ".join(str(parsed.body or "").split()).strip()
+        if body:
+            goal.checkpoint.summary = body[:2400]
+            goal.checkpoint.updated_turn = goal.turn_count
+
+    def _recover_goal_same_chat(
+        self,
+        reason: str,
+        *,
+        allow_rollover: bool,
+    ) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        goal.reason = reason
+        if not allow_rollover:
+            goal.recovery_count = 0
+            self.clear_automatic_prompts()
+            self._automatic_prompts.append(abnormal_recovery_prompt(reason))
+            if not self._save_state():
+                self._interrupt_goal("failed to persist goal recovery state", notify=False)
+                return False
+            self.renderer.info("Goal · continuing · response was truncated")
+            return True
+
+        goal.recovery_count += 1
+        if goal.recovery_count > MAX_RECOVERY_ATTEMPTS:
+            return self._rollover_goal(f"repeated non-standard turns: {reason}")
+        self.clear_automatic_prompts()
+        self._automatic_prompts.append(abnormal_recovery_prompt(reason))
+        if not self._save_state():
+            self._interrupt_goal("failed to persist goal recovery state", notify=False)
+            return False
+        self.renderer.info(
+            f"Goal · recovering · attempt {goal.recovery_count}/{MAX_RECOVERY_ATTEMPTS}"
+        )
+        return True
+
+    def _rollover_goal(self, reason: str) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        if goal.rollover_count >= MAX_ROLLOVERS:
+            self._interrupt_goal(
+                f"rollover safety limit reached after {goal.rollover_count} recoveries: {reason}",
+                notify=True,
+            )
+            return True
+        old_ref = goal.conversation_ref or self.state.current_conversation
+        if old_ref and old_ref not in goal.conversations:
+            goal.conversations.append(old_ref)
+        goal.conversation_ref = None
+        goal.rollover_count += 1
+        goal.recovery_count = 0
+        goal.protocol_failures = 0
+        goal.reason = f"recovering in a new chat: {reason}"
+        self.state.current_conversation = None
+        self.clear_automatic_prompts()
+        self._automatic_prompts.append(rollover_prompt(goal, reason=reason))
+        self._goal_bootstrap_pending = True
+        if not self._save_state():
+            self._interrupt_goal("failed to persist goal rollover state", notify=False)
+            return False
+        self.renderer.info(
+            f"Goal · recovering · new chat · rollover {goal.rollover_count}"
+        )
+        return True
 
     def handle_goal_interruption(
         self, reason: str, *, chat_title: str | None = None
@@ -457,6 +663,37 @@ class InteractiveCommands:
         self._conversation_mode = "normal"
         self._reset_temporary_context()
 
+    def _capture_goal_context_seed(self, conversation_ref: str | None) -> list[str]:
+        if not conversation_ref:
+            return []
+        try:
+            messages = list(self.get_client().get_messages(conversation_ref))
+        except Exception:
+            return []
+
+        captured: list[str] = []
+        total = 0
+        for message in reversed(messages):
+            role = _field_text(message, "role")
+            if role not in {"user", "assistant"}:
+                continue
+            if role == "assistant":
+                recipient = _field_text(message, "recipient")
+                if recipient and recipient not in {"all", "assistant"}:
+                    continue
+            text = " ".join(_message_text(message).split()).strip()
+            if not text:
+                continue
+            entry = f"{role}: {text[:1600]}"
+            if total + len(entry) > 12000 and captured:
+                break
+            captured.append(entry)
+            total += len(entry)
+            if len(captured) >= 12:
+                break
+        captured.reverse()
+        return captured
+
     def _cmd_goal(self, argv: list[str]) -> None:
         if self._conversation_mode == "temporary":
             self.renderer.warning(
@@ -482,12 +719,23 @@ class InteractiveCommands:
                     self.renderer.info("No goal is configured.")
                     return
                 previous_goal = self.state.goal
+                try:
+                    self.goal_store.clear_current()
+                except OSError as exc:
+                    self.renderer.warning(f"failed to clear Goal pointer: {exc}")
+                    return
                 self.state.goal = None
-                self._automatic_prompts.clear()
+                self.clear_automatic_prompts()
                 if self._save_state():
                     self.renderer.info("Goal · cleared")
                 else:
                     self.state.goal = previous_goal
+                    try:
+                        self.goal_store.save(previous_goal)
+                    except OSError as exc:
+                        self.renderer.warning(
+                            f"failed to restore Goal pointer after state save failure: {exc}"
+                        )
                 return
             self._render_goal_status()
             return
@@ -517,15 +765,34 @@ class InteractiveCommands:
 
         self.state.goal = GoalState(
             conversation_ref=self.state.current_conversation,
+            conversations=(
+                [self.state.current_conversation]
+                if self.state.current_conversation
+                else []
+            ),
+            context_seed=self._capture_goal_context_seed(
+                self.state.current_conversation
+            ),
             status="active",
             objective=objective,
         )
+        ensure_goal_id(self.state.goal)
         if not self._save_state():
             self.state.goal = existing
+            try:
+                if existing is None:
+                    self.goal_store.clear_current()
+                else:
+                    self.goal_store.save(existing)
+            except OSError as exc:
+                self.renderer.warning(
+                    f"failed to restore Goal pointer after state save failure: {exc}"
+                )
             return
-        self._automatic_prompts.clear()
+        self.clear_automatic_prompts()
         self._automatic_prompts.append(activation_prompt(objective))
         self.renderer.info("Goal · active · starting")
+        self.renderer.info(f"Goal state: {self.goal_store.goal_path(self.state.goal)}")
 
     def _cmd_exit(self, argv: list[str]) -> int:
         self._pause_active_goal("gptty exited")
@@ -891,16 +1158,28 @@ class InteractiveCommands:
         )
         if goal.conversation_ref is None and self.state.current_conversation:
             goal.conversation_ref = self.state.current_conversation
+            if self.state.current_conversation not in goal.conversations:
+                goal.conversations.append(self.state.current_conversation)
+        previous_reason = goal.reason
         goal.status = "active"
         goal.reason = None
         if not self._save_state():
             return
-        self._automatic_prompts.clear()
-        self._automatic_prompts.append(
-            activation_prompt(goal.objective)
-            if bootstrap_without_chat
-            else continuation_prompt()
-        )
+        self.clear_automatic_prompts()
+        if bootstrap_without_chat and goal.conversations:
+            self._automatic_prompts.append(
+                rollover_prompt(
+                    goal,
+                    reason=previous_reason or "resuming durable Goal state",
+                )
+            )
+            self._goal_bootstrap_pending = True
+        else:
+            self._automatic_prompts.append(
+                activation_prompt(goal.objective)
+                if bootstrap_without_chat
+                else continuation_prompt()
+            )
         self.renderer.info(
             f"Goal · active · resuming after {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
         )
@@ -911,8 +1190,12 @@ class InteractiveCommands:
             self.renderer.info("No goal is configured.")
             return
         details = [f"Goal · {goal.status}", f"turns {goal.turn_count}"]
+        if goal.goal_id:
+            details.append(f"id {goal.goal_id[:8]}")
         if goal.conversation_ref:
             details.append(_short_ref(goal.conversation_ref))
+        if goal.rollover_count:
+            details.append(f"rollovers {goal.rollover_count}")
         if goal.protocol_failures:
             details.append(
                 f"protocol misses {goal.protocol_failures}/{MAX_PROTOCOL_FAILURES}"
@@ -920,6 +1203,25 @@ class InteractiveCommands:
         self.renderer.info(" · ".join(details))
         if goal.reason:
             self.renderer.info(f"Goal reason: {goal.reason}")
+        if goal.goal_id:
+            self.renderer.info(f"Goal state: {self.goal_store.goal_path(goal)}")
+            self.renderer.info(
+                f"Goal checkpoint: {self.goal_store.checkpoint_path(goal)}"
+            )
+
+    def _pause_goal_for_service_condition(self, reason: str) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        goal.status = "paused"
+        goal.reason = f"service backoff required: {reason}"
+        self.clear_automatic_prompts()
+        if not self._save_state():
+            return False
+        self.renderer.warning(
+            "Goal · paused · service backoff required · use /goal resume later"
+        )
+        return True
 
     def _pause_active_goal(self, reason: str) -> bool:
         goal = self.state.goal
@@ -927,7 +1229,7 @@ class InteractiveCommands:
             return False
         goal.status = "paused"
         goal.reason = reason
-        self._automatic_prompts.clear()
+        self.clear_automatic_prompts()
         self._save_state()
         return True
 
@@ -943,7 +1245,7 @@ class InteractiveCommands:
             return
         goal.status = "interrupted"
         goal.reason = reason
-        self._automatic_prompts.clear()
+        self.clear_automatic_prompts()
         self._save_state()
         self.renderer.warning(f"Goal · interrupted · {reason}")
         if notify:
@@ -968,8 +1270,10 @@ class InteractiveCommands:
 
     def _save_state(self) -> bool:
         try:
+            if self.state.goal is not None:
+                self.goal_store.save(self.state.goal)
             save_chat_state(self.state_path, self.state)
-        except StateError as exc:
+        except (OSError, StateError) as exc:
             self.renderer.warning(str(exc))
             return False
         return True

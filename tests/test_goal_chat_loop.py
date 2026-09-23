@@ -8,7 +8,14 @@ from types import SimpleNamespace
 
 from gptty.commands import chat as chat_module
 from gptty.commands.chat import run_chat
-from gptty.state import ChatState, GoalState, load_chat_state, save_chat_state
+from gptty.goal_store import GoalStore
+from gptty.state import (
+    ChatState,
+    GoalCheckpoint,
+    GoalState,
+    load_chat_state,
+    save_chat_state,
+)
 
 
 class _GoalLoopClient:
@@ -139,7 +146,9 @@ def _args(tmp_path):
     )
 
 
-def test_turn_health_status_distinguishes_delivery_and_backend_stall(monkeypatch) -> None:
+def test_turn_health_status_distinguishes_delivery_and_backend_stall(
+    monkeypatch,
+) -> None:
     now = 500.0
     monkeypatch.setattr(chat_module.time, "monotonic", lambda: now)
     health = chat_module._TurnHealth(last_server_progress_at=470.0)
@@ -354,7 +363,104 @@ def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(
     assert created == []
 
 
-def test_goal_hard_chat_error_interrupts_without_auto_retry(
+def test_goal_recovers_from_standalone_store_when_chat_state_is_missing(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    store = GoalStore(state_path)
+    store.save(
+        GoalState(
+            goal_id="goal-recover",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+            objective="Finish safely",
+            turn_count=5,
+            checkpoint=GoalCheckpoint(
+                summary="Core changes are already applied.",
+                decisions=["do not rewrite commit A"],
+                next_step="verify current repository state",
+                updated_turn=5,
+            ),
+        )
+    )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    restored = load_chat_state(state_path)
+    assert restored.current_conversation == "conv-1"
+    assert restored.goal is not None
+    assert restored.goal.goal_id == "goal-recover"
+    assert restored.goal.status == "paused"
+    assert restored.goal.turn_count == 5
+    assert restored.goal.checkpoint.decisions == ["do not rewrite commit A"]
+    assert restored.goal.reason == "gptty restarted while goal was active"
+    assert created == []
+
+
+def test_goal_recovers_from_standalone_store_when_chat_state_is_corrupt(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    store = GoalStore(state_path)
+    store.save(
+        GoalState(
+            goal_id="goal-corrupt-recover",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+            objective="Recover safely",
+            turn_count=4,
+            checkpoint=GoalCheckpoint(
+                summary="Durable work exists.",
+                completed=["commit A already landed"],
+                next_step="inspect current state",
+                updated_turn=4,
+            ),
+        )
+    )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+
+    stderr = StringIO()
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 0
+    restored = load_chat_state(state_path)
+    assert restored.current_conversation == "conv-1"
+    assert restored.goal is not None
+    assert restored.goal.goal_id == "goal-corrupt-recover"
+    assert restored.goal.status == "paused"
+    assert restored.goal.turn_count == 4
+    assert restored.goal.checkpoint.completed == ["commit A already landed"]
+    assert restored.goal.reason == "gptty restarted while goal was active"
+    assert "recovered Goal state from standalone goal store" in stderr.getvalue()
+    assert created == []
+
+
+def test_goal_hard_chat_limit_rolls_over_to_new_chat_and_completes(
     tmp_path, monkeypatch
 ) -> None:
     class HardFailureClient:
@@ -363,15 +469,49 @@ def test_goal_hard_chat_error_interrupts_without_auto_retry(
         def __init__(
             self, auth_file: str = "auth_data.json", timeout: int = 90
         ) -> None:
-            self.calls: list[str] = []
+            self.calls: list[tuple[str, str, str | None]] = []
             self.__class__.instances.append(self)
 
-        def send(self, prompt: str, **options):
-            self.calls.append(prompt)
+        def get_messages(self, ref: str):
+            return [
+                {"role": "user", "text": "Keep the API stable and finish the task."},
+                {"role": "assistant", "text": "Agreed. I already pushed commit A."},
+            ]
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt, ref))
             raise RuntimeError("CHATGPT_CONVERSATION_LIMIT_EXCEEDED")
 
+        def send(self, prompt: str, **options):
+            self.calls.append(("send", prompt, None))
+            return SimpleNamespace(
+                text=(
+                    "GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"done","completed":["commit A preserved",'
+                    '"live acceptance passed"],"decisions":["keep API stable"],'
+                    '"pending":[],"next":"none"}\n'
+                    "Recovered in the new chat and finished safely."
+                ),
+                conversation_id="conv-new",
+                title="Recovered goal",
+            )
+
+    save_chat_state(
+        tmp_path / "state.json",
+        ChatState(current_conversation="conv-old"),
+    )
     _FakeRenderer.instances.clear()
-    _FakeSession.script = iter(['/goal "Do the full task"'])
+    _FakeSession.script = iter(
+        [
+            '/goal "Do the full task"',
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and ("info", "Goal · complete · 2 turns")
+                in _FakeRenderer.instances[0].events,
+                "/exit",
+            ),
+        ]
+    )
     goal_notifications: list[dict[str, object]] = []
     monkeypatch.setattr(
         "gptty.commands.chat.should_use_enhanced_ui",
@@ -384,29 +524,39 @@ def test_goal_hard_chat_error_interrupts_without_auto_retry(
         lambda **kwargs: goal_notifications.append(kwargs),
     )
 
-    stderr = StringIO()
     code = run_chat(
         _args(tmp_path),
         client_factory=HardFailureClient,
         input_stream=StringIO(),
         stdout=StringIO(),
-        stderr=stderr,
+        stderr=StringIO(),
     )
 
-    assert code == 1
+    assert code == 0
     client = HardFailureClient.instances[0]
-    assert len(client.calls) == 1
+    assert [call[0] for call in client.calls] == ["send_to_conversation", "send"]
+    assert client.calls[0][2] == "conv-old"
+    handoff = client.calls[1][1]
+    assert "fresh ChatGPT conversation" in handoff
+    assert "Do not repeat completed external actions" in handoff
+    assert "user: Keep the API stable and finish the task." in handoff
     state = load_chat_state(tmp_path / "state.json")
+    assert state.current_conversation == "conv-new"
     assert state.goal is not None
-    assert state.goal.status == "interrupted"
-    assert state.goal.reason == "chat turn failed with exit code 1"
+    assert state.goal.status == "complete"
+    assert state.goal.rollover_count == 1
+    assert state.goal.conversations == ["conv-old", "conv-new"]
+    assert state.goal.checkpoint.decisions == ["keep API stable"]
     assert goal_notifications == [
         {
-            "chat_title": None,
-            "final_response": "Goal interrupted. chat turn failed with exit code 1",
+            "chat_title": "Recovered goal",
+            "final_response": "Recovered in the new chat and finished safely.",
         }
     ]
-    assert "CHATGPT_CONVERSATION_LIMIT_EXCEEDED" in stderr.getvalue()
+    goal_json = tmp_path / "goals" / state.goal.goal_id / "goal.json"
+    checkpoint = tmp_path / "goals" / state.goal.goal_id / "checkpoint.md"
+    assert goal_json.exists()
+    assert checkpoint.exists()
 
 
 def test_goal_queued_steering_replaces_pending_auto_continuation(
@@ -760,7 +910,7 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
     assert notifications == []
 
 
-def test_goal_incomplete_turn_interrupts_without_auto_continue(
+def test_goal_incomplete_turn_reconciles_same_chat_then_completes(
     tmp_path, monkeypatch
 ) -> None:
     class IncompleteGoalClient:
@@ -769,11 +919,11 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(
         def __init__(
             self, auth_file: str = "auth_data.json", timeout: int = 90
         ) -> None:
-            self.calls: list[str] = []
+            self.calls: list[tuple[str, str, str | None]] = []
             self.__class__.instances.append(self)
 
         def send(self, prompt: str, **options):
-            self.calls.append(prompt)
+            self.calls.append(("send", prompt, None))
             return SimpleNamespace(
                 text="",
                 title="Incomplete goal",
@@ -784,7 +934,17 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(
             )
 
         def send_to_conversation(self, ref: str, prompt: str, **options):
-            raise AssertionError("incomplete Goal must not auto-continue")
+            self.calls.append(("send_to_conversation", prompt, ref))
+            return SimpleNamespace(
+                text=(
+                    "GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"reconciled and done","completed":'
+                    '["verified prior side effect"],"decisions":[],"pending":[],"next":"none"}\n'
+                    "Recovered without repeating the uncertain action."
+                ),
+                conversation_id=ref,
+                title="Incomplete goal",
+            )
 
     IncompleteGoalClient.instances.clear()
     _FakeRenderer.instances.clear()
@@ -793,10 +953,8 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(
             '/goal "Finish the task"',
             (
                 lambda: bool(_FakeRenderer.instances)
-                and any(
-                    event[0] == "warning" and "Goal · interrupted" in str(event[1])
-                    for event in _FakeRenderer.instances[0].events
-                ),
+                and ("info", "Goal · complete · 2 turns")
+                in _FakeRenderer.instances[0].events,
                 "/exit",
             ),
         ]
@@ -817,11 +975,16 @@ def test_goal_incomplete_turn_interrupts_without_auto_continue(
     )
 
     assert code == 0
-    assert len(IncompleteGoalClient.instances[0].calls) == 1
+    client = IncompleteGoalClient.instances[0]
+    assert [call[0] for call in client.calls] == ["send", "send_to_conversation"]
+    recovery_prompt = client.calls[1][1]
+    assert "non-standard transport/chat state" in recovery_prompt
+    assert "Do not blindly repeat the previous action" in recovery_prompt
     state = load_chat_state(tmp_path / "state.json")
     assert state.goal is not None
-    assert state.goal.status == "interrupted"
-    assert state.goal.reason == "ChatGPT stream ended before a final assistant completion."
+    assert state.goal.status == "complete"
+    assert state.goal.turn_count == 2
+    assert state.goal.checkpoint.completed == ["verified prior side effect"]
 
 
 def test_resume_loading_queues_text_without_concurrent_cwa_request(
@@ -1574,16 +1737,24 @@ def test_stop_command_during_follow_stops_then_sends_queued_prompt(
         )
 
     def queued_visible() -> bool:
-        return bool(_FakeRenderer.instances) and (
-            "info",
-            "Queued · 1",
-        ) in _FakeRenderer.instances[0].events
+        return (
+            bool(_FakeRenderer.instances)
+            and (
+                "info",
+                "Queued · 1",
+            )
+            in _FakeRenderer.instances[0].events
+        )
 
     def queued_sent() -> bool:
-        return bool(FollowStopClient.instances) and (
-            "send_to_conversation",
-            "queued after stop",
-        ) in FollowStopClient.instances[0].calls
+        return (
+            bool(FollowStopClient.instances)
+            and (
+                "send_to_conversation",
+                "queued after stop",
+            )
+            in FollowStopClient.instances[0].calls
+        )
 
     _FakeSession.script = iter(
         [
@@ -1612,14 +1783,12 @@ def test_stop_command_during_follow_stops_then_sends_queued_prompt(
     client = FollowStopClient.instances[0]
     assert ("stop_generation", "conv-follow-stop") in client.calls
     assert client.calls.count(("send_to_conversation", "queued after stop")) == 1
-    assert client.calls.index(("stop_generation", "conv-follow-stop")) < client.calls.index(
-        ("send_to_conversation", "queued after stop")
-    )
+    assert client.calls.index(
+        ("stop_generation", "conv-follow-stop")
+    ) < client.calls.index(("send_to_conversation", "queued after stop"))
 
 
-def test_nonterminal_follow_keeps_queued_prompt_unsent(
-    tmp_path, monkeypatch
-) -> None:
+def test_nonterminal_follow_keeps_queued_prompt_unsent(tmp_path, monkeypatch) -> None:
     class NonterminalFollowClient:
         instances: list["NonterminalFollowClient"] = []
         release_stream = threading.Event()
@@ -1895,7 +2064,9 @@ def test_resume_follow_replaces_corrupt_stream_final_with_canonical_snapshot(
     assert notifications[-1]["final_response"] == "complete canonical answer"
 
 
-def test_attached_follow_does_not_replay_previously_rendered_intermediate_as_message() -> None:
+def test_attached_follow_does_not_replay_previously_rendered_intermediate_as_message() -> (
+    None
+):
     renderer = _FakeRenderer(StringIO(), SimpleNamespace())
     follow = chat_module._EnhancedFollow(
         conversation_ref="conv-live",

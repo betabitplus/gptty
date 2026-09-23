@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +11,28 @@ class StateError(RuntimeError):
 
 
 @dataclass
+class GoalCheckpoint:
+    summary: str | None = None
+    completed: list[str] = field(default_factory=list)
+    decisions: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    next_step: str | None = None
+    updated_turn: int = 0
+
+
+@dataclass
 class GoalState:
+    goal_id: str | None = None
     conversation_ref: str | None = None
+    conversations: list[str] = field(default_factory=list)
+    context_seed: list[str] = field(default_factory=list)
     status: str = "paused"
     objective: str | None = None
     turn_count: int = 0
     protocol_failures: int = 0
+    recovery_count: int = 0
+    rollover_count: int = 0
+    checkpoint: GoalCheckpoint = field(default_factory=GoalCheckpoint)
     reason: str | None = None
 
 
@@ -42,12 +58,14 @@ def load_chat_state(path: str | Path) -> ChatState:
         raise StateError(f"failed to load state from {state_path}: {exc}") from exc
 
     if not isinstance(data, dict):
-        raise StateError(f"failed to load state from {state_path}: expected JSON object")
+        raise StateError(
+            f"failed to load state from {state_path}: expected JSON object"
+        )
 
     return ChatState(
         current_conversation=_optional_str(data.get("current_conversation")),
         model=_optional_str(data.get("model")),
-        goal=_goal_state(data.get("goal")),
+        goal=goal_state_from_dict(data.get("goal")),
     )
 
 
@@ -67,6 +85,28 @@ def save_chat_state(path: str | Path, state: ChatState) -> None:
         raise StateError(f"failed to save state to {state_path}: {exc}") from exc
 
 
+def goal_state_from_dict(value: Any) -> GoalState | None:
+    if not isinstance(value, dict):
+        return None
+    status = _optional_str(value.get("status")) or "paused"
+    if status not in {"active", "paused", "blocked", "complete", "interrupted"}:
+        status = "paused"
+    return GoalState(
+        goal_id=_optional_str(value.get("goal_id")),
+        conversation_ref=_optional_str(value.get("conversation_ref")),
+        conversations=_string_list(value.get("conversations")),
+        context_seed=_string_list(value.get("context_seed")),
+        status=status,
+        objective=_optional_str(value.get("objective")),
+        turn_count=_non_negative_int(value.get("turn_count")),
+        protocol_failures=_non_negative_int(value.get("protocol_failures")),
+        recovery_count=_non_negative_int(value.get("recovery_count")),
+        rollover_count=_non_negative_int(value.get("rollover_count")),
+        checkpoint=_goal_checkpoint(value.get("checkpoint")),
+        reason=_optional_str(value.get("reason")),
+    )
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -76,20 +116,28 @@ def _optional_str(value: Any) -> str | None:
     return str(value)
 
 
-def _goal_state(value: Any) -> GoalState | None:
+def _goal_checkpoint(value: Any) -> GoalCheckpoint:
     if not isinstance(value, dict):
-        return None
-    status = _optional_str(value.get("status")) or "paused"
-    if status not in {"active", "paused", "blocked", "complete", "interrupted"}:
-        status = "paused"
-    return GoalState(
-        conversation_ref=_optional_str(value.get("conversation_ref")),
-        status=status,
-        objective=_optional_str(value.get("objective")),
-        turn_count=_non_negative_int(value.get("turn_count")),
-        protocol_failures=_non_negative_int(value.get("protocol_failures")),
-        reason=_optional_str(value.get("reason")),
+        return GoalCheckpoint()
+    return GoalCheckpoint(
+        summary=_optional_str(value.get("summary")),
+        completed=_string_list(value.get("completed")),
+        decisions=_string_list(value.get("decisions")),
+        pending=_string_list(value.get("pending")),
+        next_step=_optional_str(value.get("next_step")),
+        updated_turn=_non_negative_int(value.get("updated_turn")),
     )
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        normalized = _optional_str(item)
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 def _non_negative_int(value: Any) -> int:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from gptty.goal import MAX_ROLLOVERS
 from gptty.state import (
     ChatState,
     GoalState,
@@ -904,11 +905,116 @@ def test_goal_command_starts_on_attached_conversation_and_queues_activation(
     assert state.goal is not None
     assert state.goal.status == "active"
     assert state.goal.conversation_ref == "conv-1"
+    assert state.goal.conversations == ["conv-1"]
+    assert state.goal.context_seed == [
+        "user: question",
+        "assistant: answer",
+    ]
+    assert state.goal.goal_id is not None
     assert load_chat_state(state_path).goal == state.goal
+    goal_path = tmp_path / "goals" / state.goal.goal_id / "goal.json"
+    checkpoint_path = tmp_path / "goals" / state.goal.goal_id / "checkpoint.md"
+    assert goal_path.exists()
+    assert checkpoint_path.exists()
     prompt = commands.pop_automatic_prompt()
     assert prompt is not None
     assert "GPTTY Goal mode is now active" in prompt
     assert ("info", "Goal · active · starting") in renderer.events
+    assert ("info", f"Goal state: {goal_path}") in renderer.events
+
+
+def test_goal_start_restores_previous_pointer_if_chat_state_save_fails(
+    tmp_path, monkeypatch
+) -> None:
+    previous_goal = GoalState(
+        goal_id="goal-old",
+        conversation_ref="conv-1",
+        conversations=["conv-1"],
+        status="complete",
+        objective="Old finished goal",
+    )
+    state = ChatState(current_conversation="conv-1", goal=previous_goal)
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.goal_store.save(previous_goal)
+
+    def fail_save(*args, **kwargs) -> None:
+        raise StateError("disk failed")
+
+    monkeypatch.setattr("gptty.ui.commands.save_chat_state", fail_save)
+
+    commands.handle('/goal "New goal"')
+
+    assert state.goal == previous_goal
+    assert commands.goal_store.load_current() == previous_goal
+    assert commands.goal_store.current_path().read_text().strip() == "goal-old"
+    assert ("warning", "disk failed") in renderer.events
+
+
+def test_goal_clear_restores_pointer_if_chat_state_save_fails(
+    tmp_path, monkeypatch
+) -> None:
+    goal = GoalState(
+        goal_id="goal-clear",
+        conversation_ref="conv-1",
+        conversations=["conv-1"],
+        status="paused",
+    )
+    state = ChatState(current_conversation="conv-1", goal=goal)
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.goal_store.save(goal)
+
+    def fail_save(*args, **kwargs) -> None:
+        raise StateError("disk failed")
+
+    monkeypatch.setattr("gptty.ui.commands.save_chat_state", fail_save)
+
+    commands.handle("/goal clear")
+
+    assert state.goal == goal
+    assert commands.goal_store.load_current() == goal
+    assert renderer.events[-1] == ("warning", "disk failed")
+
+
+def test_goal_rollover_safety_limit_interrupts_instead_of_looping(
+    tmp_path, monkeypatch
+) -> None:
+    goal = GoalState(
+        goal_id="goal-loop",
+        conversation_ref="conv-1",
+        conversations=["conv-1"],
+        status="active",
+        rollover_count=MAX_ROLLOVERS,
+    )
+    state = ChatState(current_conversation="conv-1", goal=goal)
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+            "terminal_marker": (
+                "chat",
+                "limit-reached",
+                "This conversation reached its maximum length.",
+            ),
+        }
+    )
+
+    assert goal.status == "interrupted"
+    assert goal.rollover_count == MAX_ROLLOVERS
+    assert commands.has_automatic_prompt is False
+    assert "rollover safety limit reached" in (goal.reason or "")
+    assert any(
+        event[0] == "warning" and "Goal · interrupted" in str(event[1])
+        for event in renderer.events
+    )
+    assert notified
 
 
 def test_goal_command_can_start_new_chat_with_explicit_objective(tmp_path) -> None:
@@ -1041,7 +1147,7 @@ def test_goal_blocked_stops_loop_and_notifies_for_user_action(
     assert ("warning", "Goal · blocked · user action required") in renderer.events
 
 
-def test_goal_missing_status_recovers_twice_then_interrupts(
+def test_goal_missing_status_recovers_twice_then_rolls_over(
     tmp_path, monkeypatch
 ) -> None:
     state = ChatState(
@@ -1080,15 +1186,271 @@ def test_goal_missing_status_recovers_twice_then_interrupts(
     )
 
     assert state.goal is not None
-    assert state.goal.status == "interrupted"
-    assert state.goal.protocol_failures == 3
+    assert state.goal.status == "active"
+    assert state.goal.protocol_failures == 0
+    assert state.goal.rollover_count == 1
+    assert state.goal.conversation_ref is None
+    assert state.goal.conversations == ["conv-1"]
+    assert state.current_conversation is None
+    assert commands.goal_bootstrap_pending is True
+    handoff = commands.pop_automatic_prompt() or ""
+    assert "fresh ChatGPT conversation" in handoff
+    assert "missing valid GPTTY_GOAL status for 3 consecutive turns" in handoff
+    assert notified == []
+
+
+def test_goal_complete_survives_post_final_chat_limit_without_rollover(
+    tmp_path, monkeypatch
+) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-complete",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Everything is finished."
+            ),
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+            "terminal_marker": (
+                "chat",
+                "limit-reached",
+                "This conversation reached its maximum length; start a new chat to continue.",
+            ),
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "complete"
+    assert state.goal.rollover_count == 0
+    assert state.goal.checkpoint.completed == ["verified"]
+    assert state.current_conversation == "conv-1"
     assert commands.has_automatic_prompt is False
     assert notified == [
         {
             "chat_title": "Goal chat",
-            "final_response": "Goal interrupted. missing valid GPTTY_GOAL status for 3 consecutive turns",
+            "final_response": "Everything is finished.",
         }
     ]
+
+
+def test_goal_complete_survives_post_final_chat_unavailable_without_rollover(
+    tmp_path, monkeypatch
+) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-complete-unavailable",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Everything is finished."
+            ),
+            "title": "Goal chat",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+            "terminal_marker": (
+                "chat",
+                "unavailable",
+                "This conversation is no longer available; continue in a new chat.",
+            ),
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "complete"
+    assert state.goal.rollover_count == 0
+    assert state.goal.checkpoint.completed == ["verified"]
+    assert commands.has_automatic_prompt is False
+    assert notified[0]["final_response"] == "Everything is finished."
+
+
+def test_goal_truncated_turn_continues_same_chat_without_recovery_escalation(
+    tmp_path,
+) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-truncated",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    for _ in range(4):
+        commands.handle_goal_turn_result(
+            {
+                "text": "Partial answer",
+                "conversation_ref": "conv-1",
+                "terminal_marker": (
+                    "turn",
+                    "truncated",
+                    "ChatGPT ended the response at an output-length limit.",
+                ),
+            }
+        )
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.recovery_count == 0
+    assert state.goal.rollover_count == 0
+    assert state.goal.conversation_ref == "conv-1"
+    assert commands.has_automatic_prompt is True
+    assert (
+        "info",
+        "Goal · continuing · response was truncated",
+    ) in renderer.events
+
+
+def test_goal_abnormal_turn_preserves_structured_checkpoint_before_recovery(
+    tmp_path,
+) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-checkpoint-recovery",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: CONTINUE\n"
+                'GPTTY_CHECKPOINT: {"summary":"write landed","completed":["commit A pushed"],'
+                '"decisions":["keep old API"],"pending":["verify"],"next":"inspect repo"}\n'
+                "The web turn ended strangely after the write."
+            ),
+            "conversation_ref": "conv-1",
+            "terminal_marker": (
+                "turn",
+                "abnormal",
+                "ChatGPT web UI reports an error for the last turn.",
+            ),
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.checkpoint.completed == ["commit A pushed"]
+    assert state.goal.checkpoint.decisions == ["keep old API"]
+    assert state.goal.checkpoint.next_step == "inspect repo"
+    assert state.goal.checkpoint.updated_turn == 1
+    assert state.goal.recovery_count == 1
+    assert commands.has_automatic_prompt is True
+
+
+def test_goal_repeated_abnormal_turns_reconcile_then_roll_over(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-recover",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    result = {
+        "text": "",
+        "conversation_ref": "conv-1",
+        "stopped_by_user": False,
+        "terminal_marker": (
+            "turn",
+            "abnormal",
+            "ChatGPT web UI reports an error for the last turn.",
+        ),
+    }
+
+    for expected_attempt in (1, 2):
+        commands.handle_goal_turn_result(result)
+        assert state.goal is not None
+        assert state.goal.recovery_count == expected_attempt
+        recovery = commands.pop_automatic_prompt() or ""
+        assert "Do not blindly repeat the previous action" in recovery
+        assert state.current_conversation == "conv-1"
+
+    commands.handle_goal_turn_result(result)
+
+    assert state.goal is not None
+    assert state.goal.rollover_count == 1
+    assert state.goal.recovery_count == 0
+    assert state.goal.conversation_ref is None
+    assert state.current_conversation is None
+    assert commands.goal_bootstrap_pending is True
+    handoff = commands.pop_automatic_prompt() or ""
+    assert "repeated non-standard turns" in handoff
+
+
+def test_goal_rate_limit_pauses_instead_of_spamming_requests(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-1",
+        goal=GoalState(
+            goal_id="goal-rate",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="active",
+        ),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle_goal_turn_result(
+        {
+            "text": "",
+            "conversation_ref": "conv-1",
+            "stopped_by_user": False,
+            "terminal_marker": (
+                "turn",
+                "rate-limited",
+                "ChatGPT rate-limited this request.",
+            ),
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "paused"
+    assert state.goal.rollover_count == 0
+    assert commands.has_automatic_prompt is False
+    assert any(
+        event[0] == "warning" and "service backoff required" in str(event[1])
+        for event in renderer.events
+    )
 
 
 def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -> None:

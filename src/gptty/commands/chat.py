@@ -27,6 +27,7 @@ from ..locks import (
     render_lock_timeout,
     render_stale_lock_recovered,
 )
+from ..goal_store import GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
@@ -489,6 +490,26 @@ def _turn_terminal_marker(
             "limit-reached",
             "This conversation reached its maximum length; start a new chat to continue.",
         )
+    conversation_unavailable_text = any(
+        token in normalized_error_text
+        for token in (
+            "conversation not found",
+            "conversation unavailable",
+            "unable to load conversation",
+            "could not load conversation",
+            "chat not found",
+        )
+    )
+    if error_code in {
+        "conversation_unavailable",
+        "conversation_not_found",
+        "conversation_missing",
+    } or conversation_unavailable_text:
+        return (
+            "chat",
+            "unavailable",
+            "This conversation is no longer available; continue in a new chat.",
+        )
     if error_code:
         detail = f"ChatGPT reported server error {error_code!r} after this turn."
         if error_text:
@@ -550,6 +571,21 @@ def _turn_failure_marker(error: BaseException) -> tuple[str, str, str]:
             "limit-reached",
             "This conversation reached its length limit; start a new chat to continue.",
         )
+    if any(
+        token in normalized
+        for token in (
+            "conversation not found",
+            "conversation unavailable",
+            "unable to load conversation",
+            "could not load conversation",
+            "chat not found",
+        )
+    ):
+        return (
+            "chat",
+            "unavailable",
+            "This conversation is no longer available; continue in a new chat.",
+        )
     if "429" in normalized or "rate limit" in normalized:
         return (
             "turn",
@@ -595,11 +631,40 @@ def run_chat(
     stderr: TextIO = sys.stderr,
 ) -> int:
     state_path = Path(getattr(args, "state", "gptty_state.json"))
+    goal_store = GoalStore(state_path)
     try:
         state = load_chat_state(state_path)
     except StateError as exc:
-        print(f"gptty: {exc}", file=stderr)
-        return 1
+        recovered_goal = goal_store.load_current()
+        if recovered_goal is None:
+            print(f"gptty: {exc}", file=stderr)
+            return 1
+        print(
+            "gptty: recovered Goal state from standalone goal store",
+            file=stderr,
+        )
+        state = ChatState(
+            current_conversation=recovered_goal.conversation_ref,
+            goal=recovered_goal,
+        )
+
+    current_goal = goal_store.load_current()
+    if current_goal is not None:
+        state.goal = current_goal
+        if state.current_conversation is None:
+            state.current_conversation = current_goal.conversation_ref
+    if state.goal is not None:
+        if state.goal.goal_id and current_goal is None:
+            stored_goal = goal_store.load(state.goal.goal_id)
+            if stored_goal is not None:
+                state.goal = stored_goal
+        ensure_goal_id(state.goal)
+        try:
+            goal_store.save(state.goal)
+            save_chat_state(state_path, state)
+        except (OSError, StateError) as exc:
+            print(f"gptty: failed to persist goal state: {exc}", file=stderr)
+            return 1
 
     startup_goal_paused = False
     if state.goal is not None and state.goal.status == "active":
@@ -607,8 +672,9 @@ def run_chat(
         state.goal.reason = "gptty restarted while goal was active"
         startup_goal_paused = True
         try:
+            goal_store.save(state.goal)
             save_chat_state(state_path, state)
-        except StateError as exc:
+        except (OSError, StateError) as exc:
             print(f"gptty: {exc}", file=stderr)
             return 1
 
@@ -836,6 +902,7 @@ def run_chat(
                     else None
                 ),
                 notify_completion=not goal_turn,
+                suppress_request_error_output=goal_turn,
                 result_out=turn_result,
                 on_stop_confirmed=(
                     interactive_commands.pause_goal_after_user_stop
@@ -851,6 +918,12 @@ def run_chat(
             return 0
         if code != 0:
             if interactive_commands is not None:
+                if goal_turn and interactive_commands.handle_goal_turn_failure(
+                    turn_result,
+                    f"chat turn failed with exit code {code}",
+                    chat_title=str(turn_result.get("title") or "").strip() or None,
+                ):
+                    continue
                 if goal_turn:
                     interactive_commands.handle_goal_interruption(
                         f"chat turn failed with exit code {code}"
@@ -1018,7 +1091,10 @@ async def _enhanced_loop_core(
         if active is None and active_resume is None and active_follow is None:
             next_prompt: str | None = None
             automatic_turn = False
-            if queued_prompts:
+            if commands.goal_bootstrap_pending:
+                next_prompt = commands.pop_automatic_prompt()
+                automatic_turn = next_prompt is not None
+            elif queued_prompts:
                 commands.clear_automatic_prompts()
                 next_prompt = queued_prompts.popleft()
             else:
@@ -1925,6 +2001,12 @@ async def _finish_enhanced_turn(
         marker = turn.result.get("terminal_marker")
         if isinstance(marker, (tuple, list)) and len(marker) == 3:
             renderer.turn_marker(str(marker[0]), str(marker[1]), str(marker[2]))
+        if turn.goal_turn and commands.handle_goal_turn_failure(
+            turn.result,
+            f"chat turn failed with exit code {code}",
+            chat_title=str(turn.result.get("title") or "").strip() or None,
+        ):
+            return None
         if turn.goal_turn:
             commands.handle_goal_interruption(f"chat turn failed with exit code {code}")
         await _cancel_prompt_task(prompt_task)
@@ -1933,6 +2015,9 @@ async def _finish_enhanced_turn(
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
     stopped_by_user = bool(turn.result.get("stopped_by_user"))
     final_text = str(turn.result.get("text") or "")
+    display_text = (
+        commands.goal_display_text(final_text) if turn.goal_turn else final_text
+    )
     marker = turn.result.get("terminal_marker")
     terminal_marker = (
         (str(marker[0]), str(marker[1]), str(marker[2]))
@@ -1943,7 +2028,7 @@ async def _finish_enhanced_turn(
     if incomplete_turn:
         renderer.turn_abort()
     else:
-        renderer.answer(final_text)
+        renderer.answer(display_text)
         renderer.answer_model(
             turn.result.get("observed_model"),
             requested_model=turn.result.get("requested_model"),
@@ -1967,7 +2052,11 @@ async def _finish_enhanced_turn(
         commands.clear_automatic_prompts()
 
     incomplete_turn = bool(turn.result.get("incomplete_without_terminal"))
-    if abnormal_turn:
+    if turn.goal_turn:
+        commands.handle_goal_turn_result(turn.result)
+        if turn.pause_goal_after_turn and commands.goal_active:
+            commands.handle("/goal pause")
+    elif abnormal_turn:
         queued_count = len(queued_prompts)
         queued_prompts.clear()
         commands.clear_automatic_prompts()
@@ -1975,16 +2064,6 @@ async def _finish_enhanced_turn(
             renderer.info(
                 f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after abnormal turn."
             )
-        if turn.goal_turn:
-            commands.handle_goal_interruption(
-                terminal_marker[2]
-                if terminal_marker is not None
-                else "ChatGPT turn ended abnormally"
-            )
-    elif turn.goal_turn:
-        commands.handle_goal_turn_result(turn.result)
-        if turn.pause_goal_after_turn and commands.goal_active:
-            commands.handle("/goal pause")
 
     if turn.exit_after_turn or turn.controls.quit_requested.is_set():
         if turn.goal_turn and commands.goal_active:
@@ -2094,6 +2173,8 @@ def _start_enhanced_turn(
             turn_health=health,
             tui_archive=commands.tui_archive,
             archive_turn_id=archive_turn_id,
+            suppress_live_answer=goal_turn,
+            suppress_request_error_output=goal_turn,
         )
     )
     active = _EnhancedTurn(
@@ -2388,6 +2469,8 @@ def _send_chat_prompt(
     turn_health: _TurnHealth | None = None,
     tui_archive: TUIArchive | None = None,
     archive_turn_id: str | None = None,
+    suppress_live_answer: bool = False,
+    suppress_request_error_output: bool = False,
 ) -> int:
     if result_out is not None:
         result_out.clear()
@@ -2479,6 +2562,16 @@ def _send_chat_prompt(
                 write_committed.set()
         if stopped_by_user or local_quit_requested:
             return
+        if (
+            suppress_live_answer
+            and event_type
+            in {
+                "assistant_text_snapshot",
+                "assistant_text_delta",
+                "assistant_text_revision",
+            }
+        ):
+            return
         if renderer is not None:
             renderer.live_event(event)
             return
@@ -2555,7 +2648,8 @@ def _send_chat_prompt(
             except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
                 if recorder is not None:
                     recorder.fail(str(exc))
-                print(f"gptty: chat request failed: {exc}", file=stderr)
+                if not suppress_request_error_output:
+                    print(f"gptty: chat request failed: {exc}", file=stderr)
                 return 1
         else:
             outcome: dict[str, Any] = {}
@@ -2749,7 +2843,8 @@ def _send_chat_prompt(
                         except Exception:
                             pass
                     renderer.turn_abort()
-                    print(f"gptty: chat request failed: {error}", file=stderr)
+                    if not suppress_request_error_output:
+                        print(f"gptty: chat request failed: {error}", file=stderr)
                     if defer_final_rendering:
                         return 1
                     renderer.turn_marker(*marker)
@@ -2791,19 +2886,20 @@ def _send_chat_prompt(
                 terminal_source = "conversation_archive"
         incomplete_turn = finish_reason == "incomplete"
         abnormal_turn = terminal_marker is not None
-        if renderer is not None and not defer_final_rendering:
-            if incomplete_turn:
-                renderer.turn_abort()
-                renderer.warning(
-                    "ChatGPT stream ended without a final answer; returned control to gptty."
-                )
-            else:
-                renderer.answer(rendered_text)
-            if terminal_marker is not None:
-                renderer.turn_marker(*terminal_marker)
-            if stopped_by_user:
-                renderer.info("Stopped by user.")
-        elif renderer is None and incomplete_turn:
+        if renderer is not None:
+            if not defer_final_rendering:
+                if incomplete_turn:
+                    renderer.turn_abort()
+                    renderer.warning(
+                        "ChatGPT stream ended without a final answer; returned control to gptty."
+                    )
+                else:
+                    renderer.answer(rendered_text)
+                if terminal_marker is not None:
+                    renderer.turn_marker(*terminal_marker)
+                if stopped_by_user:
+                    renderer.info("Stopped by user.")
+        elif incomplete_turn:
             print("gptty: ChatGPT stream ended without a final answer.", file=stderr)
         elif stream:
             if saw_stream_token:
