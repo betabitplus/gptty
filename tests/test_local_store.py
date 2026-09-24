@@ -262,3 +262,25 @@ def test_concurrent_terminal_semantic_dedupe_is_transactional(tmp_path: Path) ->
     events = stores[0].tui_events("conversation-1")
     assert len(events) == 1
     assert events[0]["text"] == "same semantic terminal"
+
+def test_schema_v1_migrates_delivery_tables_in_place(tmp_path: Path) -> None:
+    db_path = tmp_path / "runs" / "local.sqlite3"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as db:
+        db.execute("PRAGMA user_version=1")
+        db.commit()
+
+    store = LocalEventStore(db_path)
+    event_id = store.append_delivery_event(
+        {
+            "schema": 1,
+            "event": "migrated-delivery",
+            "observed_at_ms": 123,
+            "conversation_ref": "conversation-1",
+        }
+    )
+
+    assert event_id > 0
+    assert store.delivery_events()[-1][1]["event"] == "migrated-delivery"
+    with sqlite3.connect(db_path) as db:
+        assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION

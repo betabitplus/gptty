@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from .profiles import profile_paths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_FILENAME = "local-state.sqlite3"
 
 
@@ -174,6 +175,130 @@ class LocalEventStore:
             for row in rows
             if (item := self._decode_dict(row[0])) is not None
         ]
+
+    def import_delivery_projection(
+        self,
+        source_path: str | Path,
+        records: Iterable[Any],
+    ) -> int:
+        source_key = str(Path(source_path).expanduser().resolve())
+        imported = 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT 1 FROM delivery_imports WHERE source_path = ?",
+                (source_key,),
+            ).fetchone()
+            if existing is not None:
+                db.commit()
+                return 0
+            for raw in records:
+                if not isinstance(raw, dict):
+                    continue
+                record = dict(raw)
+                record.pop("local_event_id", None)
+                observed_at_ms = record.get("observed_at_ms")
+                if isinstance(observed_at_ms, bool) or not isinstance(
+                    observed_at_ms, (int, float)
+                ):
+                    observed_at_ms = 0
+                conversation_ref = record.get("conversation_ref")
+                db.execute(
+                    """
+                    INSERT INTO delivery_events(
+                        conversation_ref,
+                        event_type,
+                        payload_json,
+                        observed_at_ms
+                    )
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        str(conversation_ref).strip()
+                        if isinstance(conversation_ref, str)
+                        and conversation_ref.strip()
+                        else None,
+                        str(record.get("event") or ""),
+                        self._encode(record),
+                        int(observed_at_ms),
+                    ),
+                )
+                imported += 1
+            db.execute(
+                """
+                INSERT INTO delivery_imports(source_path, imported_at)
+                VALUES(?, CURRENT_TIMESTAMP)
+                """,
+                (source_key,),
+            )
+            db.commit()
+        return imported
+
+    def append_delivery_event(self, record: dict[str, Any]) -> int:
+        observed_at_ms = record.get("observed_at_ms")
+        if isinstance(observed_at_ms, bool) or not isinstance(observed_at_ms, (int, float)):
+            observed_at_ms = 0
+        conversation_ref = record.get("conversation_ref")
+        event_type = str(record.get("event") or "")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """
+                INSERT INTO delivery_events(
+                    conversation_ref,
+                    event_type,
+                    payload_json,
+                    observed_at_ms
+                )
+                VALUES(?, ?, ?, ?)
+                """,
+                (
+                    str(conversation_ref).strip()
+                    if isinstance(conversation_ref, str) and conversation_ref.strip()
+                    else None,
+                    event_type,
+                    self._encode(record),
+                    int(observed_at_ms),
+                ),
+            )
+            event_id = int(cursor.lastrowid)
+            db.commit()
+        return event_id
+
+    def delivery_events(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        with self._connect() as db:
+            if limit is None:
+                rows = db.execute(
+                    """
+                    SELECT id, payload_json
+                    FROM delivery_events
+                    ORDER BY id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """
+                    SELECT id, payload_json
+                    FROM (
+                        SELECT id, payload_json
+                        FROM delivery_events
+                        ORDER BY id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY id ASC
+                    """,
+                    (max(0, int(limit)),),
+                ).fetchall()
+        result: list[tuple[int, dict[str, Any]]] = []
+        for row in rows:
+            item = self._decode_dict(row[1])
+            if item is not None:
+                result.append((int(row[0]), item))
+        return result
 
     def put_pending_tui_event(self, turn_id: str, event: dict[str, Any]) -> None:
         with self._connect() as db:
@@ -511,6 +636,22 @@ class LocalEventStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_local_run_events_run_seq
                     ON local_run_events(run_id, seq);
+
+                CREATE TABLE IF NOT EXISTS delivery_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_ref TEXT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_delivery_events_conversation_id
+                    ON delivery_events(conversation_ref, id);
+                CREATE INDEX IF NOT EXISTS idx_delivery_events_type_id
+                    ON delivery_events(event_type, id);
+                CREATE TABLE IF NOT EXISTS delivery_imports(
+                    source_path TEXT PRIMARY KEY,
+                    imported_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS tui_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

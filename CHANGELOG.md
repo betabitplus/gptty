@@ -7,6 +7,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 ## Unreleased
 
 - durability: make one SQLite/WAL local event store authoritative for run events and normal TUI observations, with bounded recent queries, transactional dedupe, private storage, incremental portable projections, and projection repair after crashes
+- diagnostics: move stream-delivery evidence into the shared transactional store, import legacy rotated JSONL evidence once, and replace multiprocess-unsafe rename rotation with a bounded lock-serialized support projection
 - concurrency: replace conversation stale-file/PID lock recovery with the same kernel-backed ownership model used by Goal runs; retained sidecars are diagnostic only and `observe` probes the kernel lock rather than file existence
 - packaging: require `chatgpt-web-adapter>=0.3.1,<0.4.0`, the first exact CWA release candidate verified against the current gptty browser-authority/WK runtime contract
 - feat: add profile-aware auth/state path resolution with `gptty profile` commands

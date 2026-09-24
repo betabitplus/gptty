@@ -1220,9 +1220,17 @@ async def _enhanced_loop_core(
     activity_tracker = CodexProActivityTracker(
         mapping_path=state_path.parent / "codexpro-session-map.json"
     )
-    delivery_journal = StreamDeliveryJournal(
-        state_path.parent / "stream-delivery.jsonl"
-    )
+    try:
+        delivery_journal: StreamDeliveryJournal | None = StreamDeliveryJournal(
+            state_path.parent / "stream-delivery.jsonl",
+            db_path=local_store_path(
+                profile=getattr(args, "profile", None),
+                state_path=state_path,
+            ),
+        )
+    except Exception:
+        # Delivery diagnostics are optional and must never prevent chat startup.
+        delivery_journal = None
     active: _EnhancedTurn | None = None
     active_resume: _EnhancedResume | None = None
     active_follow: _EnhancedFollow | None = None
