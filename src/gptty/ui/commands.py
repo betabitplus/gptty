@@ -22,6 +22,7 @@ from ..goal import (
     MAX_ROLLOVERS,
     GoalSignal,
     abnormal_recovery_prompt,
+    acceptance_criteria_error,
     activation_prompt,
     completion_checkpoint_error,
     continuation_prompt,
@@ -32,10 +33,16 @@ from ..goal import (
     sanitize_goal_history_text,
     steering_prompt,
 )
-from ..goal_store import GoalConflictError, GoalStore, ensure_goal_id
+from ..goal_lock import (
+    GoalRunLock,
+    goal_lock_is_held,
+    read_goal_lock_metadata,
+    try_acquire_goal_lock,
+)
+from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
-from ..state import ChatState, GoalState, StateError, save_chat_state
+from ..state import ChatState, GoalAcceptanceCriterion, GoalState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
@@ -77,6 +84,19 @@ class InteractiveCommands:
         self.tui_archive = tui_archive
         self.goal_store = GoalStore(state_path)
         self.runner_id = runner_id or uuid.uuid4().hex
+        self._goal_run_lock: GoalRunLock | None = None
+        if (
+            state.goal is not None
+            and state.goal.status == "active"
+            and (
+                not state.goal.runner_id
+                or (
+                    state.goal.runner_id == self.runner_id
+                    and state.goal.runner_pid in {0, os.getpid()}
+                )
+            )
+        ):
+            self._acquire_goal_run_lock(state.goal)
         self._pending_media: list[str] = []
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
@@ -144,15 +164,48 @@ class InteractiveCommands:
     def pending_media_count(self) -> int:
         return len(self._pending_media)
 
+    def _acquire_goal_run_lock(self, goal: GoalState) -> bool:
+        goal_id = ensure_goal_id(goal)
+        current = self._goal_run_lock
+        if (
+            current is not None
+            and not current.released
+            and current.goal_id == goal_id
+        ):
+            goal.runner_id = self.runner_id
+            goal.runner_pid = os.getpid()
+            return True
+        if current is not None and not current.released:
+            current.release()
+        lease = try_acquire_goal_lock(
+            self.goal_store.root,
+            goal_id,
+            runner_id=self.runner_id,
+            pid=os.getpid(),
+        )
+        self._goal_run_lock = lease
+        if lease is None:
+            return False
+        goal.runner_id = self.runner_id
+        goal.runner_pid = os.getpid()
+        return True
+
+    def _release_goal_run_lock(self) -> None:
+        current = self._goal_run_lock
+        self._goal_run_lock = None
+        if current is not None:
+            current.release()
+
     def _owns_goal_run(self, goal: GoalState | None = None) -> bool:
         goal = goal or self.state.goal
-        if goal is None:
+        lease = self._goal_run_lock
+        if goal is None or lease is None or lease.released:
             return False
-        # Legacy pre-lease Goal state is adopted only inside the already-running
-        # process/test path. Startup recovery normalizes it before interactive use.
-        if not goal.runner_id:
-            return True
-        return goal.runner_id == self.runner_id and goal.runner_pid == os.getpid()
+        return (
+            lease.goal_id == (goal.goal_id or "")
+            and goal.runner_id == self.runner_id
+            and goal.runner_pid == os.getpid()
+        )
 
     @property
     def goal_owned_elsewhere(self) -> bool:
@@ -489,6 +542,10 @@ class InteractiveCommands:
             "operation_id": goal.active_operation_id,
             "conversation_ref": goal.conversation_ref or self.state.current_conversation,
             "message_id": event.get("message_id"),
+            "tool_call_id": event.get("tool_call_id"),
+            "parent_message_id": event.get("parent_message_id"),
+            "turn_exchange_id": event.get("turn_exchange_id"),
+            "submission_id": event.get("submission_id"),
             "source_offset": event.get("source_offset"),
             "tool_name": event.get("tool_name"),
             "label": event.get("label"),
@@ -542,6 +599,7 @@ class InteractiveCommands:
             event_type="goal_paused",
             event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
         )
+        self._release_goal_run_lock()
         self.renderer.info("Goal · paused · stopped by user")
 
     def goal_display_text(self, text: str) -> str:
@@ -595,11 +653,14 @@ class InteractiveCommands:
                 event_type="goal_paused",
                 event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
             )
+            self._release_goal_run_lock()
             self.renderer.info("Goal · paused · stopped by user")
             return
 
         parsed = parse_goal_response(str(result.get("text") or ""))
         completion_error = completion_checkpoint_error(parsed)
+        if completion_error is None and parsed.signal is GoalSignal.COMPLETE:
+            completion_error = acceptance_criteria_error(goal)
         if completion_error is not None:
             self.renderer.warning(f"Goal · rejected COMPLETE · {completion_error}")
             parsed = ParsedGoalResponse(
@@ -630,13 +691,13 @@ class InteractiveCommands:
                 goal.reason = detail
                 goal.runner_id = None
                 goal.runner_pid = 0
-                goal.active_operation_id = None
-                goal.active_operation_turn = 0
                 self.clear_automatic_prompts()
-                self._save_state(
+                if not self._save_state(
                     event_type="turn_terminal",
                     event_payload=blocked_payload,
-                )
+                ):
+                    return
+                self._release_goal_run_lock()
                 self.renderer.warning("Goal · blocked · user action required")
                 notify_response_complete(
                     chat_title=str(result.get("title") or "").strip() or None,
@@ -666,11 +727,14 @@ class InteractiveCommands:
                 )
                 return
 
-        machine_evidence = {"tool_calls": 0, "tool_results": 0, "unresolved_tool_calls": 0}
-        reconciliation_evidence: dict[str, int | bool] = {
+        machine_evidence: dict[str, Any] = self.goal_store._tool_evidence_summary([])
+        reconciliation_evidence: dict[str, Any] = {
             "verification_calls": 0,
             "verification_results": 0,
             "unresolved_verification_calls": 0,
+            "ambiguous_verification_results": 0,
+            "proofs": 0,
+            "covered_original_calls": [],
             "ready": False,
         }
         reconciled_ambiguity = False
@@ -705,16 +769,38 @@ class InteractiveCommands:
                 else:
                     detail = (
                         f"machine journal has {machine_evidence['unresolved_tool_calls']} observed tool call(s) "
-                        f"without observed result for durable operation {goal.active_operation_id}"
+                        f"without exact result/proof for durable operation {goal.active_operation_id}"
                     )
-                    if parsed.signal is GoalSignal.COMPLETE:
-                        self.renderer.warning(
-                            f"Goal · rejected COMPLETE · {detail}"
-                        )
                     self._update_goal_checkpoint(goal, parsed)
                     payload = self._goal_result_event_payload(result, parsed)
                     payload["machine_evidence"] = machine_evidence
                     payload["reconciliation_evidence"] = reconciliation_evidence
+
+                    verification_finished_without_proof = bool(
+                        reconciliation_evidence["verification_results"]
+                        and not reconciliation_evidence[
+                            "unresolved_verification_calls"
+                        ]
+                        and not reconciliation_evidence["ready"]
+                    )
+                    if (
+                        parsed.signal is GoalSignal.BLOCKED
+                        or verification_finished_without_proof
+                    ):
+                        if parsed.signal is GoalSignal.COMPLETE:
+                            self.renderer.warning(
+                                f"Goal · rejected COMPLETE · {detail}"
+                            )
+                        self._block_goal_for_ambiguous_operation(
+                            detail,
+                            event_payload=payload,
+                        )
+                        return
+
+                    if parsed.signal is GoalSignal.COMPLETE:
+                        self.renderer.warning(
+                            f"Goal · rejected COMPLETE · {detail}"
+                        )
                     self._recover_goal_same_chat(
                         detail,
                         allow_rollover=True,
@@ -731,11 +817,11 @@ class InteractiveCommands:
             "reconciliation_evidence": reconciliation_evidence,
             "reconciled_ambiguity": reconciled_ambiguity,
         }
-        goal.active_operation_id = None
-        goal.active_operation_turn = 0
         self._update_goal_checkpoint(goal, parsed)
 
         if parsed.signal is GoalSignal.COMPLETE:
+            goal.active_operation_id = None
+            goal.active_operation_turn = 0
             goal.status = "complete"
             goal.runner_id = None
             goal.runner_pid = 0
@@ -743,10 +829,12 @@ class InteractiveCommands:
             goal.recovery_count = 0
             goal.reason = None
             self.clear_automatic_prompts()
-            self._save_state(
+            if not self._save_state(
                 event_type="turn_terminal",
                 event_payload=terminal_payload,
-            )
+            ):
+                return
+            self._release_goal_run_lock()
             self.renderer.info(
                 f"Goal · complete · {goal.turn_count} turn{'s' if goal.turn_count != 1 else ''}"
             )
@@ -757,6 +845,9 @@ class InteractiveCommands:
             return
 
         if parsed.signal is GoalSignal.BLOCKED:
+            if not machine_evidence["unresolved_tool_calls"]:
+                goal.active_operation_id = None
+                goal.active_operation_turn = 0
             goal.status = "blocked"
             goal.runner_id = None
             goal.runner_pid = 0
@@ -764,16 +855,22 @@ class InteractiveCommands:
             goal.recovery_count = 0
             goal.reason = parsed.body or "agent reported a blocker"
             self.clear_automatic_prompts()
-            self._save_state(
+            if not self._save_state(
                 event_type="turn_terminal",
                 event_payload=terminal_payload,
-            )
+            ):
+                return
+            self._release_goal_run_lock()
             self.renderer.warning("Goal · blocked · user action required")
             notify_response_complete(
                 chat_title=str(result.get("title") or "").strip() or None,
                 final_response=f"Goal blocked. {parsed.body}".strip(),
             )
             return
+
+        if not machine_evidence["unresolved_tool_calls"]:
+            goal.active_operation_id = None
+            goal.active_operation_turn = 0
 
         protocol_recovery = parsed.signal is None
         if protocol_recovery:
@@ -825,7 +922,9 @@ class InteractiveCommands:
             self.clear_automatic_prompts()
             goal.active_operation_id = None
             goal.active_operation_turn = 0
-            self._save_state(event_type="turn_terminal", event_payload=failure_payload)
+            if not self._save_state(event_type="turn_terminal", event_payload=failure_payload):
+                return True
+            self._release_goal_run_lock()
             self.renderer.warning("Goal · blocked · user action required")
             notify_response_complete(
                 chat_title=chat_title,
@@ -888,6 +987,40 @@ class InteractiveCommands:
         if body:
             goal.checkpoint.summary = body[:2400]
             goal.checkpoint.updated_turn = goal.turn_count
+
+    def _block_goal_for_ambiguous_operation(
+        self,
+        reason: str,
+        *,
+        event_payload: dict[str, Any],
+    ) -> bool:
+        goal = self.state.goal
+        if goal is None or goal.status != "active":
+            return False
+        goal.status = "blocked"
+        goal.reason = reason
+        goal.runner_id = None
+        goal.runner_pid = 0
+        self.clear_automatic_prompts()
+        payload = dict(event_payload)
+        payload["reason"] = reason
+        payload["ambiguous_operation"] = goal.active_operation_id
+        if not self._save_state(
+            event_type="goal_blocked_ambiguous_operation",
+            event_payload=payload,
+        ):
+            return False
+        self._release_goal_run_lock()
+        self.renderer.warning(
+            "Goal · blocked · ambiguous external side effect requires machine-verifiable reconciliation"
+        )
+        notify_response_complete(
+            final_response=(
+                "Goal blocked. An external side effect has no exact result or "
+                "trusted reconciliation proof."
+            )
+        )
+        return True
 
     def _recover_goal_same_chat(
         self,
@@ -1039,6 +1172,7 @@ class InteractiveCommands:
             self._clipboard_dir = None
 
     def close(self) -> None:
+        self._release_goal_run_lock()
         self.clear_pending_media()
 
     def _reset_temporary_context(self) -> None:
@@ -1204,6 +1338,225 @@ class InteractiveCommands:
         if self._save_state(persist_goal=False):
             self._render_goal_status()
 
+    def _cmd_goal_doctor(self) -> None:
+        goal = self.state.goal
+        if goal is None:
+            self.renderer.info("No Goal is attached to this conversation.")
+            return
+        try:
+            report = self.goal_store.doctor(goal)
+            held = goal_lock_is_held(self.goal_store.root, goal.goal_id or "")
+            lock_metadata = read_goal_lock_metadata(
+                self.goal_store.root, goal.goal_id or ""
+            )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            self.renderer.warning(f"Goal doctor failed: {exc}")
+            return
+
+        lock_expected = goal.status == "active"
+        lock_ok = held if lock_expected else not held
+        if not lock_ok:
+            report["ok"] = False
+            report["safe_to_continue"] = False
+            report["warnings"].append(
+                "kernel ownership lock does not match durable Goal status"
+            )
+
+        verdict = "PASS" if report["ok"] else "FAIL"
+        safe = "yes" if report["safe_to_continue"] else "no"
+        self.renderer.info(
+            f"Goal doctor · {verdict} · safe-to-continue {safe} · "
+            f"events {report.get('event_count', 0)} · "
+            f"latest {report.get('latest_event') or 'none'}"
+        )
+        checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
+        for name in ("sqlite_integrity", "replay", "event_sequence", "journal_hashes"):
+            check = checks.get(name)
+            if not isinstance(check, dict):
+                continue
+            status = "PASS" if check.get("ok") else "FAIL"
+            detail = (
+                check.get("reason")
+                or check.get("detail")
+                or (
+                    f"count={check.get('count')} last={check.get('last_seq')}"
+                    if name == "event_sequence"
+                    else ""
+                )
+            )
+            suffix = f" · {detail}" if detail else ""
+            self.renderer.info(f"{name} · {status}{suffix}")
+
+        runtime = checks.get("runtime")
+        if isinstance(runtime, dict):
+            runtime_status = "FAIL" if runtime.get("future") else (
+                "MIGRATE" if runtime.get("needs_migration") else "PASS"
+            )
+            self.renderer.info(
+                "runtime · "
+                f"{runtime_status} · "
+                f"{runtime.get('runtime_version')}/{runtime.get('protocol_version')}"
+            )
+
+        bindings = checks.get("bindings")
+        if isinstance(bindings, dict):
+            self.renderer.info(
+                f"bindings · {'PASS' if bindings.get('ok') else 'FAIL'} · "
+                f"{bindings.get('count', 0)} conversation(s)"
+            )
+
+        acceptance = checks.get("acceptance")
+        if isinstance(acceptance, dict):
+            self.renderer.info(
+                f"acceptance · "
+                f"{acceptance.get('satisfied', 0)}/{acceptance.get('required', 0)}"
+                " required satisfied"
+            )
+
+        operation = checks.get("open_operation")
+        if isinstance(operation, dict) and operation.get("operation_id"):
+            evidence = operation.get("evidence")
+            unresolved = (
+                evidence.get("unresolved_tool_calls", 0)
+                if isinstance(evidence, dict)
+                else 0
+            )
+            self.renderer.info(
+                f"open operation · {'PASS' if operation.get('ok') else 'BLOCKED'} · "
+                f"{operation.get('operation_id')} · unresolved={unresolved}"
+            )
+
+        owner = str(lock_metadata.get("runner_id") or "").strip()
+        pid = lock_metadata.get("pid")
+        owner_text = (
+            f" · owner={owner[:12]} pid={pid}" if held and owner else ""
+        )
+        self.renderer.info(
+            f"kernel lock · {'PASS' if lock_ok else 'FAIL'} · "
+            f"{'held' if held else 'free'}{owner_text}"
+        )
+        for warning in report.get("warnings") or []:
+            self.renderer.warning(f"Goal doctor · {warning}")
+
+    def _cmd_goal_trace(self, argv: list[str]) -> None:
+        goal = self.state.goal
+        if goal is None:
+            self.renderer.info("No Goal is attached to this conversation.")
+            return
+        if len(argv) > 1:
+            self.renderer.warning("Usage: /goal trace [N]")
+            return
+        limit = 20
+        if argv:
+            try:
+                limit = int(argv[0])
+            except ValueError:
+                self.renderer.warning("Usage: /goal trace [N]")
+                return
+            if limit < 1 or limit > 200:
+                self.renderer.warning("Goal trace count must be between 1 and 200.")
+                return
+        try:
+            trace = self.goal_store.trace(goal, limit=limit)
+        except (OSError, sqlite3.Error) as exc:
+            self.renderer.warning(f"Goal trace failed: {exc}")
+            return
+        self.renderer.info(
+            f"Goal trace · {len(trace)} event{'s' if len(trace) != 1 else ''}"
+        )
+        for event in trace:
+            details: list[str] = []
+            operation_id = str(event.get("operation_id") or "").strip()
+            if operation_id:
+                details.append(f"op={operation_id}")
+            conversation_ref = str(event.get("conversation_ref") or "").strip()
+            if conversation_ref:
+                details.append(f"chat={_short_ref(conversation_ref)}")
+            tool_name = str(event.get("tool_name") or "").strip()
+            if tool_name:
+                details.append(f"tool={tool_name}")
+            call_id = str(event.get("tool_call_id") or "").strip()
+            if call_id:
+                details.append(f"call={call_id}")
+            criterion_id = str(event.get("criterion_id") or "").strip()
+            if criterion_id:
+                details.append(f"criterion={criterion_id}")
+            reason = " ".join(str(event.get("reason") or "").split()).strip()
+            if reason:
+                details.append(f"reason={reason[:100]}")
+            suffix = " · " + " · ".join(details) if details else ""
+            self.renderer.info(
+                f"#{event.get('seq')} · g{event.get('generation')} · "
+                f"{event.get('type')}{suffix}"
+            )
+
+    def _cmd_goal_criteria(self, argv: list[str]) -> None:
+        goal = self.state.goal
+        if goal is None:
+            self.renderer.info("No Goal is attached to this conversation.")
+            return
+        if not argv:
+            if not goal.acceptance_criteria:
+                self.renderer.info("Goal acceptance criteria · none configured")
+                return
+            passed = sum(1 for criterion in goal.acceptance_criteria if criterion.satisfied)
+            self.renderer.info(
+                f"Goal acceptance criteria · {passed}/{len(goal.acceptance_criteria)} satisfied"
+            )
+            for criterion in goal.acceptance_criteria:
+                status = "PASS" if criterion.satisfied else "PENDING"
+                source = (
+                    f" · {criterion.evidence_source}"
+                    if criterion.evidence_source
+                    else ""
+                )
+                evidence = (
+                    f" · {criterion.evidence_refs[0]}"
+                    if criterion.evidence_refs
+                    else ""
+                )
+                self.renderer.info(
+                    f"{criterion.criterion_id} · {status}{source}{evidence} · "
+                    f"{criterion.description}"
+                )
+            return
+
+        if argv[0].lower() != "attest" or len(argv) < 3:
+            self.renderer.warning(
+                "Usage: /goal criteria [attest <criterion-id> <evidence-note>]"
+            )
+            return
+        if goal.status == "active" and not self._owns_goal_run(goal):
+            self.renderer.warning(
+                "Goal is active in another live gptty process; attest from that process."
+            )
+            return
+        criterion_id = argv[1].strip()
+        note = " ".join(argv[2:]).strip()
+        if not note:
+            self.renderer.warning("Human attestation requires an evidence note.")
+            return
+        evidence_ref = "human:" + hashlib.sha256(
+            f"{criterion_id}:{note}".encode("utf-8")
+        ).hexdigest()[:16]
+        try:
+            updated = self.goal_store.record_acceptance_evidence(
+                goal,
+                criterion_id=criterion_id,
+                evidence_ref=evidence_ref,
+                source="human",
+                details={"note": note},
+            )
+        except (KeyError, ValueError, GoalConflictError, OSError, sqlite3.Error) as exc:
+            self.renderer.warning(f"Acceptance evidence rejected: {exc}")
+            return
+        self.state.goal = updated
+        if not self._save_state(persist_goal=False):
+            return
+        self.renderer.info(
+            f"Goal acceptance · {criterion_id} PASS · human attestation · {evidence_ref}"
+        )
+
     def _cmd_goal(self, argv: list[str]) -> None:
         if self._conversation_mode == "temporary":
             self.renderer.warning(
@@ -1223,6 +1576,18 @@ class InteractiveCommands:
                 self.renderer.warning("Usage: /goal open <id-prefix>")
                 return
             self._open_goal(argv[1])
+            return
+        if action == "criteria":
+            self._cmd_goal_criteria(argv[1:])
+            return
+        if action == "doctor":
+            if len(argv) != 1:
+                self.renderer.warning("Usage: /goal doctor")
+                return
+            self._cmd_goal_doctor()
+            return
+        if action == "trace":
+            self._cmd_goal_trace(argv[1:])
             return
 
         if action in {"pause", "resume", "clear", "status"} and len(argv) == 1:
@@ -1283,6 +1648,7 @@ class InteractiveCommands:
                             "Goal authoritative state committed, but portable projection "
                             f"could not be refreshed: {self.goal_store.last_projection_error}"
                         )
+                    self._release_goal_run_lock()
                 try:
                     self.goal_store.unbind_goal(goal)
                 except (OSError, sqlite3.Error) as exc:
@@ -1296,7 +1662,27 @@ class InteractiveCommands:
             self._render_goal_status()
             return
 
-        objective = " ".join(argv).strip() or None
+        criteria_descriptions: list[str] = []
+        objective_parts: list[str] = []
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            if token == "--accept":
+                if index + 1 >= len(argv):
+                    self.renderer.warning(
+                        'Usage: /goal [--accept "criterion"]... <objective>'
+                    )
+                    return
+                description = " ".join(argv[index + 1].split()).strip()
+                if not description:
+                    self.renderer.warning("Acceptance criterion cannot be empty.")
+                    return
+                criteria_descriptions.append(description)
+                index += 2
+                continue
+            objective_parts.extend(argv[index:])
+            break
+        objective = " ".join(objective_parts).strip() or None
         existing = self.state.goal
         if (
             objective is None
@@ -1330,12 +1716,23 @@ class InteractiveCommands:
                 else []
             ),
             context_seed=self._compact_goal_context_seed(context_history),
+            acceptance_criteria=[
+                GoalAcceptanceCriterion(
+                    criterion_id=f"A{number}",
+                    description=description,
+                )
+                for number, description in enumerate(criteria_descriptions, start=1)
+            ],
             status="active",
             objective=objective,
             runner_id=self.runner_id,
             runner_pid=os.getpid(),
         )
         ensure_goal_id(new_goal)
+        if not self._acquire_goal_run_lock(new_goal):
+            self.state.goal = existing
+            self.renderer.warning("Goal ownership lock could not be acquired.")
+            return
         self.state.goal = new_goal
         if not self._save_state(
             event_type="goal_created",
@@ -1343,16 +1740,25 @@ class InteractiveCommands:
                 "objective": objective,
                 "conversation_ref": self.state.current_conversation,
                 "context_snapshot": context_history,
+                "acceptance_criteria": [
+                    {
+                        "criterion_id": criterion.criterion_id,
+                        "description": criterion.description,
+                        "required": criterion.required,
+                    }
+                    for criterion in new_goal.acceptance_criteria
+                ],
             },
         ):
             # If the authoritative Goal transaction committed but local chat-state
             # persistence failed, keep the durable Goal visible instead of deleting
             # or rolling it back through a singleton pointer.
             authoritative = self.goal_store.load(new_goal.goal_id or "")
+            self._release_goal_run_lock()
             self.state.goal = authoritative if authoritative is not None else existing
             return
         self.clear_automatic_prompts()
-        self._automatic_prompts.append(activation_prompt(objective))
+        self._automatic_prompts.append(activation_prompt(objective, goal=new_goal))
         self.renderer.info(f"Goal · active · {new_goal.goal_id[:8]} · starting")
         self.renderer.info(f"Goal state: {self.goal_store.goal_path(new_goal)}")
 
@@ -1722,6 +2128,15 @@ class InteractiveCommands:
         if goal.status == "complete":
             self.renderer.info("Goal · complete")
             return
+        compatibility = self.goal_store.runtime_compatibility(goal)
+        if compatibility["future"]:
+            self.renderer.warning(
+                "Goal requires newer runtime/protocol semantics "
+                f"{goal.runtime_version}/{goal.protocol_version}; this gptty supports "
+                f"{compatibility['current_runtime_version']}/"
+                f"{compatibility['current_protocol_version']}."
+            )
+            return
         if goal.status == "active":
             if not self._owns_goal_run(goal):
                 self.renderer.warning(
@@ -1729,6 +2144,30 @@ class InteractiveCommands:
                 )
             self._render_goal_status()
             return
+        if compatibility["needs_migration"]:
+            try:
+                goal = self.goal_store.migrate_runtime(goal)
+            except GoalConflictError:
+                refreshed = self.goal_store.load(goal.goal_id or "")
+                if refreshed is None:
+                    self.renderer.warning("Goal runtime migration conflicted and reload failed.")
+                    return
+                goal = refreshed
+                compatibility = self.goal_store.runtime_compatibility(goal)
+                if compatibility["needs_migration"] or compatibility["future"]:
+                    self.renderer.warning(
+                        "Goal runtime migration conflicted with another process; retry /goal resume."
+                    )
+                    return
+            except (GoalCompatibilityError, OSError, sqlite3.Error) as exc:
+                self.renderer.warning(f"Goal runtime migration failed: {exc}")
+                return
+            self.state.goal = goal
+            self.renderer.info(
+                f"Goal · migrated to runtime/protocol "
+                f"{goal.runtime_version}/{goal.protocol_version}"
+            )
+
         if (
             goal.conversation_ref
             and goal.conversation_ref != self.state.current_conversation
@@ -1764,14 +2203,35 @@ class InteractiveCommands:
             if self.state.current_conversation not in goal.conversations:
                 goal.conversations.append(self.state.current_conversation)
         previous_reason = goal.reason
+        if not self._acquire_goal_run_lock(goal):
+            authoritative = self.goal_store.load(goal.goal_id or "")
+            if authoritative is not None:
+                metadata = read_goal_lock_metadata(
+                    self.goal_store.root, goal.goal_id or ""
+                )
+                lock_runner = str(metadata.get("runner_id") or "").strip()
+                lock_pid = metadata.get("pid")
+                if lock_runner:
+                    # The kernel lock can become visible a few microseconds before
+                    # its owner commits active metadata. Reflect that ownership
+                    # locally without mutating authoritative state.
+                    authoritative.status = "active"
+                    authoritative.runner_id = lock_runner
+                    authoritative.runner_pid = (
+                        int(lock_pid) if isinstance(lock_pid, int) else 0
+                    )
+                self.state.goal = authoritative
+            self.renderer.warning(
+                "Goal is active in another live gptty process; this session will not take ownership."
+            )
+            return
         goal.status = "active"
         goal.reason = None
-        goal.runner_id = self.runner_id
-        goal.runner_pid = os.getpid()
         if not self._save_state(
             event_type="goal_resumed",
             event_payload={"conversation_ref": goal.conversation_ref, "ambiguous_operation": goal.active_operation_id},
         ):
+            self._release_goal_run_lock()
             return
         self.clear_automatic_prompts()
         if bootstrap_without_chat and goal.conversations:
@@ -1794,7 +2254,7 @@ class InteractiveCommands:
                 )
             else:
                 self._automatic_prompts.append(
-                    activation_prompt(goal.objective)
+                    activation_prompt(goal.objective, goal=goal)
                     if bootstrap_without_chat
                     else continuation_prompt(goal=goal)
                 )
@@ -1843,6 +2303,7 @@ class InteractiveCommands:
             event_payload={"reason": goal.reason, "ambiguous_operation": goal.active_operation_id},
         ):
             return False
+        self._release_goal_run_lock()
         self.renderer.warning(
             "Goal · paused · service backoff required · use /goal resume later"
         )
@@ -1861,6 +2322,7 @@ class InteractiveCommands:
             event_type="goal_paused",
             event_payload={"reason": reason, "ambiguous_operation": goal.active_operation_id},
         )
+        self._release_goal_run_lock()
         return True
 
     def _interrupt_goal(
@@ -1882,6 +2344,7 @@ class InteractiveCommands:
             event_type="goal_interrupted",
             event_payload={"reason": reason, "ambiguous_operation": goal.active_operation_id},
         )
+        self._release_goal_run_lock()
         self.renderer.warning(f"Goal · interrupted · {reason}")
         if notify:
             notify_response_complete(
@@ -1935,6 +2398,7 @@ class InteractiveCommands:
                         )
             save_chat_state(self.state_path, self.state)
         except GoalConflictError as exc:
+            self._release_goal_run_lock()
             goal_id = self.state.goal.goal_id if self.state.goal is not None else None
             try:
                 current = self.goal_store.load(goal_id or "") if goal_id else None

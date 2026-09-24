@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping, TextIO
 
 
+CURRENT_GOAL_RUNTIME_VERSION = 2
+CURRENT_GOAL_PROTOCOL_VERSION = 2
+
+
 class StateError(RuntimeError):
     """Raised when a gptty state file cannot be loaded or saved."""
 
@@ -24,8 +28,21 @@ class GoalCheckpoint:
 
 
 @dataclass
+class GoalAcceptanceCriterion:
+    criterion_id: str
+    description: str
+    required: bool = True
+    satisfied: bool = False
+    evidence_refs: list[str] = field(default_factory=list)
+    evidence_source: str | None = None
+    satisfied_at_turn: int = 0
+
+
+@dataclass
 class GoalState:
     goal_id: str | None = None
+    runtime_version: int = CURRENT_GOAL_RUNTIME_VERSION
+    protocol_version: int = CURRENT_GOAL_PROTOCOL_VERSION
     revision: int = 0
     generation: int = 1
     active_operation_id: str | None = None
@@ -35,6 +52,7 @@ class GoalState:
     conversation_ref: str | None = None
     conversations: list[str] = field(default_factory=list)
     context_seed: list[str] = field(default_factory=list)
+    acceptance_criteria: list[GoalAcceptanceCriterion] = field(default_factory=list)
     status: str = "paused"
     objective: str | None = None
     turn_count: int = 0
@@ -157,6 +175,8 @@ def goal_state_from_dict(value: Any) -> GoalState | None:
         status = "paused"
     return GoalState(
         goal_id=_optional_str(value.get("goal_id")),
+        runtime_version=_positive_int(value.get("runtime_version"), default=1),
+        protocol_version=_positive_int(value.get("protocol_version"), default=1),
         revision=_non_negative_int(value.get("revision")),
         generation=max(1, _non_negative_int(value.get("generation"))),
         active_operation_id=_optional_str(value.get("active_operation_id")),
@@ -166,6 +186,7 @@ def goal_state_from_dict(value: Any) -> GoalState | None:
         conversation_ref=_optional_str(value.get("conversation_ref")),
         conversations=_string_list(value.get("conversations")),
         context_seed=_string_list(value.get("context_seed")),
+        acceptance_criteria=_goal_acceptance_criteria(value.get("acceptance_criteria")),
         status=status,
         objective=_optional_str(value.get("objective")),
         turn_count=_non_negative_int(value.get("turn_count")),
@@ -175,6 +196,33 @@ def goal_state_from_dict(value: Any) -> GoalState | None:
         checkpoint=_goal_checkpoint(value.get("checkpoint")),
         reason=_optional_str(value.get("reason")),
     )
+
+
+def _goal_acceptance_criteria(value: Any) -> list[GoalAcceptanceCriterion]:
+    if not isinstance(value, list):
+        return []
+    result: list[GoalAcceptanceCriterion] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        criterion_id = _optional_str(item.get("criterion_id"))
+        description = _optional_str(item.get("description"))
+        if not criterion_id or not description or criterion_id in seen:
+            continue
+        seen.add(criterion_id)
+        result.append(
+            GoalAcceptanceCriterion(
+                criterion_id=criterion_id,
+                description=description,
+                required=bool(item.get("required", True)),
+                satisfied=bool(item.get("satisfied", False)),
+                evidence_refs=_string_list(item.get("evidence_refs")),
+                evidence_source=_optional_str(item.get("evidence_source")),
+                satisfied_at_turn=_non_negative_int(item.get("satisfied_at_turn")),
+            )
+        )
+    return result
 
 
 def _optional_str(value: Any) -> str | None:
@@ -208,6 +256,16 @@ def _string_list(value: Any) -> list[str]:
         if normalized and normalized not in result:
             result.append(normalized)
     return result
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result > 0 else default
 
 
 def _non_negative_int(value: Any) -> int:

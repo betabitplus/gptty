@@ -716,11 +716,11 @@ def test_contextual_command_completion_exposes_usage_and_subcommands(tmp_path) -
             await asyncio.sleep(0.05)
             assert buffer.complete_state is not None
             top = {item.text: item for item in buffer.complete_state.completions}
-            assert "list [all] | open <id> | pause | resume | status | clear" in top["/goal"].display_meta_text
+            assert "list [all] | open <id> | pause | resume | status | doctor | trace [N] | criteria | clear" in top["/goal"].display_meta_text
             assert "Enter: choose chat" in top["/resume"].display_meta_text
 
             for raw, expected in (
-                ("/goal ", ["list", "open", "pause", "resume", "status", "clear"]),
+                ("/goal ", ["list", "open", "pause", "resume", "status", "doctor", "trace", "criteria", "clear"]),
                 ("/goal re", ["resume"]),
                 ("/image ", ["clear"]),
                 ("/model ", ["default"]),

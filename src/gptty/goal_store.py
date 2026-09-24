@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .state import GoalState, goal_state_from_dict
+from .state import (
+    CURRENT_GOAL_PROTOCOL_VERSION,
+    CURRENT_GOAL_RUNTIME_VERSION,
+    GoalState,
+    goal_state_from_dict,
+)
 
 
 def _now_iso() -> str:
@@ -23,6 +29,10 @@ def ensure_goal_id(goal: GoalState) -> str:
     return goal.goal_id
 
 
+class GoalCompatibilityError(RuntimeError):
+    """Raised when a durable Goal requires unsupported runtime semantics."""
+
+
 class GoalConflictError(RuntimeError):
     """Raised when a stale Goal writer would overwrite a newer revision."""
 
@@ -34,7 +44,7 @@ class GoalStore:
     human-readable projections and may be copied for backup or inspection.
     """
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, state_path: str | Path) -> None:
         self.state_path = Path(state_path)
@@ -137,6 +147,10 @@ class GoalStore:
                         generation=inferred_generation,
                         allow_replace_terminal=True,
                     )
+                transition_state = asdict(goal)
+                transition_json = json.dumps(
+                    transition_state, ensure_ascii=False, sort_keys=True
+                )
                 self._append_event_tx(
                     db,
                     goal_id,
@@ -145,6 +159,10 @@ class GoalStore:
                         "revision": goal.revision,
                         "generation": goal.generation,
                         **(event_payload or {}),
+                        "state_after": transition_state,
+                        "state_sha256": hashlib.sha256(
+                            transition_json.encode("utf-8")
+                        ).hexdigest(),
                     },
                 )
                 db.commit()
@@ -164,6 +182,117 @@ class GoalStore:
         except OSError as exc:
             self.last_projection_error = exc
         return self.goal_path(goal)
+
+    def runtime_compatibility(self, goal: GoalState) -> dict[str, Any]:
+        runtime = int(goal.runtime_version)
+        protocol = int(goal.protocol_version)
+        future = (
+            runtime > CURRENT_GOAL_RUNTIME_VERSION
+            or protocol > CURRENT_GOAL_PROTOCOL_VERSION
+        )
+        needs_migration = (
+            runtime < CURRENT_GOAL_RUNTIME_VERSION
+            or protocol < CURRENT_GOAL_PROTOCOL_VERSION
+        )
+        return {
+            "runtime_version": runtime,
+            "protocol_version": protocol,
+            "current_runtime_version": CURRENT_GOAL_RUNTIME_VERSION,
+            "current_protocol_version": CURRENT_GOAL_PROTOCOL_VERSION,
+            "future": future,
+            "needs_migration": needs_migration,
+            "compatible": not future,
+        }
+
+    def migrate_runtime(self, goal: GoalState | str) -> GoalState:
+        """Explicitly migrate a non-running durable Goal to current semantics."""
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        current = self.load(goal_id)
+        if current is None:
+            raise KeyError(f"unknown goal: {goal_id}")
+        compatibility = self.runtime_compatibility(current)
+        if compatibility["future"]:
+            raise GoalCompatibilityError(
+                f"goal {goal_id} requires runtime/protocol "
+                f"{current.runtime_version}/{current.protocol_version}, but this gptty supports "
+                f"{CURRENT_GOAL_RUNTIME_VERSION}/{CURRENT_GOAL_PROTOCOL_VERSION}"
+            )
+        if not compatibility["needs_migration"]:
+            return current
+        if current.status == "active":
+            raise GoalCompatibilityError(
+                "active Goal must be paused under exclusive ownership before runtime migration"
+            )
+        old_runtime = current.runtime_version
+        old_protocol = current.protocol_version
+        current.runtime_version = CURRENT_GOAL_RUNTIME_VERSION
+        current.protocol_version = CURRENT_GOAL_PROTOCOL_VERSION
+        self.save(
+            current,
+            event_type="goal_runtime_migrated",
+            event_payload={
+                "from_runtime_version": old_runtime,
+                "to_runtime_version": current.runtime_version,
+                "from_protocol_version": old_protocol,
+                "to_protocol_version": current.protocol_version,
+            },
+        )
+        return current
+
+    def record_acceptance_evidence(
+        self,
+        goal: GoalState | str,
+        *,
+        criterion_id: str,
+        evidence_ref: str,
+        source: str,
+        details: dict[str, Any] | None = None,
+    ) -> GoalState:
+        """Satisfy one immutable acceptance criterion with explicit evidence."""
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        criterion_id = str(criterion_id).strip()
+        evidence_ref = str(evidence_ref).strip()
+        source = str(source).strip().lower()
+        if not criterion_id or not evidence_ref:
+            raise ValueError("criterion_id and evidence_ref are required")
+        if source not in {"machine", "human"}:
+            raise ValueError("acceptance evidence source must be machine or human")
+
+        current = self.load(goal_id)
+        if current is None:
+            raise KeyError(f"unknown goal: {goal_id}")
+        criterion = next(
+            (
+                item
+                for item in current.acceptance_criteria
+                if item.criterion_id == criterion_id
+            ),
+            None,
+        )
+        if criterion is None:
+            raise KeyError(f"unknown acceptance criterion: {criterion_id}")
+        if criterion.satisfied:
+            if evidence_ref not in criterion.evidence_refs:
+                raise GoalConflictError(
+                    f"criterion {criterion_id} is already satisfied by different evidence"
+                )
+            return current
+
+        criterion.satisfied = True
+        criterion.evidence_source = source
+        criterion.evidence_refs = [evidence_ref]
+        criterion.satisfied_at_turn = current.turn_count
+        self.save(
+            current,
+            event_type="acceptance_criterion_satisfied",
+            event_payload={
+                "criterion_id": criterion_id,
+                "evidence_ref": evidence_ref,
+                "source": source,
+                "details": details or {},
+            },
+        )
+        return current
 
     def record_event(
         self,
@@ -264,64 +393,276 @@ class GoalStore:
                 refs.append(ref)
         return refs[0] if len(refs) == 1 else None
 
-    def operation_evidence(
-        self, goal: GoalState | str, operation_id: str | None
-    ) -> dict[str, int]:
-        """Summarize observed tool evidence conservatively.
+    @staticmethod
+    def _event_operation_id(event: dict[str, Any]) -> str | None:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        direct = payload.get("operation_id")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        state_after = payload.get("state_after")
+        if isinstance(state_after, dict):
+            nested = state_after.get("active_operation_id")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+        return None
 
-        Tool results only resolve a preceding unmatched call for the same tool identity.
-        We intentionally prefer false "needs reconciliation" over falsely declaring an
-        ambiguous side effect resolved.
+    @staticmethod
+    def _tool_evidence_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Pair tool calls/results without guessing across ambiguous identities.
+
+        Exact CWA tool_call_id is authoritative. A result without exact
+        identity may resolve a call only when there is exactly one unmatched call
+        for that tool. Two same-tool outstanding calls therefore remain unresolved
+        instead of being paired by arrival order.
         """
-        if not operation_id:
-            return {"tool_calls": 0, "tool_results": 0, "unresolved_tool_calls": 0}
         calls = 0
         results = 0
-        unmatched: dict[str, int] = {}
-        for event in self.events(goal):
-            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            if payload.get("operation_id") != operation_id:
-                continue
-            tool = str(payload.get("tool_name") or "<unknown>").strip() or "<unknown>"
-            if event.get("type") == "tool_call_observed":
+        exact_matches = 0
+        inferred_matches = 0
+        ambiguous_results = 0
+        orphan_results = 0
+
+        unmatched: dict[str, dict[str, str | None]] = {}
+        anonymous_counter = 0
+
+        def normalized_tool(payload: dict[str, Any]) -> str:
+            return str(payload.get("tool_name") or "<unknown>").strip() or "<unknown>"
+
+        def explicit_call_id(payload: dict[str, Any], *, call: bool) -> str | None:
+            for key in ("tool_call_id", "parent_message_id"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            if call:
+                value = payload.get("message_id")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+
+        for event in events:
+            payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), dict)
+                else {}
+            )
+            kind = event.get("type")
+            tool = normalized_tool(payload)
+            if kind == "tool_call_observed":
                 calls += 1
-                unmatched[tool] = unmatched.get(tool, 0) + 1
-            elif event.get("type") == "tool_result_observed":
-                results += 1
-                if unmatched.get(tool, 0) > 0:
-                    unmatched[tool] -= 1
+                call_id = explicit_call_id(payload, call=True)
+                if call_id:
+                    token = f"id:{call_id}"
+                    if token in unmatched:
+                        token = f"duplicate:{call_id}:{event.get('seq')}"
+                else:
+                    anonymous_counter += 1
+                    token = f"anonymous:{anonymous_counter}"
+                unmatched[token] = {"call_id": call_id, "tool": tool}
+                continue
+
+            if kind != "tool_result_observed":
+                continue
+            results += 1
+            result_call_id = explicit_call_id(payload, call=False)
+            if result_call_id:
+                token = f"id:{result_call_id}"
+                candidate = unmatched.get(token)
+                if candidate is None:
+                    orphan_results += 1
+                    continue
+                candidate_tool = str(candidate.get("tool") or "")
+                if (
+                    tool != "<unknown>"
+                    and candidate_tool != "<unknown>"
+                    and tool != candidate_tool
+                ):
+                    ambiguous_results += 1
+                    continue
+                unmatched.pop(token, None)
+                exact_matches += 1
+                continue
+
+            candidates = [
+                token
+                for token, candidate in unmatched.items()
+                if candidate.get("tool") == tool
+            ]
+            if len(candidates) == 1:
+                unmatched.pop(candidates[0], None)
+                inferred_matches += 1
+            elif len(candidates) > 1:
+                ambiguous_results += 1
+            else:
+                orphan_results += 1
+
+        unresolved_ids = sorted(
+            str(candidate.get("call_id"))
+            for candidate in unmatched.values()
+            if candidate.get("call_id")
+        )
+        anonymous_unresolved = sum(
+            1 for candidate in unmatched.values() if not candidate.get("call_id")
+        )
         return {
             "tool_calls": calls,
             "tool_results": results,
-            "unresolved_tool_calls": sum(unmatched.values()),
+            "matched_tool_results": exact_matches + inferred_matches,
+            "exact_matches": exact_matches,
+            "inferred_matches": inferred_matches,
+            "ambiguous_tool_results": ambiguous_results,
+            "orphan_tool_results": orphan_results,
+            "unresolved_tool_calls": len(unmatched),
+            "unresolved_call_ids": unresolved_ids,
+            "anonymous_unresolved_calls": anonymous_unresolved,
         }
+
+    def operation_evidence(
+        self, goal: GoalState | str, operation_id: str | None
+    ) -> dict[str, Any]:
+        """Summarize observed tool evidence conservatively."""
+        if not operation_id:
+            return self._tool_evidence_summary([])
+        relevant = [
+            event
+            for event in self.events(goal)
+            if self._event_operation_id(event) == operation_id
+            and event.get("type") in {"tool_call_observed", "tool_result_observed"}
+        ]
+        return self._tool_evidence_summary(relevant)
+
+    def record_reconciliation_proof(
+        self,
+        goal: GoalState | str,
+        *,
+        operation_id: str,
+        original_tool_call_id: str,
+        verifier_tool_call_id: str,
+        resource_identity: str,
+        proof_kind: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
+        """Record a trusted machine reconciliation contract.
+
+        This API is intentionally not driven by model text. A caller must bind a
+        concrete unresolved original call to a concrete verifier call/result and
+        stable external resource identity.
+        """
+        operation_id = str(operation_id).strip()
+        original_tool_call_id = str(original_tool_call_id).strip()
+        verifier_tool_call_id = str(verifier_tool_call_id).strip()
+        resource_identity = str(resource_identity).strip()
+        proof_kind = str(proof_kind).strip()
+        if not all(
+            (
+                operation_id,
+                original_tool_call_id,
+                verifier_tool_call_id,
+                resource_identity,
+                proof_kind,
+            )
+        ):
+            raise ValueError("complete reconciliation proof identity is required")
+
+        current = self.operation_evidence(goal, operation_id)
+        unresolved_ids = set(current.get("unresolved_call_ids") or [])
+        if original_tool_call_id not in unresolved_ids:
+            raise ValueError("original tool call is not an unresolved exact call")
+
+        events = self.events(goal)
+        relevant = [
+            event
+            for event in events
+            if self._event_operation_id(event) == operation_id
+        ]
+        resume_positions = [
+            index
+            for index, event in enumerate(relevant)
+            if event.get("type") == "operation_resumed"
+        ]
+        if not resume_positions:
+            raise ValueError("reconciliation proof requires a resumed operation")
+        verification_events = relevant[resume_positions[-1] + 1 :]
+        verification_summary = self._tool_evidence_summary(
+            [
+                event
+                for event in verification_events
+                if event.get("type") in {"tool_call_observed", "tool_result_observed"}
+            ]
+        )
+        verification_call_ids = {
+            str(
+                event["payload"].get("tool_call_id")
+                or event["payload"].get("message_id")
+                or ""
+            ).strip()
+            for event in verification_events
+            if event.get("type") == "tool_call_observed"
+            and isinstance(event.get("payload"), dict)
+        }
+        verification_result_ids = {
+            str(
+                event["payload"].get("tool_call_id")
+                or event["payload"].get("parent_message_id")
+                or ""
+            ).strip()
+            for event in verification_events
+            if event.get("type") == "tool_result_observed"
+            and isinstance(event.get("payload"), dict)
+        }
+        if verifier_tool_call_id not in verification_call_ids:
+            raise ValueError("verifier call is not present after operation resume")
+        if verifier_tool_call_id not in verification_result_ids:
+            raise ValueError("verifier result is not exactly correlated")
+        if verification_summary["ambiguous_tool_results"] or verification_summary[
+            "unresolved_tool_calls"
+        ]:
+            raise ValueError("verification operation still contains ambiguous tool evidence")
+
+        payload = {
+            "operation_id": operation_id,
+            "original_tool_call_id": original_tool_call_id,
+            "verifier_tool_call_id": verifier_tool_call_id,
+            "resource_identity": resource_identity,
+            "proof_kind": proof_kind,
+            "evidence": evidence or {},
+        }
+        stable = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return self.record_observed_event(
+            goal,
+            "operation_reconciliation_proof",
+            payload,
+            event_key="reconcile-proof:"
+            + hashlib.sha256(stable.encode("utf-8")).hexdigest(),
+        )
 
     def operation_reconciliation_evidence(
         self, goal: GoalState | str, operation_id: str | None
-    ) -> dict[str, int | bool]:
-        """Return machine evidence produced after the latest operation resume.
+    ) -> dict[str, Any]:
+        """Return strict machine reconciliation evidence after latest resume.
 
-        An ambiguous original side effect cannot always regain its missing result. In
-        that case a recovery turn may inspect external state with a different tool.
-        We only call that reconciliation-ready when the resumed turn contains at
-        least one matched tool call/result pair and no newly-unresolved calls. The
-        semantic claim that the inspection actually proves the old side effect still
-        comes from the structured Goal response; the journal keeps both layers
-        explicit rather than pretending this is exactly-once proof.
+        Matched read/check tool calls are useful evidence but never prove an
+        ambiguous original write by themselves. Ready becomes true only when
+        trusted runtime code records explicit proof covering every exact unresolved
+        original call. Anonymous unresolved calls cannot be auto-proved.
         """
-        empty: dict[str, int | bool] = {
+        empty: dict[str, Any] = {
             "verification_calls": 0,
             "verification_results": 0,
             "unresolved_verification_calls": 0,
+            "ambiguous_verification_results": 0,
+            "proofs": 0,
+            "covered_original_calls": [],
             "ready": False,
         }
         if not operation_id:
             return empty
+        operation = self.operation_evidence(goal, operation_id)
         relevant = [
             event
             for event in self.events(goal)
-            if isinstance(event.get("payload"), dict)
-            and event["payload"].get("operation_id") == operation_id
+            if self._event_operation_id(event) == operation_id
         ]
         resume_positions = [
             index
@@ -331,27 +672,41 @@ class GoalStore:
         if not resume_positions:
             return empty
         verification = relevant[resume_positions[-1] + 1 :]
-        calls = 0
-        results = 0
-        matched = 0
-        unmatched: dict[str, int] = {}
-        for event in verification:
-            payload = event["payload"]
-            tool = str(payload.get("tool_name") or "<unknown>").strip() or "<unknown>"
-            if event.get("type") == "tool_call_observed":
-                calls += 1
-                unmatched[tool] = unmatched.get(tool, 0) + 1
-            elif event.get("type") == "tool_result_observed":
-                results += 1
-                if unmatched.get(tool, 0) > 0:
-                    unmatched[tool] -= 1
-                    matched += 1
-        unresolved = sum(unmatched.values())
+        summary = self._tool_evidence_summary(
+            [
+                event
+                for event in verification
+                if event.get("type") in {"tool_call_observed", "tool_result_observed"}
+            ]
+        )
+        proofs = [
+            event
+            for event in verification
+            if event.get("type") == "operation_reconciliation_proof"
+            and isinstance(event.get("payload"), dict)
+        ]
+        covered = {
+            str(event["payload"].get("original_tool_call_id") or "").strip()
+            for event in proofs
+            if str(event["payload"].get("resource_identity") or "").strip()
+            and str(event["payload"].get("verifier_tool_call_id") or "").strip()
+        }
+        unresolved_ids = set(operation.get("unresolved_call_ids") or [])
+        ready = bool(
+            unresolved_ids
+            and not operation.get("anonymous_unresolved_calls")
+            and unresolved_ids.issubset(covered)
+            and summary["unresolved_tool_calls"] == 0
+            and summary["ambiguous_tool_results"] == 0
+        )
         return {
-            "verification_calls": calls,
-            "verification_results": results,
-            "unresolved_verification_calls": unresolved,
-            "ready": matched > 0 and unresolved == 0,
+            "verification_calls": summary["tool_calls"],
+            "verification_results": summary["tool_results"],
+            "unresolved_verification_calls": summary["unresolved_tool_calls"],
+            "ambiguous_verification_results": summary["ambiguous_tool_results"],
+            "proofs": len(proofs),
+            "covered_original_calls": sorted(covered),
+            "ready": ready,
         }
 
     def events(self, goal: GoalState | str) -> list[dict[str, Any]]:
@@ -381,6 +736,211 @@ class GoalStore:
                     "created_at": str(created_at),
                 }
             )
+        return result
+
+    def doctor(self, goal: GoalState | str) -> dict[str, Any]:
+        """Return read-only durability/invariant diagnostics for one Goal."""
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        report: dict[str, Any] = {
+            "goal_id": goal_id,
+            "ok": True,
+            "safe_to_continue": True,
+            "checks": {},
+            "warnings": [],
+        }
+        checks: dict[str, Any] = report["checks"]
+
+        try:
+            with self._connect() as db:
+                integrity_row = db.execute("PRAGMA integrity_check").fetchone()
+                integrity = str(integrity_row[0]) if integrity_row else "missing"
+                row = db.execute(
+                    "SELECT revision, generation, state_json FROM goals WHERE goal_id = ?",
+                    (goal_id,),
+                ).fetchone()
+                event_rows = db.execute(
+                    """
+                    SELECT seq, event_type
+                    FROM goal_events
+                    WHERE goal_id = ?
+                    ORDER BY seq
+                    """,
+                    (goal_id,),
+                ).fetchall()
+                binding_rows = db.execute(
+                    """
+                    SELECT conversation_ref, generation
+                    FROM goal_conversations
+                    WHERE goal_id = ?
+                    ORDER BY generation, conversation_ref
+                    """,
+                    (goal_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            report["ok"] = False
+            report["safe_to_continue"] = False
+            checks["sqlite_integrity"] = {"ok": False, "detail": str(exc)}
+            return report
+
+        integrity_ok = integrity == "ok"
+        checks["sqlite_integrity"] = {"ok": integrity_ok, "detail": integrity}
+        if not integrity_ok:
+            report["ok"] = False
+            report["safe_to_continue"] = False
+
+        if row is None:
+            checks["goal_row"] = {"ok": False, "detail": "goal row missing"}
+            report["ok"] = False
+            report["safe_to_continue"] = False
+            return report
+
+        snapshot = self._decode_goal(str(row[2]))
+        checks["snapshot"] = {
+            "ok": snapshot is not None,
+            "revision": int(row[0]),
+            "generation": int(row[1]),
+        }
+        if snapshot is None:
+            report["warnings"].append(
+                "snapshot is unreadable; replay may still recover authoritative state"
+            )
+
+        replay_check = self.verify_replay(goal_id)
+        checks["replay"] = replay_check
+        if not bool(replay_check.get("ok")):
+            report["ok"] = False
+            # Snapshot corruption with valid replay is recoverable for load(), but
+            # a doctor report should still prohibit autonomous continuation until
+            # the inconsistency is repaired/understood.
+            report["safe_to_continue"] = False
+
+        seqs = [int(item[0]) for item in event_rows]
+        expected = list(range(1, len(seqs) + 1))
+        sequence_ok = seqs == expected
+        checks["event_sequence"] = {
+            "ok": sequence_ok,
+            "count": len(seqs),
+            "last_seq": seqs[-1] if seqs else 0,
+        }
+        if not sequence_ok:
+            report["ok"] = False
+            report["safe_to_continue"] = False
+
+        effective = None
+        try:
+            effective = self.replay(goal_id) or snapshot
+        except sqlite3.DatabaseError as exc:
+            checks["journal_hashes"] = {"ok": False, "detail": str(exc)}
+            report["ok"] = False
+            report["safe_to_continue"] = False
+        else:
+            checks["journal_hashes"] = {"ok": True}
+
+        if effective is not None:
+            compatibility = self.runtime_compatibility(effective)
+            checks["runtime"] = compatibility
+            if compatibility["future"]:
+                report["safe_to_continue"] = False
+            elif compatibility["needs_migration"]:
+                report["warnings"].append("runtime/protocol migration required before resume")
+
+            actual_bindings = [str(item[0]) for item in binding_rows]
+            binding_ok = True
+            if (
+                effective.status in {"active", "paused", "blocked"}
+                and effective.conversation_ref
+            ):
+                binding_ok = effective.conversation_ref in actual_bindings
+            checks["bindings"] = {
+                "ok": binding_ok,
+                "current": effective.conversation_ref,
+                "count": len(actual_bindings),
+                "refs": actual_bindings,
+            }
+            if not binding_ok:
+                report["ok"] = False
+                report["safe_to_continue"] = False
+
+            required = [
+                item for item in effective.acceptance_criteria if item.required
+            ]
+            pending = [item.criterion_id for item in required if not item.satisfied]
+            checks["acceptance"] = {
+                "ok": not pending,
+                "required": len(required),
+                "satisfied": len(required) - len(pending),
+                "pending": pending,
+            }
+            if pending:
+                report["warnings"].append(
+                    "required acceptance criteria are still pending: "
+                    + ", ".join(pending)
+                )
+
+            operation_id = effective.active_operation_id
+            operation = self.operation_evidence(effective, operation_id)
+            reconciliation = self.operation_reconciliation_evidence(
+                effective, operation_id
+            )
+            ambiguous = bool(
+                operation_id
+                and (
+                    operation.get("unresolved_tool_calls")
+                    or operation.get("ambiguous_tool_results")
+                )
+                and not reconciliation.get("ready")
+            )
+            checks["open_operation"] = {
+                "ok": not ambiguous,
+                "operation_id": operation_id,
+                "evidence": operation,
+                "reconciliation": reconciliation,
+            }
+            if ambiguous:
+                report["safe_to_continue"] = False
+                report["warnings"].append(
+                    "open operation has unresolved/ambiguous tool evidence"
+                )
+
+        report["event_count"] = len(event_rows)
+        report["latest_event"] = str(event_rows[-1][1]) if event_rows else None
+        return report
+
+    def trace(
+        self, goal: GoalState | str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return a concise chronological tail of the Goal journal."""
+        bounded = max(1, min(int(limit), 200))
+        events = self.events(goal)[-bounded:]
+        result: list[dict[str, Any]] = []
+        for event in events:
+            payload = (
+                event.get("payload")
+                if isinstance(event.get("payload"), dict)
+                else {}
+            )
+            item: dict[str, Any] = {
+                "seq": int(event.get("seq") or 0),
+                "generation": int(event.get("generation") or 0),
+                "type": str(event.get("type") or ""),
+                "created_at": str(event.get("created_at") or ""),
+            }
+            operation_id = self._event_operation_id(event)
+            if operation_id:
+                item["operation_id"] = operation_id
+            for key in (
+                "conversation_ref",
+                "tool_name",
+                "tool_call_id",
+                "message_id",
+                "reason",
+                "criterion_id",
+                "evidence_ref",
+            ):
+                value = payload.get(key)
+                if value not in {None, ""}:
+                    item[key] = value
+            result.append(item)
         return result
 
     def recovery_context(
@@ -420,19 +980,58 @@ class GoalStore:
         steering_events = [event for event in events if event.get("type") == "user_steering"]
         if steering_events:
             budget = max(1200, min(8000, max_chars // 2))
-            per_item = max(80, min(1200, budget // max(1, len(steering_events))))
-            pieces: list[str] = []
+            entries: list[tuple[int, str]] = []
             for index, event in enumerate(steering_events, 1):
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                payload = (
+                    event.get("payload")
+                    if isinstance(event.get("payload"), dict)
+                    else {}
+                )
                 raw = " ".join(str(payload.get("text") or "").split()).strip()
-                pieces.append(f"{index}. {raw[:per_item]}")
-            steering_line = (
-                f"user steering history ({len(steering_events)} durable messages): "
-                + " | ".join(pieces)
+                if raw:
+                    entries.append((index, raw[:1200]))
+
+            prefix = (
+                f"user steering history ({len(steering_events)} durable messages; "
+                "newest steering has precedence): "
             )
-            if len(steering_line) > budget:
-                steering_line = steering_line[: budget - 36] + " … [see full Goal journal]"
-            add(steering_line)
+            remaining = max(0, budget - len(prefix) - 64)
+            chosen: list[tuple[int, str]] = []
+            # Recovery must never lose the newest steering merely because older
+            # technical/control history filled a bounded prompt. Select newest
+            # messages first, then use spare room for the earliest context.
+            used = 0
+            for item in reversed(entries):
+                rendered = f"{item[0]}. {item[1]}"
+                cost = len(rendered) + (3 if chosen else 0)
+                if chosen and used + cost > remaining:
+                    continue
+                if not chosen and cost > remaining:
+                    rendered = rendered[: max(0, remaining - 24)] + " … [truncated]"
+                    chosen.append((item[0], rendered.split(". ", 1)[-1]))
+                    used = len(rendered)
+                    break
+                chosen.append(item)
+                used += cost
+            chosen.reverse()
+
+            earliest = entries[0] if entries else None
+            if earliest is not None and all(item[0] != earliest[0] for item in chosen):
+                rendered = f"{earliest[0]}. {earliest[1]}"
+                cost = len(rendered) + 3
+                if used + cost <= remaining:
+                    chosen.insert(0, earliest)
+                    used += cost
+
+            pieces = [f"{index}. {raw}" for index, raw in chosen]
+            omitted = len(entries) - len(chosen)
+            if omitted > 0:
+                pieces.insert(
+                    1 if len(pieces) > 1 else 0,
+                    f"… {omitted} older steering message(s) omitted; see full Goal journal …",
+                )
+            steering_line = prefix + " | ".join(pieces)
+            add(steering_line[:budget])
 
         recent_candidates = [
             event
@@ -509,15 +1108,10 @@ class GoalStore:
             return None
         with self._connect() as db:
             row = db.execute(
-                """
-                SELECT g.state_json
-                FROM goal_conversations c
-                JOIN goals g ON g.goal_id = c.goal_id
-                WHERE c.conversation_ref = ?
-                """,
+                "SELECT goal_id FROM goal_conversations WHERE conversation_ref = ?",
                 (ref,),
             ).fetchone()
-        return self._decode_goal(str(row[0])) if row is not None else None
+        return self.load(str(row[0])) if row is not None else None
 
     def goal_id_for_conversation(self, conversation_ref: str | None) -> str | None:
         ref = str(conversation_ref or "").strip()
@@ -538,7 +1132,7 @@ class GoalStore:
     ) -> list[GoalState]:
         if not self.db_path.exists():
             return []
-        query = "SELECT state_json FROM goals"
+        query = "SELECT goal_id FROM goals"
         params: list[Any] = []
         if statuses:
             placeholders = ",".join("?" for _ in statuses)
@@ -552,7 +1146,7 @@ class GoalStore:
             rows = db.execute(query, tuple(params)).fetchall()
         result: list[GoalState] = []
         for row in rows:
-            goal = self._decode_goal(str(row[0]))
+            goal = self.load(str(row[0]))
             if goal is not None:
                 result.append(goal)
         return result
@@ -563,14 +1157,13 @@ class GoalStore:
         with self._connect() as db:
             rows = db.execute(
                 """
-                SELECT c.conversation_ref, g.state_json
+                SELECT c.conversation_ref, c.goal_id
                 FROM goal_conversations c
-                JOIN goals g ON g.goal_id = c.goal_id
                 """
             ).fetchall()
         result: dict[str, GoalState] = {}
-        for conversation_ref, state_json in rows:
-            goal = self._decode_goal(str(state_json))
+        for conversation_ref, goal_id in rows:
+            goal = self.load(str(goal_id))
             if goal is not None:
                 result[str(conversation_ref)] = goal
         return result
@@ -665,8 +1258,95 @@ class GoalStore:
                     "SELECT state_json FROM goals WHERE goal_id = ?", (goal_id,)
                 ).fetchone()
             if row is not None:
-                return self._decode_goal(str(row[0]))
+                snapshot = self._decode_goal(str(row[0]))
+                replayed = self.replay(goal_id)
+                if replayed is None:
+                    return snapshot
+                if snapshot is None:
+                    return replayed
+                if snapshot.revision > replayed.revision:
+                    raise sqlite3.DatabaseError(
+                        f"goal {goal_id} snapshot revision {snapshot.revision} is ahead "
+                        f"of replay revision {replayed.revision}; incompatible writer or journal loss"
+                    )
+                if replayed.revision > snapshot.revision:
+                    return replayed
+                if asdict(snapshot) != asdict(replayed):
+                    raise sqlite3.DatabaseError(
+                        f"goal {goal_id} snapshot/replay mismatch at revision {snapshot.revision}"
+                    )
+                return replayed
         return self._load_legacy(goal_id)
+
+    def replay(self, goal: GoalState | str) -> GoalState | None:
+        """Rebuild Goal state from the append-only transition journal.
+
+        State-mutating events carry a complete state_after projection and hash.
+        Observed telemetry events intentionally do not.
+        """
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        if not self.db_path.exists():
+            return None
+        replayed: GoalState | None = None
+        for event in self.events(goal_id):
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            raw_state = payload.get("state_after")
+            if not isinstance(raw_state, dict):
+                continue
+            encoded = json.dumps(raw_state, ensure_ascii=False, sort_keys=True)
+            expected = str(payload.get("state_sha256") or "").strip()
+            actual = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if expected and expected != actual:
+                raise sqlite3.DatabaseError(
+                    f"goal {goal_id} journal state hash mismatch at event {event['seq']}"
+                )
+            candidate = goal_state_from_dict(raw_state)
+            if candidate is None:
+                raise sqlite3.DatabaseError(
+                    f"goal {goal_id} journal contains invalid state at event {event['seq']}"
+                )
+            if candidate.goal_id is None:
+                candidate.goal_id = goal_id
+            if candidate.goal_id != goal_id:
+                raise sqlite3.DatabaseError(
+                    f"goal {goal_id} journal state points at {candidate.goal_id}"
+                )
+            replayed = candidate
+        return replayed
+
+    def verify_replay(self, goal: GoalState | str) -> dict[str, Any]:
+        """Compare transactional snapshot with deterministic journal replay."""
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        if not self.db_path.exists():
+            return {"goal_id": goal_id, "ok": False, "reason": "database missing"}
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT revision, generation, state_json FROM goals WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchone()
+        if row is None:
+            return {"goal_id": goal_id, "ok": False, "reason": "goal row missing"}
+        snapshot = self._decode_goal(str(row[2]))
+        try:
+            replayed = self.replay(goal_id)
+        except sqlite3.DatabaseError as exc:
+            return {"goal_id": goal_id, "ok": False, "reason": str(exc)}
+        if replayed is None:
+            return {"goal_id": goal_id, "ok": False, "reason": "no replayable transition"}
+        snapshot_payload = asdict(snapshot) if snapshot is not None else None
+        replay_payload = asdict(replayed)
+        return {
+            "goal_id": goal_id,
+            "ok": snapshot_payload == replay_payload,
+            "snapshot_valid": snapshot is not None,
+            "snapshot_revision": int(row[0]),
+            "snapshot_generation": int(row[1]),
+            "replay_revision": replayed.revision,
+            "replay_generation": replayed.generation,
+            "reason": None if snapshot_payload == replay_payload else "snapshot/replay mismatch",
+        }
 
     def _load_legacy(self, goal_id: str) -> GoalState | None:
         path = self.goal_path(goal_id)
@@ -744,8 +1424,11 @@ class GoalStore:
             "ON goal_events(goal_id, event_key) WHERE event_key IS NOT NULL"
         )
         schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
-        if schema_version < self.SCHEMA_VERSION:
+        if schema_version < 3:
             self._migrate_conversation_bindings_tx(db)
+        if schema_version < 4:
+            self._migrate_replay_checkpoints_tx(db)
+        if schema_version < self.SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         db.commit()
         return db
@@ -821,6 +1504,40 @@ class GoalStore:
                        ) VALUES (?, ?, ?, ?)""",
                     (ref, str(goal_id), max(1, int(generation)), _now_iso()),
                 )
+
+    def _migrate_replay_checkpoints_tx(self, db: sqlite3.Connection) -> None:
+        """Seed pre-v4 Goals with one replayable state transition."""
+        rows = db.execute(
+            "SELECT goal_id, revision, generation, state_json FROM goals"
+        ).fetchall()
+        for goal_id, revision, generation, state_json in rows:
+            already = db.execute(
+                """
+                SELECT 1 FROM goal_events
+                WHERE goal_id = ? AND json_type(payload_json, '$.state_after') = 'object'
+                LIMIT 1
+                """,
+                (str(goal_id),),
+            ).fetchone()
+            if already is not None:
+                continue
+            goal = self._decode_goal(str(state_json))
+            if goal is None:
+                continue
+            raw_state = asdict(goal)
+            encoded = json.dumps(raw_state, ensure_ascii=False, sort_keys=True)
+            self._append_event_tx(
+                db,
+                str(goal_id),
+                "state_checkpoint",
+                {
+                    "revision": int(revision),
+                    "generation": int(generation),
+                    "migration": "v4-replay-seed",
+                    "state_after": raw_state,
+                    "state_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+                },
+            )
 
     def _append_event_tx(
         self,
@@ -941,6 +1658,29 @@ class GoalStore:
             else:
                 lines.append("- _none recorded_")
             lines.append("")
+        lines.extend(["## Acceptance criteria", ""])
+        if goal.acceptance_criteria:
+            for criterion in goal.acceptance_criteria:
+                status = "PASS" if criterion.satisfied else "PENDING"
+                source = (
+                    f" · {criterion.evidence_source}"
+                    if criterion.evidence_source
+                    else ""
+                )
+                evidence = (
+                    f" · {', '.join(criterion.evidence_refs)}"
+                    if criterion.evidence_refs
+                    else ""
+                )
+                required = "required" if criterion.required else "optional"
+                lines.append(
+                    f"- {criterion.criterion_id} · {status} · {required}{source}{evidence} — "
+                    f"{criterion.description}"
+                )
+        else:
+            lines.append("- _none configured_")
+        lines.append("")
+
         lines.extend(
             [
                 "### Next step",

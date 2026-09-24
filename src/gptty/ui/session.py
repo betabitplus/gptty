@@ -70,13 +70,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "goal",
         "Run the current task until complete or blocked",
-        "<objective> | list [all] | open <id> | pause | resume | status | clear",
+        "<objective> | list [all] | open <id> | pause | resume | status | doctor | trace [N] | criteria | clear",
         (
             CommandOptionSpec("list", "List unfinished goals (add 'all' for terminal)"),
             CommandOptionSpec("open", "Switch to a goal by id prefix"),
             CommandOptionSpec("pause", "Pause the attached goal"),
             CommandOptionSpec("resume", "Resume the attached paused or blocked goal"),
             CommandOptionSpec("status", "Show attached goal state and turn count"),
+            CommandOptionSpec("doctor", "Verify Goal durability and recovery invariants"),
+            CommandOptionSpec("trace", "Show recent typed Goal journal events"),
+            CommandOptionSpec("criteria", "Show or attest Goal acceptance criteria"),
             CommandOptionSpec("clear", "Unbind the attached goal; retain history"),
         ),
     ),
@@ -115,12 +118,13 @@ class _ContextualCommandCompleter(Completer):
             return
 
         if " " not in text:
-            if text != "/":
-                return
+            typed = text[1:].strip().lower()
             for spec in self._commands:
+                if typed and not spec.name.startswith(typed):
+                    continue
                 yield Completion(
                     f"/{spec.name}",
-                    start_position=-1,
+                    start_position=-len(text),
                     display=f"/{spec.name}",
                     display_meta=_command_meta(spec),
                 )
@@ -132,15 +136,17 @@ class _ContextualCommandCompleter(Completer):
         if spec is None or not spec.options:
             return
 
-        # FuzzyCompleter strips the currently typed word before calling us.
-        # If any prior argument remains, this is no longer the first option.
-        if remainder.strip():
+        # Only complete the first subcommand token. Once a second argument begins,
+        # command completion is no longer useful.
+        if any(char.isspace() for char in remainder.strip()):
             return
-
+        typed = remainder.strip().lower()
         for option in spec.options:
+            if typed and not option.value.lower().startswith(typed):
+                continue
             yield Completion(
                 option.value,
-                start_position=0,
+                start_position=-len(typed),
                 display=option.value,
                 display_meta=option.description,
             )
@@ -518,10 +524,7 @@ class InteractiveSession:
     def _build_session(self) -> None:
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
         completer = ConditionalCompleter(
-            FuzzyCompleter(
-                _ContextualCommandCompleter(COMMANDS),
-                enable_fuzzy=True,
-            ),
+            _ContextualCommandCompleter(COMMANDS),
             Condition(lambda: get_app().current_buffer.text.startswith("/")),
         )
         self._command_completer = completer

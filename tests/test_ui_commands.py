@@ -2303,3 +2303,140 @@ def test_goal_open_does_not_follow_stale_historical_conversation_binding(tmp_pat
     infos = [str(message) for kind, message in renderer.events if kind == "info"]
     assert any("oldgoal1" in line and "history only" in line for line in infos)
     assert any("newgoal2" in line and "conv-shared" in line for line in infos)
+
+def test_goal_acceptance_criteria_veto_complete_until_evidence_exists(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-criteria")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.handle(
+        '/goal --accept "full gate passes" --accept "visual cmux passes" "Ship safely"'
+    )
+    assert state.goal is not None
+    assert [item.criterion_id for item in state.goal.acceptance_criteria] == ["A1", "A2"]
+    assert "A1: full gate passes" in (commands.pop_automatic_prompt() or "")
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["implementation"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Done."
+            ),
+            "conversation_ref": "conv-criteria",
+        }
+    )
+    assert state.goal.status == "active"
+    assert any(
+        kind == "warning" and "acceptance criteria" in str(message)
+        for kind, message in renderer.events
+    )
+
+    commands.handle("/goal criteria attest A1 pytest-500-pass")
+    commands.handle("/goal criteria attest A2 cmux-visual-pass")
+    assert all(item.satisfied for item in state.goal.acceptance_criteria)
+    assert all(item.evidence_source == "human" for item in state.goal.acceptance_criteria)
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["implementation"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Done."
+            ),
+            "conversation_ref": "conv-criteria",
+        }
+    )
+    assert state.goal.status == "complete"
+
+
+def test_goal_criteria_list_is_readable_and_definitions_are_creation_only(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(
+        tmp_path, state=ChatState(current_conversation="conv-criteria-list")
+    )
+    commands.handle('/goal --accept "test gate" "Objective"')
+    renderer.events.clear()
+    commands.handle("/goal criteria")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert "Goal acceptance criteria · 0/1 satisfied" in infos
+    assert any("A1 · PENDING" in message and "test gate" in message for message in infos)
+
+def test_goal_resume_explicitly_migrates_legacy_runtime_before_dispatch(tmp_path) -> None:
+    state = ChatState(
+        current_conversation="conv-runtime-old",
+        goal=GoalState(
+            goal_id="goal-runtime-ui",
+            runtime_version=1,
+            protocol_version=1,
+            conversation_ref="conv-runtime-old",
+            conversations=["conv-runtime-old"],
+            status="paused",
+        ),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.goal_store.save(state.goal, event_type="goal_created")
+
+    commands.handle("/goal resume")
+
+    assert state.goal is not None
+    assert state.goal.status == "active"
+    assert state.goal.runtime_version > 1
+    assert state.goal.protocol_version > 1
+    assert any(
+        kind == "info" and "migrated to runtime/protocol" in str(message)
+        for kind, message in renderer.events
+    )
+    assert any(
+        event["type"] == "goal_runtime_migrated"
+        for event in commands.goal_store.events(state.goal)
+    )
+
+
+def test_goal_resume_rejects_future_runtime_without_mutating_it(tmp_path) -> None:
+    from gptty.state import CURRENT_GOAL_RUNTIME_VERSION
+
+    state = ChatState(
+        current_conversation="conv-runtime-future",
+        goal=GoalState(
+            goal_id="goal-runtime-future-ui",
+            runtime_version=CURRENT_GOAL_RUNTIME_VERSION + 1,
+            conversation_ref="conv-runtime-future",
+            conversations=["conv-runtime-future"],
+            status="paused",
+        ),
+    )
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.goal_store.save(state.goal, event_type="goal_created")
+    revision = state.goal.revision
+
+    commands.handle("/goal resume")
+
+    assert state.goal.status == "paused"
+    assert state.goal.revision == revision
+    assert commands.has_automatic_prompt is False
+    assert any(
+        kind == "warning" and "newer runtime/protocol" in str(message)
+        for kind, message in renderer.events
+    )
+
+def test_goal_doctor_and_trace_are_read_only_and_visible(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-doctor-ui")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    commands.handle('/goal "diagnose active goal"')
+    assert state.goal is not None
+    revision = state.goal.revision
+
+    renderer.events.clear()
+    commands.handle("/goal doctor")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert any("Goal doctor · PASS" in message for message in infos)
+    assert any("replay · PASS" in message for message in infos)
+    assert any("kernel lock · PASS · held" in message for message in infos)
+    assert state.goal.revision == revision
+
+    renderer.events.clear()
+    commands.handle("/goal trace 5")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert any(message.startswith("Goal trace · ") for message in infos)
+    assert any("goal_created" in message for message in infos)
+    assert state.goal.revision == revision

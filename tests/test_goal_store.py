@@ -32,7 +32,7 @@ def test_goal_store_writes_portable_json_checkpoint_and_multi_goal_index(tmp_pat
 
     assert path == tmp_path / "goals" / "goal-123" / "goal.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema"] == 3
+    assert payload["schema"] == 4
     assert payload["goal"]["checkpoint"]["decisions"] == [
         "keep API backwards compatible"
     ]
@@ -46,7 +46,7 @@ def test_goal_store_writes_portable_json_checkpoint_and_multi_goal_index(tmp_pat
     assert "https://chatgpt.com/c/conv-1" in checkpoint
     assert not store.current_path().exists()
     index = json.loads(store.index_path().read_text(encoding="utf-8"))
-    assert index["schema"] == 3
+    assert index["schema"] == 4
     assert index["goals"][0]["goal_id"] == "goal-123"
     assert store.load_for_conversation("conv-2") == goal
     assert set(store.bindings_for_goal(goal)) == {"conv-1", "conv-2"}
@@ -346,9 +346,18 @@ seq = db.execute(
     "SELECT COALESCE(MAX(seq),0)+1 FROM goal_events WHERE goal_id=?",
     ("goal-wal-recovery",),
 ).fetchone()[0]
+import hashlib
+state_json = json.dumps(state, ensure_ascii=False, sort_keys=True)
+event_payload = {
+    "body": "wal committed",
+    "revision": state["revision"],
+    "generation": row[1],
+    "state_after": state,
+    "state_sha256": hashlib.sha256(state_json.encode("utf-8")).hexdigest(),
+}
 db.execute(
     "INSERT INTO goal_events(goal_id,seq,generation,event_type,payload_json,created_at) VALUES(?,?,?,?,?,datetime('now'))",
-    ("goal-wal-recovery", seq, row[1], "turn_terminal", json.dumps({"body":"wal committed"})),
+    ("goal-wal-recovery", seq, row[1], "turn_terminal", json.dumps(event_payload)),
 )
 db.commit()
 os._exit(88)
@@ -407,7 +416,10 @@ os._exit(89)
     assert recovered is not None
     assert recovered.active_operation_id == "goal-evidence-crash:g1:t1"
     evidence = store.operation_evidence(recovered, recovered.active_operation_id)
-    assert evidence == {"tool_calls": 1, "tool_results": 0, "unresolved_tool_calls": 1}
+    assert evidence["tool_calls"] == 1
+    assert evidence["tool_results"] == 0
+    assert evidence["unresolved_tool_calls"] == 1
+    assert evidence["ambiguous_tool_results"] == 0
     context = "\n".join(store.recovery_context(recovered))
     assert "external write" in context
     assert "write once" in context
@@ -438,11 +450,11 @@ def test_operation_evidence_does_not_let_unrelated_tool_result_resolve_write(tmp
         event_key="result-read",
     )
 
-    assert store.operation_evidence(goal, operation_id) == {
-        "tool_calls": 1,
-        "tool_results": 1,
-        "unresolved_tool_calls": 1,
-    }
+    evidence = store.operation_evidence(goal, operation_id)
+    assert evidence["tool_calls"] == 1
+    assert evidence["tool_results"] == 1
+    assert evidence["unresolved_tool_calls"] == 1
+    assert evidence["orphan_tool_results"] == 1
 
     store.record_observed_event(
         goal,
@@ -708,4 +720,488 @@ def test_v2_singleton_store_migrates_all_conversation_bindings_to_v3(tmp_path) -
         "conv-new",
     }
     with migrated._connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+
+def test_goal_store_replay_matches_snapshot_and_recovers_corrupt_snapshot(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(goal_id="goal-replay", status="paused", objective="replay me")
+    store.save(goal, event_type="goal_created")
+    goal.status = "active"
+    goal.turn_count = 2
+    store.save(goal, event_type="goal_resumed")
+
+    verified = store.verify_replay(goal)
+    assert verified["ok"] is True
+    replayed = store.replay(goal)
+    assert replayed is not None
+    assert replayed.status == "active"
+    assert replayed.turn_count == 2
+
+    with store._connect() as db:
+        db.execute(
+            "UPDATE goals SET state_json = ? WHERE goal_id = ?",
+            ("{not-json", goal.goal_id),
+        )
+        db.commit()
+
+    recovered = store.load("goal-replay")
+    assert recovered is not None
+    assert recovered.status == "active"
+    assert recovered.turn_count == 2
+    checked = store.verify_replay("goal-replay")
+    assert checked["ok"] is False
+    assert checked["snapshot_valid"] is False
+
+
+def test_v3_store_migrates_with_replay_checkpoint(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(goal_id="goal-v3-replay", status="paused", objective="migrate")
+    store.save(goal, event_type="goal_created")
+    with store._connect() as db:
+        db.execute(
+            "DELETE FROM goal_events WHERE goal_id = ?",
+            (goal.goal_id,),
+        )
+        db.execute("PRAGMA user_version=3")
+        db.commit()
+
+    migrated = GoalStore(tmp_path / "state.json")
+    loaded = migrated.load("goal-v3-replay")
+    assert loaded is not None
+    events = migrated.events("goal-v3-replay")
+    assert any(event["type"] == "state_checkpoint" for event in events)
+    assert migrated.verify_replay("goal-v3-replay")["ok"] is True
+
+
+def test_operation_evidence_exactly_correlates_repeated_same_tool_calls(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-exact:g1:t1"
+    goal = GoalState(
+        goal_id="goal-exact",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    for call_id in ("call-1", "call-2"):
+        store.record_observed_event(
+            goal,
+            "tool_call_observed",
+            {
+                "operation_id": operation_id,
+                "message_id": call_id,
+                "tool_call_id": call_id,
+                "tool_name": "write_api",
+            },
+            event_key=f"call:{call_id}",
+        )
+    store.record_observed_event(
+        goal,
+        "tool_result_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "result-2",
+            "tool_call_id": "call-2",
+            "tool_name": "write_api",
+        },
+        event_key="result:2",
+    )
+    evidence = store.operation_evidence(goal, operation_id)
+    assert evidence["exact_matches"] == 1
+    assert evidence["unresolved_tool_calls"] == 1
+    assert evidence["ambiguous_tool_results"] == 0
+
+
+def test_operation_evidence_never_guesses_between_same_tool_calls_without_identity(
+    tmp_path,
+) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-ambiguous-pair:g1:t1"
+    goal = GoalState(
+        goal_id="goal-ambiguous-pair",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    for call_id in ("call-a", "call-b"):
+        store.record_observed_event(
+            goal,
+            "tool_call_observed",
+            {
+                "operation_id": operation_id,
+                "message_id": call_id,
+                "tool_call_id": call_id,
+                "tool_name": "write_api",
+            },
+            event_key=f"call:{call_id}",
+        )
+    store.record_observed_event(
+        goal,
+        "tool_result_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "result-without-parent",
+            "tool_name": "write_api",
+        },
+        event_key="result:ambiguous",
+    )
+    evidence = store.operation_evidence(goal, operation_id)
+    assert evidence["matched_tool_results"] == 0
+    assert evidence["ambiguous_tool_results"] == 1
+    assert evidence["unresolved_tool_calls"] == 2
+
+def test_reconciliation_readback_without_machine_contract_is_not_ready(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-reconcile-read:g1:t1"
+    goal = GoalState(
+        goal_id="goal-reconcile-read",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "write-call",
+            "tool_call_id": "write-call",
+            "tool_name": "write_api",
+        },
+        event_key="write-call",
+    )
+    store.save(goal, event_type="operation_resumed")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "verify-call",
+            "tool_call_id": "verify-call",
+            "tool_name": "read_api",
+        },
+        event_key="verify-call",
+    )
+    store.record_observed_event(
+        goal,
+        "tool_result_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "verify-result",
+            "tool_call_id": "verify-call",
+            "tool_name": "read_api",
+        },
+        event_key="verify-result",
+    )
+
+    evidence = store.operation_reconciliation_evidence(goal, operation_id)
+    assert evidence["verification_calls"] == 1
+    assert evidence["verification_results"] == 1
+    assert evidence["unresolved_verification_calls"] == 0
+    assert evidence["proofs"] == 0
+    assert evidence["ready"] is False
+
+
+def test_reconciliation_machine_contract_covers_exact_original_call(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-reconcile-proof:g1:t1"
+    goal = GoalState(
+        goal_id="goal-reconcile-proof",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "write-call",
+            "tool_call_id": "write-call",
+            "tool_name": "write_api",
+        },
+        event_key="write-call",
+    )
+    store.save(goal, event_type="operation_resumed")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "verify-call",
+            "tool_call_id": "verify-call",
+            "tool_name": "read_api",
+        },
+        event_key="verify-call",
+    )
+    store.record_observed_event(
+        goal,
+        "tool_result_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "verify-result",
+            "tool_call_id": "verify-call",
+            "tool_name": "read_api",
+        },
+        event_key="verify-result",
+    )
+
+    assert store.record_reconciliation_proof(
+        goal,
+        operation_id=operation_id,
+        original_tool_call_id="write-call",
+        verifier_tool_call_id="verify-call",
+        resource_identity="record:customer-42",
+        proof_kind="readback",
+        evidence={"count": 1},
+    )
+    evidence = store.operation_reconciliation_evidence(goal, operation_id)
+    assert evidence["proofs"] == 1
+    assert evidence["covered_original_calls"] == ["write-call"]
+    assert evidence["ready"] is True
+
+def test_acceptance_evidence_is_durable_and_replayable(tmp_path) -> None:
+    from gptty.state import GoalAcceptanceCriterion
+
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(
+        goal_id="goal-acceptance",
+        status="paused",
+        acceptance_criteria=[
+            GoalAcceptanceCriterion(
+                criterion_id="A1",
+                description="full gate passes",
+            )
+        ],
+    )
+    store.save(goal, event_type="goal_created")
+    updated = store.record_acceptance_evidence(
+        goal,
+        criterion_id="A1",
+        evidence_ref="pytest:sha256:abc",
+        source="machine",
+        details={"passed": 500},
+    )
+    assert updated.acceptance_criteria[0].satisfied is True
+    assert updated.acceptance_criteria[0].evidence_source == "machine"
+    loaded = store.load("goal-acceptance")
+    assert loaded is not None
+    assert loaded.acceptance_criteria[0].evidence_refs == ["pytest:sha256:abc"]
+    assert store.verify_replay("goal-acceptance")["ok"] is True
+    assert any(
+        event["type"] == "acceptance_criterion_satisfied"
+        for event in store.events("goal-acceptance")
+    )
+
+
+def test_acceptance_evidence_cannot_silently_replace_existing_proof(tmp_path) -> None:
+    from gptty.state import GoalAcceptanceCriterion
+
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(
+        goal_id="goal-acceptance-immutable",
+        status="paused",
+        acceptance_criteria=[
+            GoalAcceptanceCriterion("A1", "visual acceptance")
+        ],
+    )
+    store.save(goal, event_type="goal_created")
+    store.record_acceptance_evidence(
+        goal,
+        criterion_id="A1",
+        evidence_ref="human:one",
+        source="human",
+    )
+    import pytest
+    from gptty.goal_store import GoalConflictError
+
+    with pytest.raises(GoalConflictError):
+        store.record_acceptance_evidence(
+            goal,
+            criterion_id="A1",
+            evidence_ref="human:two",
+            source="human",
+        )
+
+def test_legacy_runtime_goal_requires_explicit_journaled_migration(tmp_path) -> None:
+    from gptty.state import (
+        CURRENT_GOAL_PROTOCOL_VERSION,
+        CURRENT_GOAL_RUNTIME_VERSION,
+    )
+
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(
+        goal_id="goal-runtime-old",
+        runtime_version=1,
+        protocol_version=1,
+        status="paused",
+    )
+    store.save(goal, event_type="goal_created")
+    before = store.runtime_compatibility(goal)
+    assert before["needs_migration"] is True
+
+    migrated = store.migrate_runtime(goal)
+    assert migrated.runtime_version == CURRENT_GOAL_RUNTIME_VERSION
+    assert migrated.protocol_version == CURRENT_GOAL_PROTOCOL_VERSION
+    assert store.runtime_compatibility(migrated)["needs_migration"] is False
+    events = store.events(goal)
+    migration = [event for event in events if event["type"] == "goal_runtime_migrated"]
+    assert len(migration) == 1
+    assert migration[0]["payload"]["from_runtime_version"] == 1
+    assert store.verify_replay(goal)["ok"] is True
+
+
+def test_future_runtime_goal_fails_closed(tmp_path) -> None:
+    import pytest
+    from gptty.goal_store import GoalCompatibilityError
+    from gptty.state import CURRENT_GOAL_RUNTIME_VERSION
+
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(
+        goal_id="goal-runtime-future",
+        runtime_version=CURRENT_GOAL_RUNTIME_VERSION + 10,
+        status="paused",
+    )
+    store.save(goal, event_type="goal_created")
+    assert store.runtime_compatibility(goal)["future"] is True
+    with pytest.raises(GoalCompatibilityError):
+        store.migrate_runtime(goal)
+
+
+def test_recovery_context_never_drops_newest_steering_when_budget_is_tight(
+    tmp_path,
+) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(goal_id="goal-latest-steering", status="active")
+    store.save(
+        goal,
+        event_type="goal_created",
+        event_payload={"context_snapshot": ["user: initial objective"]},
+    )
+    for index in range(40):
+        goal.turn_count += 1
+        store.save(
+            goal,
+            event_type="user_steering",
+            event_payload={
+                "text": (
+                    f"steering {index}: "
+                    + ("x" * 260)
+                    + (" FINAL_OVERRIDE_DO_NOT_USE_TOOLS" if index == 39 else "")
+                )
+            },
+        )
+
+    context = "\n".join(store.recovery_context(goal, max_chars=2600, max_events=4))
+    assert "FINAL_OVERRIDE_DO_NOT_USE_TOOLS" in context
+    assert "newest steering has precedence" in context
+    assert "omitted" in context
+
+def test_goal_doctor_reports_healthy_store_replay_bindings_and_runtime(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(
+        goal_id="goal-doctor-healthy",
+        conversation_ref="conv-doctor",
+        conversations=["conv-doctor"],
+        status="paused",
+        objective="diagnose me",
+    )
+    store.save(goal, event_type="goal_created")
+
+    report = store.doctor(goal)
+    assert report["ok"] is True
+    assert report["safe_to_continue"] is True
+    assert report["checks"]["sqlite_integrity"]["ok"] is True
+    assert report["checks"]["replay"]["ok"] is True
+    assert report["checks"]["event_sequence"]["ok"] is True
+    assert report["checks"]["journal_hashes"]["ok"] is True
+    assert report["checks"]["bindings"]["ok"] is True
+    assert report["checks"]["runtime"]["future"] is False
+
+
+def test_goal_doctor_detects_corrupt_journal_state_hash_and_load_fails_closed(
+    tmp_path,
+) -> None:
+    import sqlite3
+
+    import pytest
+
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(goal_id="goal-doctor-hash", status="paused")
+    store.save(goal, event_type="goal_created")
+    with store._connect() as db:
+        row = db.execute(
+            """
+            SELECT seq, payload_json
+            FROM goal_events
+            WHERE goal_id = ?
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            (goal.goal_id,),
+        ).fetchone()
+        payload = json.loads(row[1])
+        payload["state_sha256"] = "0" * 64
+        db.execute(
+            "UPDATE goal_events SET payload_json = ? WHERE goal_id = ? AND seq = ?",
+            (json.dumps(payload), goal.goal_id, row[0]),
+        )
+        db.commit()
+
+    report = store.doctor(goal.goal_id)
+    assert report["ok"] is False
+    assert report["safe_to_continue"] is False
+    assert report["checks"]["replay"]["ok"] is False
+    assert report["checks"]["journal_hashes"]["ok"] is False
+    with pytest.raises(sqlite3.DatabaseError):
+        store.load(goal.goal_id)
+
+
+def test_goal_doctor_detects_event_sequence_gap(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    goal = GoalState(goal_id="goal-doctor-gap", status="paused")
+    store.save(goal, event_type="goal_created")
+    goal.turn_count = 1
+    store.save(goal, event_type="turn_terminal")
+    with store._connect() as db:
+        db.execute(
+            "DELETE FROM goal_events WHERE goal_id = ? AND seq = 1",
+            (goal.goal_id,),
+        )
+        db.commit()
+
+    report = store.doctor(goal.goal_id)
+    assert report["ok"] is False
+    assert report["safe_to_continue"] is False
+    assert report["checks"]["event_sequence"]["ok"] is False
+
+
+def test_goal_trace_is_bounded_and_preserves_machine_identity(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-trace:g1:t1"
+    goal = GoalState(
+        goal_id="goal-trace",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "call-1",
+            "tool_call_id": "call-1",
+            "tool_name": "api_tool.call_tool",
+        },
+        event_key="trace-call",
+    )
+    trace = store.trace(goal, limit=1)
+    assert len(trace) == 1
+    assert trace[0]["type"] == "tool_call_observed"
+    assert trace[0]["operation_id"] == operation_id
+    assert trace[0]["tool_call_id"] == "call-1"

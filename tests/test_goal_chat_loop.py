@@ -2614,6 +2614,12 @@ def test_starting_second_process_does_not_pause_goal_owned_by_live_process(tmp_p
         turn_count=3,
     )
     store.save(owned, event_type="goal_created")
+    from gptty.goal_lock import try_acquire_goal_lock
+
+    live_lock = try_acquire_goal_lock(
+        store.root, owned.goal_id, runner_id="live-owner-token", pid=os.getpid()
+    )
+    assert live_lock is not None
     before = store.load("goal-live-owner")
     assert before is not None
     before_revision = before.revision
@@ -2623,13 +2629,16 @@ def test_starting_second_process_does_not_pause_goal_owned_by_live_process(tmp_p
         def __init__(self, *args, **kwargs) -> None:
             raise AssertionError("second process must not contact ChatGPT")
 
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=NeverCreateClient,
-        input_stream=StringIO("/exit\n"),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
+    try:
+        code = run_chat(
+            _args(tmp_path),
+            client_factory=NeverCreateClient,
+            input_stream=StringIO("/exit\n"),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+    finally:
+        live_lock.release()
 
     assert code == 0
     after = store.load("goal-live-owner")
@@ -2658,6 +2667,15 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
         ),
         event_type="goal_created",
     )
+    from gptty.goal_lock import try_acquire_goal_lock
+
+    live_lock = try_acquire_goal_lock(
+        store.root,
+        "goal-live-dispatch-guard",
+        runner_id="live-owner-token",
+        pid=os.getpid(),
+    )
+    assert live_lock is not None
     save_chat_state(state_path, ChatState(current_conversation="conv-owned"))
     _FakeRenderer.instances.clear()
     _FakeSession.script = iter(
@@ -2687,13 +2705,16 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
     monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
     monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
 
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=NeverCreateClient,
-        input_stream=StringIO(),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
+    try:
+        code = run_chat(
+            _args(tmp_path),
+            client_factory=NeverCreateClient,
+            input_stream=StringIO(),
+            stdout=StringIO(),
+            stderr=StringIO(),
+        )
+    finally:
+        live_lock.release()
 
     assert code == 0
     assert created == []
@@ -2804,7 +2825,7 @@ def test_goal_transport_tool_evidence_is_in_reconciliation_prompt_after_incomple
     assert [event["type"] for event in events].count("tool_result_observed") == 1
 
 
-def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay(
+def test_restart_with_ambiguous_operation_readback_without_contract_blocks_safely(
     tmp_path, monkeypatch
 ) -> None:
     state_path = tmp_path / "state.json"
@@ -2868,6 +2889,7 @@ def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay
                     "type": "canonical_intermediate_message",
                     "message_kind": "tool_call",
                     "message_id": "reconcile-read-call",
+                    "tool_call_id": "reconcile-read-call",
                     "tool_name": "read_api",
                     "label": "verify existing record",
                     "text": "read record without writing",
@@ -2878,6 +2900,7 @@ def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay
                     "type": "canonical_intermediate_message",
                     "message_kind": "tool_result",
                     "message_id": "reconcile-read-result",
+                    "tool_call_id": "reconcile-read-call",
                     "tool_name": "read_api",
                     "label": "record exists",
                     "text": "record exists exactly once",
@@ -2902,8 +2925,12 @@ def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay
             "/goal resume",
             (
                 lambda: bool(_FakeRenderer.instances)
-                and ("info", "Goal · complete · 4 turns")
-                in _FakeRenderer.instances[0].events,
+                and any(
+                    kind == "warning"
+                    and "ambiguous external side effect requires machine-verifiable reconciliation"
+                    in str(message)
+                    for kind, message in _FakeRenderer.instances[0].events
+                ),
                 "/exit",
             ),
         ]
@@ -2932,14 +2959,23 @@ def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay
     assert len(ReconcileClient.instances[0].calls) == 1
     recovered = store.load("goal-restart-ambiguous")
     assert recovered is not None
-    assert recovered.status == "complete"
+    assert recovered.status == "blocked"
     assert recovered.turn_count == 4
+    assert recovered.active_operation_id == operation_id
     events = store.events(recovered)
     paused = [event for event in events if event["type"] == "goal_paused"]
     assert paused
     assert paused[-1]["payload"]["recovered_after_process_exit"] is True
     assert paused[-1]["payload"]["ambiguous_operation"] == operation_id
     assert any(event["type"] == "goal_resumed" for event in events)
+    blocked = [
+        event
+        for event in events
+        if event["type"] == "goal_blocked_ambiguous_operation"
+    ]
+    assert blocked
+    assert blocked[-1]["payload"]["ambiguous_operation"] == operation_id
+    assert blocked[-1]["payload"]["reconciliation_evidence"]["ready"] is False
 
 
 def test_restart_binds_fresh_chat_from_machine_write_commit_before_pausing_goal(tmp_path) -> None:

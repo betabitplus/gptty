@@ -30,7 +30,8 @@ from ..locks import (
     render_lock_timeout,
     render_stale_lock_recovered,
 )
-from ..goal_store import GoalConflictError, GoalStore, ensure_goal_id
+from ..goal_lock import try_acquire_goal_lock
+from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
@@ -751,51 +752,80 @@ def run_chat(
     startup_goal_paused = False
     startup_goal_remote_active = False
     if state.goal is not None and state.goal.status == "active":
-        owner_alive = bool(
-            state.goal.runner_id
-            and state.goal.runner_pid
-            and _pid_is_alive(state.goal.runner_pid)
+        compatibility = goal_store.runtime_compatibility(state.goal)
+        if compatibility["future"]:
+            print(
+                "gptty: active Goal requires newer runtime/protocol semantics "
+                f"{state.goal.runtime_version}/{state.goal.protocol_version}; "
+                f"supported={compatibility['current_runtime_version']}/"
+                f"{compatibility['current_protocol_version']}",
+                file=stderr,
+            )
+            return 1
+        goal_id = state.goal.goal_id or ""
+        # Kernel ownership, not PID existence, is authoritative. If this lock can
+        # be acquired then any previous owner is gone even when its PID was reused.
+        recovery_lock = try_acquire_goal_lock(
+            goal_store.root,
+            goal_id,
+            runner_id=runner_id,
+            pid=os.getpid(),
         )
-        if owner_alive:
+        if recovery_lock is None:
             startup_goal_remote_active = True
         else:
-            ambiguous_operation = state.goal.active_operation_id
-            goal_id = state.goal.goal_id or ""
-            state.goal.status = "paused"
-            state.goal.reason = "gptty restarted while goal was active"
-            state.goal.runner_id = None
-            state.goal.runner_pid = 0
-            startup_goal_paused = True
             try:
-                goal_store.save(
-                    state.goal,
-                    event_type="goal_paused",
-                    event_payload={
-                        "reason": state.goal.reason,
-                        "ambiguous_operation": ambiguous_operation,
-                        "recovered_after_process_exit": True,
-                    },
-                )
-            except (GoalConflictError, OSError, sqlite3.Error) as exc:
-                # Only reload this Goal. A different active Goal in the profile is
-                # unrelated and must never affect recovery of the attached chat.
-                try:
-                    authoritative = goal_store.load(goal_id)
-                except (OSError, sqlite3.Error) as reload_exc:
-                    print(f"gptty: failed to reload Goal store: {reload_exc}", file=stderr)
-                    return 1
-                if authoritative is None:
-                    print(f"gptty: {exc}", file=stderr)
-                    return 1
-                state.goal = authoritative
-                state.current_conversation = authoritative.conversation_ref
-                startup_goal_paused = False
-                startup_goal_remote_active = bool(
-                    authoritative.status == "active"
-                    and authoritative.runner_id
-                    and authoritative.runner_pid
-                    and _pid_is_alive(authoritative.runner_pid)
-                )
+                for attempt in range(2):
+                    current = state.goal if attempt == 0 else goal_store.load(goal_id)
+                    if current is None:
+                        print("gptty: active Goal disappeared during restart recovery", file=stderr)
+                        return 1
+                    if current.status != "active":
+                        state.goal = current
+                        state.current_conversation = current.conversation_ref
+                        break
+                    ambiguous_operation = current.active_operation_id
+                    current.status = "paused"
+                    current.reason = "gptty restarted while goal was active"
+                    current.runner_id = None
+                    current.runner_pid = 0
+                    try:
+                        goal_store.save(
+                            current,
+                            event_type="goal_paused",
+                            event_payload={
+                                "reason": current.reason,
+                                "ambiguous_operation": ambiguous_operation,
+                                "recovered_after_process_exit": True,
+                                "ownership_proof": "kernel_lock_reacquired",
+                            },
+                        )
+                    except GoalConflictError:
+                        if attempt == 0:
+                            continue
+                        print(
+                            "gptty: Goal changed repeatedly during kernel-locked restart recovery",
+                            file=stderr,
+                        )
+                        return 1
+                    if goal_store.runtime_compatibility(current)["needs_migration"]:
+                        try:
+                            current = goal_store.migrate_runtime(current)
+                        except (GoalCompatibilityError, GoalConflictError) as exc:
+                            print(
+                                f"gptty: Goal runtime migration after restart failed: {exc}",
+                                file=stderr,
+                            )
+                            return 1
+                    state.goal = current
+                    state.current_conversation = current.conversation_ref
+                    startup_goal_paused = True
+                    break
+            except (OSError, sqlite3.Error) as exc:
+                print(f"gptty: failed to recover active Goal: {exc}", file=stderr)
+                return 1
+            finally:
+                recovery_lock.release()
 
     try:
         save_chat_state(state_path, state)

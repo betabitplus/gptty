@@ -130,6 +130,34 @@ def completion_checkpoint_error(parsed: ParsedGoalResponse) -> str | None:
         return "COMPLETE checkpoint has no next-state declaration"
     return None
 
+def acceptance_criteria_error(goal: GoalState) -> str | None:
+    pending = [
+        criterion.criterion_id
+        for criterion in goal.acceptance_criteria
+        if criterion.required and not criterion.satisfied
+    ]
+    if not pending:
+        return None
+    return "required acceptance criteria are not satisfied: " + ", ".join(pending)
+
+
+def _acceptance_criteria_text(goal: GoalState) -> str:
+    if not goal.acceptance_criteria:
+        return "none configured"
+    parts: list[str] = []
+    for criterion in goal.acceptance_criteria:
+        status = "PASS" if criterion.satisfied else "PENDING"
+        source = (
+            f", evidence={criterion.evidence_source}"
+            if criterion.evidence_source
+            else ""
+        )
+        parts.append(
+            f"{criterion.criterion_id} [{status}{source}] {criterion.description}"
+        )
+    return " | ".join(parts)
+
+
 def goal_protocol_instruction() -> str:
     return (
         "At the very start of your FINAL assistant response for this turn, output exactly one of these lines:\n"
@@ -150,16 +178,29 @@ def goal_protocol_instruction() -> str:
     )
 
 
-def activation_prompt(objective: str | None = None) -> str:
+def activation_prompt(
+    objective: str | None = None, *, goal: GoalState | None = None
+) -> str:
     objective_text = ""
     if objective and objective.strip():
         objective_text = f"\n\nExplicit goal:\n{objective.strip()}"
+    criteria_text = ""
+    if goal is not None and goal.acceptance_criteria:
+        criteria_text = (
+            "\n\nRequired acceptance criteria (evidence state is authoritative):\n"
+            + "\n".join(
+                f"- {criterion.criterion_id}: {criterion.description}"
+                for criterion in goal.acceptance_criteria
+                if criterion.required
+            )
+            + "\nDo not report COMPLETE while any required criterion remains PENDING."
+        )
     return (
         "GPTTY Goal mode is now active. Pursue the task and plan already agreed in this chat autonomously until the "
         "whole agreed scope is complete; do not expand the scope beyond what was agreed. Continue doing useful work "
         "without asking for confirmation unless you are genuinely blocked. Treat the checkpoint as durable recovery "
         "state: it must be sufficient to continue safely in a new chat without repeating completed side effects."
-        f"{objective_text}\n\n{goal_protocol_instruction()}\n\nContinue working on the goal now."
+        f"{objective_text}{criteria_text}\n\n{goal_protocol_instruction()}\n\nContinue working on the goal now."
     )
 
 
@@ -169,11 +210,13 @@ def _goal_anchor(goal: GoalState) -> str:
         "Durable active Goal (authoritative for this turn):\n"
         f"Goal ID: {goal.goal_id or 'unknown'}\n"
         f"Generation: {goal.generation}\n"
+        f"Runtime/protocol version: {goal.runtime_version}/{goal.protocol_version}\n"
         f"Objective: {goal.objective or 'inherit the agreed task from the captured Goal context'}\n"
         f"Checkpoint summary: {checkpoint.summary or 'not yet captured'}\n"
         f"Completed: {_join_checkpoint(checkpoint.completed)}\n"
         f"Decisions: {_join_checkpoint(checkpoint.decisions)}\n"
         f"Pending: {_join_checkpoint(checkpoint.pending)}\n"
+        f"Acceptance criteria: {_acceptance_criteria_text(goal)}\n"
         f"Next safe step: {checkpoint.next_step or 'reconstruct current state before acting'}\n"
         "Treat this Goal state and newer user steering as the task authority. Do not drift back into unrelated "
         "older work merely because it exists in the conversation history."
@@ -247,12 +290,14 @@ def rollover_prompt(
         f"Recovery reason: {reason}\n"
         f"Original objective: {goal.objective or 'inherited from the previous conversation'}\n"
         f"Previous conversation chain: {conversations}\n"
-        f"Goal generation: {goal.generation}\n\n"
+        f"Goal generation: {goal.generation}\n"
+        f"Runtime/protocol version: {goal.runtime_version}/{goal.protocol_version}\n\n"
         "Durable checkpoint:\n"
         f"Summary: {checkpoint.summary or 'not yet captured'}\n"
         f"Completed: {_join_checkpoint(checkpoint.completed)}\n"
         f"Decisions: {_join_checkpoint(checkpoint.decisions)}\n"
         f"Pending: {_join_checkpoint(checkpoint.pending)}\n"
+        f"Acceptance criteria: {_acceptance_criteria_text(goal)}\n"
         f"Next safe step: {checkpoint.next_step or 'reconstruct the current state before acting'}\n\n"
         "Recovery context captured when Goal started:\n"
         f"{context_seed}\n\n"
