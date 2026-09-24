@@ -5,12 +5,15 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 DEFAULT_MATCH_WINDOW_MS = 10_000
 DEFAULT_REFRESH_SECONDS = 0.5
+DEFAULT_MAX_RECORDS = 20_000
+_ANCHOR_BYTES = 512
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,7 @@ class CodexProActivityTracker:
         mapping_path: str | Path | None = None,
         match_window_ms: int = DEFAULT_MATCH_WINDOW_MS,
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+        max_records: int = DEFAULT_MAX_RECORDS,
     ) -> None:
         configured_journal = os.environ.get("GPTTY_CODEXPRO_ACTIVITY_JOURNAL", "").strip()
         self.journal_path = Path(
@@ -117,10 +121,14 @@ class CodexProActivityTracker:
         )
         self.match_window_ms = max(1, int(match_window_ms))
         self.refresh_seconds = max(0.0, float(refresh_seconds))
+        self.max_records = max(100, int(max_records))
         self._lock = threading.RLock()
         self._mapping: dict[str, str] = {}
-        self._records: list[dict[str, Any]] = []
-        self._journal_signature: tuple[int, int] | None = None
+        self._records: deque[dict[str, Any]] = deque(maxlen=self.max_records)
+        self._journal_identity: tuple[int, int] | None = None
+        self._journal_offset = 0
+        self._journal_partial = b""
+        self._journal_anchor = b""
         self._last_refresh_at = 0.0
         self._load_mapping()
 
@@ -196,28 +204,64 @@ class CodexProActivityTracker:
         try:
             stat = self.journal_path.stat()
         except OSError:
-            self._records = []
-            self._journal_signature = None
+            self._records.clear()
+            self._journal_identity = None
+            self._journal_offset = 0
+            self._journal_partial = b""
+            self._journal_anchor = b""
             return
-        signature = (stat.st_mtime_ns, stat.st_size)
-        if not force and signature == self._journal_signature:
-            return
+
+        identity = (int(stat.st_dev), int(stat.st_ino))
+        reset = (
+            self._journal_identity is not None
+            and (
+                identity != self._journal_identity
+                or int(stat.st_size) < self._journal_offset
+            )
+        )
+
         try:
-            text = self.journal_path.read_text(encoding="utf-8")
+            with self.journal_path.open("rb") as handle:
+                if not reset and self._journal_offset > 0 and self._journal_anchor:
+                    anchor_start = max(0, self._journal_offset - _ANCHOR_BYTES)
+                    handle.seek(anchor_start)
+                    current_anchor = handle.read(self._journal_offset - anchor_start)
+                    if current_anchor != self._journal_anchor:
+                        reset = True
+
+                if reset:
+                    self._records.clear()
+                    self._journal_offset = 0
+                    self._journal_partial = b""
+                    self._journal_anchor = b""
+
+                handle.seek(self._journal_offset)
+                data = handle.read()
+                if data:
+                    self._journal_offset += len(data)
+                    combined = self._journal_partial + data
+                    chunks = combined.split(b"\n")
+                    if combined.endswith(b"\n"):
+                        self._journal_partial = b""
+                    else:
+                        self._journal_partial = chunks.pop()
+                    for chunk in chunks:
+                        if not chunk.strip():
+                            continue
+                        try:
+                            item = json.loads(chunk.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if isinstance(item, dict):
+                            self._records.append(item)
+
+                anchor_start = max(0, self._journal_offset - _ANCHOR_BYTES)
+                handle.seek(anchor_start)
+                self._journal_anchor = handle.read(self._journal_offset - anchor_start)
         except OSError:
             return
-        records: list[dict[str, Any]] = []
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                records.append(item)
-        self._records = records
-        self._journal_signature = signature
+
+        self._journal_identity = identity
 
     def observe_tool_call(self, conversation_id: str, event: Any) -> bool:
         parsed = _parse_codexpro_tool_call(event)

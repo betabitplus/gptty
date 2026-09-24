@@ -261,3 +261,220 @@ def test_tracker_binds_from_snapshot_source_time_ms(tmp_path: Path) -> None:
 
     assert tracker.observe_tool_call("conversation-snapshot", event)
     assert tracker.session_for("conversation-snapshot") == session
+
+def test_tracker_tails_appended_activity_without_whole_file_read(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "activity.jsonl"
+    args = {"workspace_id": "ws_1", "path": "README.md"}
+    session = "sha256:" + "e" * 64
+    start = _start(
+        activity_id="tail-activity",
+        observed_at_ms=7_000_000,
+        tool="read",
+        args=args,
+        session=session,
+    )
+    _write_jsonl(journal, [start])
+
+    original_read_text = Path.read_text
+
+    def forbidden_read_text(self: Path, *args, **kwargs):
+        if self == journal:
+            raise AssertionError("CodexPro activity journal must be tailed incrementally")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    tracker = CodexProActivityTracker(
+        journal_path=journal,
+        refresh_seconds=0,
+    )
+    assert tracker.observe_tool_call(
+        "conversation-tail",
+        _tool_event(offset="7000001-0", tool="read", args=args),
+    )
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "event": "tool_finish",
+                    "activity_id": "tail-activity",
+                    "observed_at_ms": 7_000_010,
+                    "tool": "read",
+                    "outcome": "ok",
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+    snapshot = tracker.snapshot("conversation-tail", now_ms=7_000_020)
+    assert snapshot.inflight is False
+    assert snapshot.outcome == "ok"
+    assert snapshot.last_event_age_seconds == 0.01
+
+
+def test_tracker_handles_partial_jsonl_line_across_refreshes(tmp_path: Path) -> None:
+    journal = tmp_path / "activity.jsonl"
+    args = {"workspace_id": "ws_1", "path": "partial.txt"}
+    session = "sha256:" + "f" * 64
+    record = _start(
+        activity_id="partial-activity",
+        observed_at_ms=8_000_000,
+        tool="read",
+        args=args,
+        session=session,
+    )
+    encoded = json.dumps(record, separators=(",", ":"))
+    split_at = len(encoded) // 2
+    journal.write_text(encoded[:split_at], encoding="utf-8")
+
+    tracker = CodexProActivityTracker(
+        journal_path=journal,
+        refresh_seconds=0,
+    )
+    assert (
+        tracker.observe_tool_call(
+            "conversation-partial",
+            _tool_event(offset="8000001-0", tool="read", args=args),
+        )
+        is False
+    )
+
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(encoded[split_at:] + "\n")
+
+    assert tracker.observe_tool_call(
+        "conversation-partial",
+        _tool_event(offset="8000001-0", tool="read", args=args),
+    )
+    assert tracker.session_for("conversation-partial") == session
+
+
+def test_tracker_resets_tail_when_consumed_prefix_is_rewritten(tmp_path: Path) -> None:
+    journal = tmp_path / "activity.jsonl"
+    args_a = {"workspace_id": "ws_1", "path": "old.txt"}
+    session_a = "sha256:" + "1" * 64
+    _write_jsonl(
+        journal,
+        [
+            _start(
+                activity_id="old-activity",
+                observed_at_ms=9_000_000,
+                tool="read",
+                args=args_a,
+                session=session_a,
+            )
+        ],
+    )
+    tracker = CodexProActivityTracker(
+        journal_path=journal,
+        refresh_seconds=0,
+    )
+    assert tracker.observe_tool_call(
+        "conversation-old",
+        _tool_event(offset="9000001-0", tool="read", args=args_a),
+    )
+
+    args_b = {"workspace_id": "ws_2", "path": "new.txt"}
+    session_b = "sha256:" + "2" * 64
+    replacement = [
+        _start(
+            activity_id="new-activity",
+            observed_at_ms=9_100_000,
+            tool="read",
+            args=args_b,
+            session=session_b,
+        )
+    ]
+    replacement.extend(
+        {
+            "schema": 1,
+            "event": "tool_heartbeat",
+            "activity_id": "new-activity",
+            "observed_at_ms": 9_100_000 + index,
+            "tool": "read",
+        }
+        for index in range(20)
+    )
+    _write_jsonl(journal, replacement)
+
+    assert tracker.observe_tool_call(
+        "conversation-new",
+        _tool_event(offset="9100001-0", tool="read", args=args_b),
+    )
+    assert tracker.session_for("conversation-new") == session_b
+
+
+def test_tracker_bounds_cached_activity_history(tmp_path: Path) -> None:
+    journal = tmp_path / "activity.jsonl"
+    _write_jsonl(
+        journal,
+        [
+            {
+                "schema": 1,
+                "event": "tool_finish",
+                "activity_id": f"activity-{index}",
+                "observed_at_ms": index,
+                "tool": "read",
+                "outcome": "ok",
+            }
+            for index in range(250)
+        ],
+    )
+    tracker = CodexProActivityTracker(
+        journal_path=journal,
+        refresh_seconds=0,
+        max_records=100,
+    )
+
+    tracker._refresh_records(force=True)
+
+    assert len(tracker._records) == 100
+    assert tracker._records[0]["activity_id"] == "activity-150"
+    assert tracker._records[-1]["activity_id"] == "activity-249"
+
+def test_tracker_resets_tail_when_journal_inode_is_replaced(tmp_path: Path) -> None:
+    journal = tmp_path / "activity.jsonl"
+    args_a = {"workspace_id": "ws_1", "path": "before.txt"}
+    _write_jsonl(
+        journal,
+        [
+            _start(
+                activity_id="before",
+                observed_at_ms=10_000_000,
+                tool="read",
+                args=args_a,
+                session="sha256:" + "3" * 64,
+            )
+        ],
+    )
+    tracker = CodexProActivityTracker(journal_path=journal, refresh_seconds=0)
+    assert tracker.observe_tool_call(
+        "conversation-before",
+        _tool_event(offset="10000001-0", tool="read", args=args_a),
+    )
+
+    args_b = {"workspace_id": "ws_2", "path": "after.txt"}
+    replacement = tmp_path / "replacement.jsonl"
+    _write_jsonl(
+        replacement,
+        [
+            _start(
+                activity_id="after",
+                observed_at_ms=10_100_000,
+                tool="read",
+                args=args_b,
+                session="sha256:" + "4" * 64,
+            )
+        ],
+    )
+    replacement.replace(journal)
+
+    assert tracker.observe_tool_call(
+        "conversation-after",
+        _tool_event(offset="10100001-0", tool="read", args=args_b),
+    )
+    assert tracker.session_for("conversation-after") == "sha256:" + "4" * 64
