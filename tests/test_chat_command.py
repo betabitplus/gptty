@@ -416,7 +416,110 @@ def test_goal_recovery_can_suppress_raw_request_error_output(tmp_path) -> None:
     assert code == 1
     assert stderr.getvalue() == ""
     assert result["terminal_marker"][:2] == ("chat", "limit-reached")
+    assert result["failure_classification"]["source"] == "compat-text"
 
+
+def test_send_result_records_structured_rate_limit_classification(tmp_path) -> None:
+    from chatgpt_web_adapter import RequestError
+
+    class RateLimitedClient:
+        def send(self, prompt: str, **options):
+            raise RequestError(
+                "localized rejection",
+                status_code=429,
+                request_stage="conversation_stream",
+            )
+
+    result: dict[str, Any] = {}
+    code = _send_chat_prompt(
+        RateLimitedClient(),
+        state=ChatState(),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="hello",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=SimpleNamespace(
+            turn_abort=lambda: None,
+            warning=lambda _text: None,
+            live_event=lambda _event: None,
+            info=lambda _text: None,
+        ),
+        defer_final_rendering=True,
+        suppress_request_error_output=True,
+        result_out=result,
+    )
+
+    assert code == 1
+    assert result["terminal_marker"][:2] == ("turn", "rate-limited")
+    assert result["failure_classification"] == {
+        "label": "turn",
+        "status": "rate-limited",
+        "message": "ChatGPT rate-limited this turn before final completion.",
+        "source": "structured",
+        "code": None,
+        "status_code": 429,
+        "request_stage": "conversation_stream",
+        "write_may_have_been_submitted": False,
+        "reconciliation_required": False,
+    }
+
+
+def test_send_result_preserves_post_submit_ambiguity_over_429(tmp_path) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_OUTCOME_UNKNOWN,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    error = BrowserOwnedWriteRuntimeError(
+        "provider failed after delegation",
+        failure_kind=WRITE_OUTCOME_UNKNOWN,
+        automatic_retry_allowed=False,
+        manual_retry_safe_after_repair=False,
+        write_may_have_been_submitted=True,
+        reconciliation_required=True,
+        request_stage="browser_owned_write",
+        status_code=429,
+    )
+
+    class AmbiguousClient:
+        def send(self, prompt: str, **options):
+            raise error
+
+    result: dict[str, Any] = {}
+    code = _send_chat_prompt(
+        AmbiguousClient(),
+        state=ChatState(),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="hello once",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=SimpleNamespace(
+            turn_abort=lambda: None,
+            warning=lambda _text: None,
+            live_event=lambda _event: None,
+            info=lambda _text: None,
+        ),
+        defer_final_rendering=True,
+        suppress_request_error_output=True,
+        result_out=result,
+    )
+
+    assert code == 1
+    assert result["terminal_marker"][:2] == ("turn", "unconfirmed")
+    classification = result["failure_classification"]
+    assert classification["source"] == "structured"
+    assert classification["code"] == WRITE_OUTCOME_UNKNOWN
+    assert classification["status_code"] == 429
+    assert classification["write_may_have_been_submitted"] is True
+    assert classification["reconciliation_required"] is True
 
 
 def test_send_can_suppress_live_answer_events_for_goal_protocol(tmp_path) -> None:

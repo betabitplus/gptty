@@ -562,6 +562,103 @@ def test_goal_hard_chat_limit_rolls_over_to_new_chat_and_completes(
     assert checkpoint.exists()
 
 
+def test_goal_post_submit_ambiguity_never_auto_resends(
+    tmp_path, monkeypatch
+) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_OUTCOME_UNKNOWN,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    class AmbiguousWriteClient:
+        instances: list["AmbiguousWriteClient"] = []
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str, str | None]] = []
+            self.__class__.instances.append(self)
+
+        def get_messages(self, ref: str):
+            return [
+                {"role": "user", "text": "Do this exactly once."},
+                {"role": "assistant", "text": "Understood."},
+            ]
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt, ref))
+            raise BrowserOwnedWriteRuntimeError(
+                "provider failed after delegation",
+                failure_kind=WRITE_OUTCOME_UNKNOWN,
+                automatic_retry_allowed=False,
+                manual_retry_safe_after_repair=False,
+                write_may_have_been_submitted=True,
+                reconciliation_required=True,
+                request_stage="browser_owned_write",
+                status_code=429,
+            )
+
+        def send(self, prompt: str, **options):
+            self.calls.append(("send", prompt, None))
+            raise AssertionError("ambiguous Goal turn must not roll over or resend")
+
+    save_chat_state(
+        tmp_path / "state.json",
+        ChatState(current_conversation="conv-ambiguous"),
+    )
+    AmbiguousWriteClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            '/goal "Perform exactly one durable action"',
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    kind == "warning"
+                    and "ambiguous external side effect" in str(message)
+                    for kind, message in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **_kwargs: None,
+    )
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=AmbiguousWriteClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = AmbiguousWriteClient.instances[0]
+    assert [call[0] for call in client.calls] == ["send_to_conversation"]
+    assert client.calls[0][2] == "conv-ambiguous"
+
+    _state, goal = _load_session_goal(tmp_path / "state.json")
+    assert goal.status == "blocked"
+    assert goal.rollover_count == 0
+    assert goal.active_operation_id
+    events = GoalStore(tmp_path / "state.json").events(goal)
+    assert events[-1]["type"] == "goal_blocked_ambiguous_operation"
+    classification = events[-1]["payload"]["failure_classification"]
+    assert classification["code"] == WRITE_OUTCOME_UNKNOWN
+    assert classification["status_code"] == 429
+    assert classification["reconciliation_required"] is True
+    assert not any(event["type"] == "rollover" for event in events)
+
+
 def test_goal_queued_steering_replaces_pending_auto_continuation(
     tmp_path, monkeypatch
 ) -> None:

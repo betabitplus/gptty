@@ -39,6 +39,7 @@ from ..session_state import SessionStateError, session_handle_for_args
 from ..state import ChatState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from ..turn_control import request_stop_generation
+from ..turn_failure import classify_turn_failure
 from ..ui.commands import (
     UNFINISHED_STATUSES,
     InteractiveCommands,
@@ -570,76 +571,8 @@ def _turn_terminal_marker(
 
 
 def _turn_failure_marker(error: BaseException) -> tuple[str, str, str]:
-    message = str(error).strip()
-    normalized = message.casefold()
-    if any(
-        token in normalized
-        for token in (
-            "maximum length",
-            "max conversation",
-            "conversation too long",
-            "conversation length",
-            "conversation_limit_exceeded",
-            "conversation limit exceeded",
-            "start a new chat",
-            "new chat to continue",
-            "context length",
-        )
-    ):
-        return (
-            "chat",
-            "limit-reached",
-            "This conversation reached its length limit; start a new chat to continue.",
-        )
-    if any(
-        token in normalized
-        for token in (
-            "conversation not found",
-            "conversation unavailable",
-            "unable to load conversation",
-            "could not load conversation",
-            "chat not found",
-        )
-    ):
-        return (
-            "chat",
-            "unavailable",
-            "This conversation is no longer available; continue in a new chat.",
-        )
-    if "429" in normalized or "rate limit" in normalized:
-        return (
-            "turn",
-            "rate-limited",
-            "ChatGPT rate-limited this turn before final completion.",
-        )
-    if any(
-        token in normalized
-        for token in ("turnstile", "verify you are human", "verification")
-    ):
-        return (
-            "turn",
-            "blocked",
-            "ChatGPT requires browser verification before this turn can continue.",
-        )
-    if "handoff" in normalized and any(
-        token in normalized for token in ("final", "completed", "recovery")
-    ):
-        return (
-            "turn",
-            "unconfirmed",
-            "Stream handoff did not reach a confirmed final assistant completion.",
-        )
-    if "timeout" in normalized or "timed out" in normalized:
-        return (
-            "turn",
-            "failed",
-            "Response transport timed out before a final assistant completion was confirmed.",
-        )
-    return (
-        "turn",
-        "failed",
-        "ChatGPT request ended with an error before final completion.",
-    )
+    """Compatibility projection for the human-facing terminal marker."""
+    return classify_turn_failure(error).marker
 
 
 def run_chat(
@@ -3054,7 +2987,8 @@ def _send_chat_prompt(
                                 )
                             ),
                         )
-                    marker = _turn_failure_marker(error)
+                    failure = classify_turn_failure(error)
+                    marker = failure.marker
                     marker_ref = (
                         active_ref
                         or write_conversation_ref
@@ -3064,6 +2998,7 @@ def _send_chat_prompt(
                         result_out.update(
                             terminal_marker=marker,
                             terminal_source="request_error",
+                            failure_classification=failure.to_dict(),
                             conversation_ref=marker_ref,
                         )
                     if (

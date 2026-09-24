@@ -1614,6 +1614,70 @@ def test_goal_complete_with_pending_work_is_rejected(tmp_path) -> None:
     )
 
 
+def test_goal_provider_write_ambiguity_blocks_without_recovery_prompt(
+    tmp_path, monkeypatch
+) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **_kwargs: None,
+    )
+
+    commands.handle('/goal "do one durable action"')
+    activation = commands.pop_automatic_prompt()
+    assert activation is not None
+    outgoing = commands.mark_goal_turn_started(activation, automatic=True)
+    assert outgoing is not None
+    assert state.goal is not None
+    operation_id = state.goal.active_operation_id
+    assert operation_id
+
+    handled = commands.handle_goal_turn_failure(
+        {
+            "terminal_marker": (
+                "turn",
+                "unconfirmed",
+                "ChatGPT may have accepted this turn; reconcile before retrying.",
+            ),
+            "terminal_source": "request_error",
+            "conversation_ref": "conv-1",
+            "failure_classification": {
+                "label": "turn",
+                "status": "unconfirmed",
+                "message": "ChatGPT may have accepted this turn; reconcile before retrying.",
+                "source": "structured",
+                "code": "BROWSER_OWNED_WRITE_OUTCOME_UNKNOWN",
+                "status_code": 429,
+                "request_stage": "browser_owned_write",
+                "write_may_have_been_submitted": True,
+                "reconciliation_required": True,
+            },
+        },
+        "chat turn failed with exit code 1",
+    )
+
+    assert handled is True
+    assert state.goal.status == "blocked"
+    assert state.goal.active_operation_id == operation_id
+    assert commands.has_automatic_prompt is False
+    assert "ambiguous" in (state.goal.reason or "").casefold() or "reconcile" in (
+        state.goal.reason or ""
+    ).casefold()
+    assert any(
+        kind == "warning" and "ambiguous external side effect" in str(message)
+        for kind, message in renderer.events
+    )
+
+    events = commands.goal_store.events(state.goal)
+    assert events[-1]["type"] == "goal_blocked_ambiguous_operation"
+    payload = events[-1]["payload"]
+    assert payload["ambiguous_operation"] == operation_id
+    assert payload["failure_classification"]["source"] == "structured"
+    assert payload["failure_classification"]["reconciliation_required"] is True
+    assert "turn_abnormal" not in [event["type"] for event in events[-2:]]
+
+
 def test_goal_operation_identity_and_tool_evidence_survive_pause_resume(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, _, _, _ = make_commands(tmp_path, state=state)

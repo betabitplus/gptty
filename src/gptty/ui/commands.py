@@ -631,6 +631,9 @@ class InteractiveCommands:
         if marker is not None:
             payload["status"] = marker[1]
             payload["detail"] = marker[2]
+        failure_classification = result.get("failure_classification")
+        if isinstance(failure_classification, dict):
+            payload["failure_classification"] = dict(failure_classification)
         if parsed.checkpoint is not None:
             payload["checkpoint"] = {
                 "summary": parsed.checkpoint.summary,
@@ -919,6 +922,19 @@ class InteractiveCommands:
         failure_payload = self._goal_result_event_payload(result)
         failure_payload["detail"] = detail
         failure_payload["status"] = status
+        failure_classification = result.get("failure_classification")
+        provider_write_ambiguous = bool(
+            isinstance(failure_classification, dict)
+            and (
+                failure_classification.get("reconciliation_required") is True
+                or failure_classification.get("write_may_have_been_submitted") is True
+            )
+        )
+        if provider_write_ambiguous:
+            return self._block_goal_for_ambiguous_operation(
+                detail,
+                event_payload=failure_payload,
+            )
         if label == "chat" and status in {"limit-reached", "unavailable"}:
             self._save_state(event_type="turn_failed", event_payload=failure_payload)
             return self._rollover_goal(detail)
