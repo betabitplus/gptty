@@ -30,6 +30,7 @@ from ..locks import (
     render_lock_timeout,
 )
 from ..goal_lock import try_acquire_goal_lock
+from ..local_store import local_store_path
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
@@ -888,7 +889,12 @@ def run_chat(
             renderer_stderr = stderr
         renderer = PrettyRenderer(renderer_stdout, ui_settings)
         try:
-            tui_archive: TUIArchive | None = TUIArchive()
+            tui_archive: TUIArchive | None = TUIArchive(
+                db_path=local_store_path(
+                    profile=getattr(args, "profile", None),
+                    state_path=base_state_path,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - archive failure must not block chat.
             tui_archive = None
             renderer.warning(f"TUI archive unavailable: {exc}")

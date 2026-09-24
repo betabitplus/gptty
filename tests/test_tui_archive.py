@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 
+from gptty.local_store import LocalEventStore, local_store_path
+from gptty.runs import start_run
 from gptty.tui_archive import TUIArchive
 
 
@@ -176,3 +179,177 @@ def test_chat_level_terminal_marker_is_persistent_but_turn_marker_is_not(
         "This conversation reached its maximum length; start a new chat to continue.",
         "stream",
     )
+
+def test_run_and_tui_archive_share_one_transactional_store(tmp_path) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    db_path = local_store_path(profile=None, state_path=state_path)
+    recorder = start_run(
+        profile=None,
+        state_path=state_path,
+        command="chat",
+        conversation_ref="conv-12345678",
+    )
+    archive = TUIArchive(tmp_path / "archive", db_path=db_path)
+
+    archive.record_user(
+        "shared-store",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+
+    assert recorder.store_file == db_path
+    assert archive.store.db_path == db_path
+    store = LocalEventStore(db_path)
+    assert store.run_summary(recorder.run_id)["conversation_ref"] == "conv-12345678"
+    assert store.tui_events("conv-12345678")[0]["text"] == "shared-store"
+
+
+def test_incremental_archive_append_does_not_reload_full_history(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "first",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+
+    def fail_full_history(*_args, **_kwargs):
+        raise AssertionError("incremental append must not reload full TUI history")
+
+    monkeypatch.setattr(archive.store, "tui_events", fail_full_history)
+
+    archive.record_assistant(
+        turn_id,
+        conversation_ref="conv-12345678",
+        text="second",
+        title=None,
+        model=None,
+        status="complete",
+    )
+
+    events = _events(archive, "conv-12345678")
+    assert [(event["role"], event["text"]) for event in events] == [
+        ("user", "first"),
+        ("assistant", "second"),
+    ]
+
+
+def test_projection_failure_does_not_erase_committed_tui_event(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    archive.record_user(
+        "first",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+
+    def fail_projection(*_args, **_kwargs):
+        raise OSError("projection unavailable")
+
+    monkeypatch.setattr(archive, "_append_json_event", fail_projection)
+    monkeypatch.setattr(archive, "_append_text", fail_projection)
+
+    archive.record_terminal(
+        "turn-terminal",
+        conversation_ref="conv-12345678",
+        label="turn",
+        status="unconfirmed",
+        text="durable despite projection failure",
+        source="stream",
+    )
+
+    authoritative = archive.store.tui_events("conv-12345678")
+    assert authoritative[-1]["event_id"] == "turn-terminal:terminal"
+    assert authoritative[-1]["text"] == "durable despite projection failure"
+
+def test_restart_reconciles_committed_event_missing_from_projections(tmp_path) -> None:
+    root = tmp_path / "archive"
+    first = TUIArchive(root)
+    first.record_user(
+        "projected",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+    missing = {
+        "schema": 1,
+        "event_id": "turn-crash:terminal",
+        "turn_id": "turn-crash",
+        "observed_at": "2026-09-24T00:00:00+00:00",
+        "source": "gptty-tui",
+        "scope": "tui-observed",
+        "role": "chat",
+        "text": "committed before crash",
+        "status": "limit-reached",
+        "terminal_source": "stream",
+        "conversation_id": "conv-12345678",
+    }
+    assert first.store.insert_tui_event("conv-12345678", missing) is True
+
+    before = _events(first, "conv-12345678")
+    assert [event["event_id"] for event in before] == [before[0]["event_id"]]
+
+    restarted = TUIArchive(root, db_path=first.store.db_path)
+    assert restarted.conversation_terminal_marker("conv-12345678") == (
+        "chat",
+        "limit-reached",
+        "committed before crash",
+        "stream",
+    )
+
+    repaired = _events(restarted, "conv-12345678")
+    assert [event["event_id"] for event in repaired][-1] == "turn-crash:terminal"
+    transcript = restarted.conversation_paths("conv-12345678")["transcript"].read_text(
+        encoding="utf-8"
+    )
+    assert "committed before crash" in transcript
+
+
+def test_concurrent_archive_writers_keep_projection_order_equal_to_sqlite_order(
+    tmp_path,
+) -> None:
+    root = tmp_path / "archive"
+    first = TUIArchive(root)
+    second = TUIArchive(root, db_path=first.store.db_path)
+    first.record_user(
+        "seed",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+    barrier = threading.Barrier(3)
+    errors: list[BaseException] = []
+
+    def writer(archive: TUIArchive, turn_id: str, text: str) -> None:
+        try:
+            barrier.wait(timeout=3)
+            archive.record_terminal(
+                turn_id,
+                conversation_ref="conv-12345678",
+                label="turn",
+                status="unconfirmed",
+                text=text,
+                source="stream",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=(first, "turn-a", "A")),
+        threading.Thread(target=writer, args=(second, "turn-b", "B")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=3)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert not errors
+    authoritative = first.store.tui_events("conv-12345678")
+    projected = _events(first, "conv-12345678")
+    assert [event["event_id"] for event in projected] == [
+        event["event_id"] for event in authoritative
+    ]

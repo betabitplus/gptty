@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 
+import gptty.runs as runs
 from gptty.runs import read_run_events, read_run_summary, render_run_status, start_run
 
 
@@ -53,6 +54,55 @@ def test_fail_persists_traceback_in_summary_and_event(tmp_path) -> None:
     assert events[-1]["type"] == "failed"
     assert events[-1]["message"] == "boom"
     assert "ValueError: boom" in events[-1]["traceback"]
+
+
+
+
+def test_sqlite_remains_authority_when_run_projections_are_corrupted(tmp_path) -> None:
+    recorder = start_run(
+        profile=None,
+        state_path=tmp_path / "gptty_state.json",
+        command="send",
+        conversation_ref="conv-1",
+    )
+    recorder.event("token_delta", text="authoritative")
+
+    recorder.run_file.write_text("{not-json", encoding="utf-8")
+    recorder.events_file.write_text("not-json\n", encoding="utf-8")
+
+    summary = read_run_summary(recorder.run_file)
+    events = read_run_events(recorder.events_file, from_start=True)
+
+    assert summary["last_event"] == "token_delta"
+    assert [event["type"] for event in events] == ["run_started", "token_delta"]
+    assert events[-1]["text"] == "authoritative"
+
+
+def test_projection_failure_does_not_erase_committed_run_event(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    recorder = start_run(
+        profile=None,
+        state_path=tmp_path / "gptty_state.json",
+        command="send",
+        conversation_ref="conv-1",
+    )
+
+    def fail_projection(*_args, **_kwargs):
+        raise OSError("projection unavailable")
+
+    monkeypatch.setattr(runs, "_append_event_projection", fail_projection)
+
+    recorder.event("token_delta", text="survived")
+
+    summary = read_run_summary(recorder.run_file)
+    events = read_run_events(recorder.events_file, from_start=True)
+
+    assert summary["status"] == "running"
+    assert "projection unavailable" in summary["projection_error"]
+    assert events[-1]["type"] == "token_delta"
+    assert events[-1]["text"] == "survived"
 
 
 def test_render_run_status_includes_recent_text(tmp_path) -> None:

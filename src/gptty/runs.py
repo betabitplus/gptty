@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from .profiles import profile_paths
+from .local_store import DB_FILENAME, LocalEventStore, local_store_root
 
 
 @dataclass(frozen=True)
@@ -15,13 +17,19 @@ class RunPaths:
     run_id: str
     run_file: Path
     events_file: Path
+    store_file: Path
 
 
 class RunRecorder:
-    def __init__(self, paths: RunPaths, summary: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        paths: RunPaths,
+        summary: dict[str, Any],
+        store: LocalEventStore,
+    ) -> None:
         self.paths = paths
         self.summary = summary
-        self.event("run_started")
+        self.store = store
 
     @property
     def run_id(self) -> str:
@@ -35,19 +43,24 @@ class RunRecorder:
     def events_file(self) -> Path:
         return self.paths.events_file
 
+    @property
+    def store_file(self) -> Path:
+        return self.paths.store_file
+
     def event(self, event_type: str, **data: Any) -> None:
         event = {
             "type": event_type,
             "timestamp": utc_now(),
             **data,
         }
-        self.paths.events_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.paths.events_file.open("a", encoding="utf-8", newline="\n") as file:
-            file.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
-            file.write("\n")
         self.summary["last_event"] = event_type
         self.summary["updated_at"] = event["timestamp"]
-        write_run_summary(self.paths.run_file, self.summary)
+        self.store.append_run_event(
+            run_id=self.run_id,
+            summary=self.summary,
+            event=event,
+        )
+        self._project(event)
 
     def complete(self) -> None:
         self.summary["status"] = "completed"
@@ -65,11 +78,30 @@ class RunRecorder:
             event_data["traceback"] = traceback_text
         self.event("failed", **event_data)
 
+    def _project(self, event: dict[str, Any]) -> None:
+        try:
+            _append_event_projection(self.events_file, event)
+            write_run_summary(self.run_file, self.summary)
+        except OSError as exc:
+            self.summary.setdefault(
+                "projection_error",
+                f"{type(exc).__name__}: {exc}",
+            )
+            try:
+                self.store.replace_run_summary(
+                    self.run_id,
+                    self.summary,
+                    updated_at=str(self.summary.get("updated_at") or event["timestamp"]),
+                )
+            except Exception:
+                # The event transaction already committed. A secondary failure
+                # while annotating the derived projection must not rewrite turn
+                # outcome or fabricate a failed ChatGPT operation.
+                pass
+
 
 def run_dir(*, profile: str | None, state_path: str | Path) -> Path:
-    if profile:
-        return profile_paths(profile).profile_dir / "runs"
-    return Path(state_path).expanduser().parent / ".gptty_runs"
+    return local_store_root(profile=profile, state_path=state_path)
 
 
 def start_run(
@@ -85,56 +117,134 @@ def start_run(
         run_id=run_id,
         run_file=root / f"{run_id}.json",
         events_file=root / f"{run_id}.jsonl",
+        store_file=root / DB_FILENAME,
     )
+    started_at = utc_now()
+    first_event = {
+        "type": "run_started",
+        "timestamp": started_at,
+    }
     summary: dict[str, Any] = {
         "run_id": run_id,
         "profile": profile,
         "command": command,
         "conversation_ref": conversation_ref,
         "status": "running",
-        "started_at": utc_now(),
-        "updated_at": None,
-        "last_event": None,
+        "started_at": started_at,
+        "updated_at": started_at,
+        "last_event": "run_started",
         "events_file": str(paths.events_file),
+        "store_file": str(paths.store_file),
     }
-    write_run_summary(paths.run_file, summary)
-    return RunRecorder(paths, summary)
+    store = LocalEventStore(paths.store_file)
+    store.create_run(
+        run_id=run_id,
+        summary=summary,
+        first_event=first_event,
+    )
+    recorder = RunRecorder(paths, summary, store)
+    recorder._project(first_event)
+    return recorder
 
 
 def write_run_summary(path: str | Path, summary: dict[str, Any]) -> None:
     run_path = Path(path)
     run_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = run_path.with_name(f".{run_path.name}.tmp")
-    tmp_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(run_path)
+    tmp_path = run_path.with_name(
+        f".{run_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    payload = (
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        if os.name != "nt":
+            tmp_path.chmod(0o600)
+        os.replace(tmp_path, run_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_run_summary(path: str | Path) -> dict[str, Any]:
+    run_path = Path(path)
+    store = _store_for_run_path(run_path)
+    if store is not None:
+        summary = store.run_summary(run_path.stem)
+        if summary is not None:
+            return summary
+
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(run_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def read_run_events(path: str | Path, *, from_start: bool = False) -> list[dict[str, Any]]:
+def read_run_events(
+    path: str | Path,
+    *,
+    from_start: bool = False,
+) -> list[dict[str, Any]]:
     events_path = Path(path)
+    store = _store_for_run_path(events_path)
+    if store is not None and store.run_summary(events_path.stem) is not None:
+        return store.run_events(
+            events_path.stem,
+            limit=None if from_start else 20,
+        )
+
+    return _read_legacy_run_events(events_path, from_start=from_start)
+
+
+def _store_for_run_path(path: Path) -> LocalEventStore | None:
+    store_path = path.parent / DB_FILENAME
+    if not store_path.is_file():
+        return None
+    return LocalEventStore(store_path)
+
+
+def _read_legacy_run_events(
+    path: Path,
+    *,
+    from_start: bool,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] | deque[dict[str, Any]]
+    events = [] if from_start else deque(maxlen=20)
     try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
     except OSError:
         return []
+    return list(events)
 
-    events: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-    if from_start:
-        return events
-    return events[-20:]
+
+def _append_event_projection(path: Path, event: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(f"short run projection write: {written}/{len(view)} bytes")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def render_run_status(
@@ -166,9 +276,23 @@ def render_run_status(
     if status_only:
         return
 
-    token_text = "".join(str(event.get("text", "")) for event in events if event.get("type") == "token_delta")
-    required_action = next((event for event in reversed(events) if event.get("type") == "required_action"), None)
-    failure = next((event for event in reversed(events) if event.get("type") == "failed"), None)
+    token_text = "".join(
+        str(event.get("text", ""))
+        for event in events
+        if event.get("type") == "token_delta"
+    )
+    required_action = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("type") == "required_action"
+        ),
+        None,
+    )
+    failure = next(
+        (event for event in reversed(events) if event.get("type") == "failed"),
+        None,
+    )
 
     if token_text:
         print(file=stdout)
@@ -177,7 +301,13 @@ def render_run_status(
     elif required_action:
         print(file=stdout)
         print("Action needed:", file=stdout)
-        print(str(required_action.get("message") or "ChatGPT is waiting for a web UI action."), file=stdout)
+        print(
+            str(
+                required_action.get("message")
+                or "ChatGPT is waiting for a web UI action."
+            ),
+            file=stdout,
+        )
     elif failure:
         print(file=stdout)
         print(str(failure.get("message") or "The command failed."), file=stdout)
@@ -190,7 +320,10 @@ def format_elapsed(started_at: str | None) -> str:
     started = parse_time(started_at)
     if started is None:
         return "unknown"
-    seconds = max(0, int(datetime.now(timezone.utc).timestamp() - started.timestamp()))
+    seconds = max(
+        0,
+        int(datetime.now(timezone.utc).timestamp() - started.timestamp()),
+    )
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
