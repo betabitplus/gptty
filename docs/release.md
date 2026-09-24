@@ -16,15 +16,19 @@ This checklist is for publishing `gptty-web` to PyPI.
    python -m twine check dist/*
    ```
 
-5. Confirm the wheel installs and exposes the command:
+5. Confirm every non-optional runtime dependency floor is already available from the intended package index. In particular, do not publish a gptty wheel whose declared CWA minimum has not itself been published and post-publish-smoked.
+
+6. Confirm the exact gptty wheel installs in a clean environment with dependencies resolved from the package index, and verify the CWA browser-authority contract before invoking gptty:
 
    ```bash
    python -m pip install dist/*.whl
+   python -c "import chatgpt_web_adapter.browser_authority_backend, chatgpt_web_adapter.wkwebview_provider"
+   python -c "from gptty.sdk_client import GpttyClient; GpttyClient"
    gptty --version
    gptty auth status --auth missing-auth-data.json
    ```
 
-   `gptty auth status` should run without optional auth-capture dependencies. It may exit with status 1 for a missing auth file; that is expected.
+   `gptty auth status` should run without optional auth-capture dependencies. It may exit with status 1 for a missing auth file; that is expected. A dependency-resolution failure or missing CWA runtime module is a release blocker, not an allowed smoke-test exception.
 
 ## PyPI Trusted Publishing
 

@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- packaging: require `chatgpt-web-adapter>=0.3.1,<0.4.0`, the first exact CWA release candidate verified against the current gptty browser-authority/WK runtime contract
 - feat: add profile-aware auth/state path resolution with `gptty profile` commands
 - feat: add local conversation locks for `gptty send` and `gptty chat`
 - feat: add `gptty observe` for local active run status and recent output
