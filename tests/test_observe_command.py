@@ -63,6 +63,36 @@ def test_observe_explicit_conversation_without_lock_reports_no_active_run(tmp_pa
     assert "Conversation: conv-1" in stdout.getvalue()
 
 
+
+
+def test_observe_ignores_retained_sidecar_after_kernel_lock_release(tmp_path) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(state_path, ChatState(current_conversation="conv-1"))
+    recorder = start_run(
+        profile=None,
+        state_path=state_path,
+        command="send",
+        conversation_ref="conv-1",
+    )
+    lock_dir = conversation_lock_dir(profile=None, state_path=state_path)
+    lock = acquire_conversation_lock(
+        conversation_ref="conv-1",
+        lock_dir=lock_dir,
+        command="send",
+        run_id=recorder.run_id,
+        run_file=recorder.run_file,
+    )
+    sidecar = lock.info.lock_path
+    lock.release()
+
+    assert sidecar.exists()
+    stdout = StringIO()
+    code = run_observe(make_args(tmp_path), stdout=stdout)
+
+    assert code == 1
+    assert "no active local run" in stdout.getvalue()
+
+
 def test_observe_requires_conversation(tmp_path) -> None:
     stderr = StringIO()
 

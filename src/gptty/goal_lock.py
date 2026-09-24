@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .file_lock import KernelFileLock
 
 
 @dataclass
@@ -14,22 +15,20 @@ class GoalRunLock:
 
     goal_id: str
     path: Path
-    fd: int
+    _kernel_lock: KernelFileLock
     runner_id: str
     pid: int
     released: bool = False
+
+    @property
+    def fd(self) -> int:
+        return self._kernel_lock.fd
 
     def release(self) -> None:
         if self.released:
             return
         self.released = True
-        try:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-        finally:
-            try:
-                os.close(self.fd)
-            except OSError:
-                pass
+        self._kernel_lock.release()
 
     def __enter__(self) -> "GoalRunLock":
         return self
@@ -52,24 +51,12 @@ def try_acquire_goal_lock(
     runner_id: str,
     pid: int | None = None,
 ) -> GoalRunLock | None:
-    """Acquire Goal ownership without stale-file/PID heuristics.
-
-    flock is held by the open file description and the kernel releases it on
-    process death, including SIGKILL. The file is deliberately retained as
-    diagnostic metadata; its existence never means the Goal is locked.
-    """
+    """Acquire Goal ownership without stale-file/PID heuristics."""
 
     path = goal_lock_path(root, goal_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
+    kernel_lock = KernelFileLock(path)
+    if not kernel_lock.try_acquire():
         return None
-    except Exception:
-        os.close(fd)
-        raise
 
     owner_pid = int(pid if pid is not None else os.getpid())
     payload = {
@@ -81,14 +68,15 @@ def try_acquire_goal_lock(
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode(
         "utf-8"
     )
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.write(fd, encoded)
-    os.fsync(fd)
+    try:
+        kernel_lock.write_metadata(encoded)
+    except Exception:
+        kernel_lock.release()
+        raise
     return GoalRunLock(
         goal_id=goal_id,
         path=path,
-        fd=fd,
+        _kernel_lock=kernel_lock,
         runner_id=runner_id,
         pid=owner_pid,
     )
@@ -106,15 +94,4 @@ def read_goal_lock_metadata(root: str | Path, goal_id: str) -> dict[str, object]
 def goal_lock_is_held(root: str | Path, goal_id: str) -> bool:
     """Probe kernel lock state without trusting metadata or PID reuse."""
 
-    path = goal_lock_path(root, goal_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
+    return KernelFileLock.is_held(goal_lock_path(root, goal_id))

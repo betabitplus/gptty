@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+from .file_lock import KernelFileLock
 from .profiles import profile_paths
 
 DEFAULT_LOCK_TIMEOUT_SECONDS = 2.0
-DEFAULT_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 
 class ConversationLockError(RuntimeError):
@@ -36,18 +36,17 @@ class ConversationLockInfo:
     run_file: Path | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class ConversationLock:
     info: ConversationLockInfo
-    recovered_stale: bool = False
+    _kernel_lock: KernelFileLock
+    released: bool = False
 
     def release(self) -> None:
-        try:
-            self.info.lock_path.unlink()
-        except FileNotFoundError:
+        if self.released:
             return
-        except OSError:
-            return
+        self.released = True
+        self._kernel_lock.release()
 
     def __enter__(self) -> "ConversationLock":
         return self
@@ -67,6 +66,10 @@ def conversation_lock_path(lock_dir: str | Path, conversation_ref: str) -> Path:
     return Path(lock_dir) / f"conversation-{digest}.lock"
 
 
+def conversation_lock_is_held(lock_dir: str | Path, conversation_ref: str) -> bool:
+    return KernelFileLock.is_held(conversation_lock_path(lock_dir, conversation_ref))
+
+
 def acquire_conversation_lock(
     *,
     conversation_ref: str,
@@ -76,50 +79,43 @@ def acquire_conversation_lock(
     run_id: str | None = None,
     run_file: str | Path | None = None,
     timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
-    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
-    poll_interval: float = 0.2,
+    poll_interval: float = 0.05,
 ) -> ConversationLock:
     root = Path(lock_dir)
     path = conversation_lock_path(root, conversation_ref)
     started = time.monotonic()
-    recovered_stale = False
-
-    while True:
-        root.mkdir(parents=True, exist_ok=True)
-        info = ConversationLockInfo(
-            conversation_ref=conversation_ref,
-            lock_path=path,
-            profile=profile,
-            command=command,
-            pid=os.getpid(),
-            started_at=datetime.now(timezone.utc).isoformat(),
-            run_id=run_id,
-            run_file=Path(run_file) if run_file is not None else None,
+    kernel_lock = KernelFileLock(path)
+    try:
+        kernel_lock.acquire(timeout=timeout, poll_interval=poll_interval)
+    except TimeoutError as exc:
+        existing = read_conversation_lock(
+            path,
+            fallback_conversation=conversation_ref,
         )
-        payload = json.dumps(_serialize_info(info), indent=2, sort_keys=True) + "\n"
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            existing = read_conversation_lock(
-                path, fallback_conversation=conversation_ref
-            )
-            if is_stale_lock(path, existing, stale_after=stale_after):
-                try:
-                    path.unlink()
-                    recovered_stale = True
-                    continue
-                except OSError:
-                    pass
+        raise ConversationLockError(
+            existing,
+            waited=time.monotonic() - started,
+        ) from exc
 
-            waited = time.monotonic() - started
-            if waited >= timeout:
-                raise ConversationLockError(existing, waited=waited)
-            time.sleep(poll_interval)
-            continue
-
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            file.write(payload)
-        return ConversationLock(info=info, recovered_stale=recovered_stale)
+    info = ConversationLockInfo(
+        conversation_ref=conversation_ref,
+        lock_path=path,
+        profile=profile,
+        command=command,
+        pid=os.getpid(),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        run_id=run_id,
+        run_file=Path(run_file) if run_file is not None else None,
+    )
+    payload = (json.dumps(_serialize_info(info), indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    try:
+        kernel_lock.write_metadata(payload)
+    except Exception:
+        kernel_lock.release()
+        raise
+    return ConversationLock(info=info, _kernel_lock=kernel_lock)
 
 
 def read_conversation_lock(
@@ -151,26 +147,6 @@ def read_conversation_lock(
     )
 
 
-def is_stale_lock(
-    path: str | Path, info: ConversationLockInfo, *, stale_after: float
-) -> bool:
-    if stale_after <= 0:
-        return True
-    if info.pid is not None and not _pid_is_alive(info.pid):
-        return True
-
-    started_at = _parse_started_at(info.started_at)
-    if started_at is not None:
-        age = datetime.now(timezone.utc).timestamp() - started_at.timestamp()
-        return age >= stale_after
-
-    try:
-        age = time.time() - Path(path).stat().st_mtime
-    except OSError:
-        return False
-    return age >= stale_after
-
-
 def render_lock_error(exc: ConversationLockError, *, stderr: TextIO) -> None:
     print("gptty: conversation in progress", file=stderr)
     print(file=stderr)
@@ -197,19 +173,6 @@ def render_lock_timeout(exc: ConversationLockError, *, stderr: TextIO) -> None:
     print(f"Waited: {int(round(exc.waited))}s", file=stderr)
 
 
-def render_stale_lock_recovered(lock: ConversationLock, *, stderr: TextIO) -> None:
-    if not lock.recovered_stale:
-        return
-    print("gptty: recovered previous session", file=stderr)
-    print(file=stderr)
-    print(
-        "A previous command did not finish cleanly, so gptty cleared its local lock.",
-        file=stderr,
-    )
-    print(file=stderr)
-    print("Continuing...", file=stderr)
-
-
 def _serialize_info(info: ConversationLockInfo) -> dict[str, object]:
     data = asdict(info)
     data["lock_path"] = str(info.lock_path)
@@ -218,34 +181,8 @@ def _serialize_info(info: ConversationLockInfo) -> dict[str, object]:
     return data
 
 
-def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _parse_started_at(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)

@@ -28,7 +28,6 @@ from ..locks import (
     conversation_lock_dir,
     render_lock_error,
     render_lock_timeout,
-    render_stale_lock_recovered,
 )
 from ..goal_lock import try_acquire_goal_lock
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
@@ -2848,7 +2847,6 @@ def _send_chat_prompt(
             else:
                 render_lock_error(exc, stderr=stderr)
             return 2
-        render_stale_lock_recovered(lock, stderr=stderr)
 
     try:
         if recorder is not None:

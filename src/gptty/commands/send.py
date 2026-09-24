@@ -12,7 +12,6 @@ from ..locks import (
     conversation_lock_dir,
     render_lock_error,
     render_lock_timeout,
-    render_stale_lock_recovered,
 )
 from ..media import MediaInputError, collect_media_inputs
 from ..output import OutputFormat, normalize_response, render_live_event, render_response
@@ -128,7 +127,6 @@ def run_send(
                 recorder.fail("conversation lock could not be acquired")
             _render_lock_failure(exc, args=args, stderr=stderr)
             return 2
-        render_stale_lock_recovered(lock, stderr=stderr)
 
     try:
         client = build_client(client_factory, args)

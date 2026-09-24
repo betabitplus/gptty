@@ -4,7 +4,12 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
-from ..locks import conversation_lock_dir, conversation_lock_path, read_conversation_lock
+from ..locks import (
+    conversation_lock_dir,
+    conversation_lock_is_held,
+    conversation_lock_path,
+    read_conversation_lock,
+)
 from ..runs import read_run_events, read_run_summary, render_run_status
 from ..state import StateError, load_chat_state
 
@@ -28,7 +33,7 @@ def run_observe(args: Any, *, stdout: TextIO = sys.stdout, stderr: TextIO = sys.
 
     lock_dir = conversation_lock_dir(profile=getattr(args, "profile", None), state_path=state_path)
     lock_path = conversation_lock_path(lock_dir, conversation_ref)
-    if not lock_path.exists():
+    if not conversation_lock_is_held(lock_dir, conversation_ref):
         print("gptty: no active local run for this conversation", file=stdout)
         print(file=stdout)
         if getattr(args, "profile", None):

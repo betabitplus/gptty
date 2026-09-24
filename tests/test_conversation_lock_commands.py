@@ -7,7 +7,11 @@ from typing import Any
 
 from gptty.commands.chat import run_chat
 from gptty.commands.send import run_send
-from gptty.locks import acquire_conversation_lock, conversation_lock_dir
+from gptty.locks import (
+    acquire_conversation_lock,
+    conversation_lock_dir,
+    conversation_lock_is_held,
+)
 from gptty.state import ChatState, save_chat_state
 
 
@@ -109,7 +113,9 @@ def test_send_releases_lock_after_success(tmp_path: Path) -> None:
     )
 
     assert code == 0
-    assert list(lock_dir.glob("conversation-*.lock")) == []
+    sidecars = list(lock_dir.glob("conversation-*.lock"))
+    assert len(sidecars) == 1
+    assert conversation_lock_is_held(lock_dir, "conv-1") is False
 
 
 def test_send_new_does_not_need_preexisting_conversation_lock(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- concurrency: replace conversation stale-file/PID lock recovery with the same kernel-backed ownership model used by Goal runs; retained sidecars are diagnostic only and `observe` probes the kernel lock rather than file existence
 - packaging: require `chatgpt-web-adapter>=0.3.1,<0.4.0`, the first exact CWA release candidate verified against the current gptty browser-authority/WK runtime contract
 - feat: add profile-aware auth/state path resolution with `gptty profile` commands
 - feat: add local conversation locks for `gptty send` and `gptty chat`
