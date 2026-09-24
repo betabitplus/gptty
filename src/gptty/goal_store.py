@@ -34,7 +34,7 @@ class GoalStore:
     human-readable projections and may be copied for backup or inspection.
     """
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, state_path: str | Path) -> None:
         self.state_path = Path(state_path)
@@ -53,22 +53,22 @@ class GoalStore:
         return self.goal_dir(goal) / "checkpoint.md"
 
     def current_path(self) -> Path:
+        """Legacy singleton pointer retained only for migration compatibility."""
         return self.root / "current"
 
+    def index_path(self) -> Path:
+        return self.root / "index.json"
+
     def clear_current(self) -> None:
-        if self.db_path.exists():
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                row = db.execute("SELECT goal_id FROM current_goal WHERE slot = 1").fetchone()
-                if row is not None:
-                    goal_id = str(row[0])
-                    self._append_event_tx(db, goal_id, "current_cleared", {})
-                db.execute("DELETE FROM current_goal WHERE slot = 1")
-                db.commit()
+        """Remove only the legacy singleton pointer.
+
+        Multi-Goal routing is conversation-scoped and never uses this pointer.
+        """
         try:
             self.current_path().unlink()
         except FileNotFoundError:
             pass
+
 
     def save(
         self,
@@ -121,13 +121,22 @@ class GoalStore:
                     """,
                     (goal_id, goal.revision, goal.generation, payload, now),
                 )
-                db.execute(
-                    """
-                    INSERT INTO current_goal(slot, goal_id) VALUES (1, ?)
-                    ON CONFLICT(slot) DO UPDATE SET goal_id=excluded.goal_id
-                    """,
-                    (goal_id,),
-                )
+                refs = list(dict.fromkeys(goal.conversations))
+                if goal.conversation_ref and goal.conversation_ref not in refs:
+                    refs.append(goal.conversation_ref)
+                for index, ref in enumerate(refs, start=1):
+                    inferred_generation = (
+                        goal.generation
+                        if ref == goal.conversation_ref
+                        else min(index, goal.generation)
+                    )
+                    self._bind_conversation_tx(
+                        db,
+                        goal_id,
+                        ref,
+                        generation=inferred_generation,
+                        allow_replace_terminal=True,
+                    )
                 self._append_event_tx(
                     db,
                     goal_id,
@@ -151,6 +160,7 @@ class GoalStore:
         self.last_projection_error = None
         try:
             self._write_portable_projection(goal)
+            self._write_index_projection()
         except OSError as exc:
             self.last_projection_error = exc
         return self.goal_path(goal)
@@ -186,6 +196,16 @@ class GoalStore:
             if row is None:
                 db.rollback()
                 return False
+            if event_type == "conversation_write_committed":
+                conversation_ref = str(payload.get("conversation_ref") or "").strip()
+                if conversation_ref:
+                    self._bind_conversation_tx(
+                        db,
+                        goal_id,
+                        conversation_ref,
+                        generation=int(row[0]),
+                        allow_replace_terminal=False,
+                    )
             seq = int(
                 db.execute(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM goal_events WHERE goal_id = ?",
@@ -214,6 +234,8 @@ class GoalStore:
             self.last_projection_error = None
             try:
                 self._write_portable_events(goal_id)
+                if event_type == "conversation_write_committed":
+                    self._write_index_projection()
             except OSError as exc:
                 self.last_projection_error = exc
         return inserted
@@ -481,25 +503,160 @@ class GoalStore:
             ).fetchone()
         return row is not None
 
+    def load_for_conversation(self, conversation_ref: str | None) -> GoalState | None:
+        ref = str(conversation_ref or "").strip()
+        if not ref or not self.db_path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT g.state_json
+                FROM goal_conversations c
+                JOIN goals g ON g.goal_id = c.goal_id
+                WHERE c.conversation_ref = ?
+                """,
+                (ref,),
+            ).fetchone()
+        return self._decode_goal(str(row[0])) if row is not None else None
+
+    def goal_id_for_conversation(self, conversation_ref: str | None) -> str | None:
+        ref = str(conversation_ref or "").strip()
+        if not ref or not self.db_path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT goal_id FROM goal_conversations WHERE conversation_ref = ?",
+                (ref,),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def list_goals(
+        self,
+        *,
+        statuses: set[str] | None = None,
+        limit: int | None = 100,
+    ) -> list[GoalState]:
+        if not self.db_path.exists():
+            return []
+        query = "SELECT state_json FROM goals"
+        params: list[Any] = []
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" WHERE json_extract(state_json, '$.status') IN ({placeholders})"
+            params.extend(sorted(statuses))
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self._connect() as db:
+            rows = db.execute(query, tuple(params)).fetchall()
+        result: list[GoalState] = []
+        for row in rows:
+            goal = self._decode_goal(str(row[0]))
+            if goal is not None:
+                result.append(goal)
+        return result
+
+    def conversation_goal_map(self) -> dict[str, GoalState]:
+        if not self.db_path.exists():
+            return {}
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT c.conversation_ref, g.state_json
+                FROM goal_conversations c
+                JOIN goals g ON g.goal_id = c.goal_id
+                """
+            ).fetchall()
+        result: dict[str, GoalState] = {}
+        for conversation_ref, state_json in rows:
+            goal = self._decode_goal(str(state_json))
+            if goal is not None:
+                result[str(conversation_ref)] = goal
+        return result
+
+    def bindings_for_goal(self, goal: GoalState | str) -> list[str]:
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        if not self.db_path.exists():
+            return []
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT conversation_ref FROM goal_conversations
+                   WHERE goal_id = ? ORDER BY bound_at, conversation_ref""",
+                (goal_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def bind_conversation(
+        self, goal: GoalState | str, conversation_ref: str, *, generation: int | None = None
+    ) -> None:
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        ref = str(conversation_ref).strip()
+        if not ref:
+            raise ValueError("conversation_ref is required")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT generation FROM goals WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise KeyError(f"unknown goal: {goal_id}")
+            self._bind_conversation_tx(
+                db,
+                goal_id,
+                ref,
+                generation=max(1, int(generation or row[0])),
+                allow_replace_terminal=True,
+            )
+            self._append_event_tx(
+                db, goal_id, "conversation_bound", {"conversation_ref": ref}
+            )
+            db.commit()
+        try:
+            self._write_index_projection()
+        except OSError as exc:
+            self.last_projection_error = exc
+
+    def unbind_goal(self, goal: GoalState | str) -> list[str]:
+        goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
+        if not self.db_path.exists():
+            return []
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT conversation_ref FROM goal_conversations WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchall()
+            refs = [str(row[0]) for row in rows]
+            db.execute("DELETE FROM goal_conversations WHERE goal_id = ?", (goal_id,))
+            if db.execute("SELECT 1 FROM goals WHERE goal_id = ?", (goal_id,)).fetchone():
+                self._append_event_tx(
+                    db, goal_id, "conversations_unbound", {"conversations": refs}
+                )
+            db.commit()
+        try:
+            self._write_index_projection()
+        except OSError as exc:
+            self.last_projection_error = exc
+        return refs
+
     def load_current(self) -> GoalState | None:
+        """Legacy singleton lookup used only to import pre-v3 state."""
         if self.db_path.exists():
             with self._connect() as db:
                 row = db.execute(
-                    """
-                    SELECT g.state_json FROM current_goal c
-                    JOIN goals g ON g.goal_id = c.goal_id WHERE c.slot = 1
-                    """
+                    "SELECT goal_id FROM current_goal WHERE slot = 1"
                 ).fetchone()
-            # Once SQLite exists it is authoritative even when there is no current
-            # Goal. Falling back to the portable pointer here could resurrect stale
-            # state after a crash between the DB commit and projection cleanup.
-            return self._decode_goal(str(row[0])) if row is not None else None
-        # Backward-compatible migration path used only before SQLite exists.
+            if row is not None:
+                return self.load(str(row[0]))
+            return None
         try:
             goal_id = self.current_path().read_text(encoding="utf-8").strip()
         except OSError:
             return None
         return self._load_legacy(goal_id) if goal_id else None
+
 
     def load(self, goal_id: str) -> GoalState | None:
         if self.db_path.exists():
@@ -556,6 +713,14 @@ class GoalStore:
                 slot INTEGER PRIMARY KEY CHECK(slot = 1),
                 goal_id TEXT NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS goal_conversations(
+                conversation_ref TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
+                generation INTEGER NOT NULL,
+                bound_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_conversations_goal
+                ON goal_conversations(goal_id, bound_at);
             CREATE TABLE IF NOT EXISTS goal_events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 goal_id TEXT NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
@@ -578,7 +743,84 @@ class GoalStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_events_key "
             "ON goal_events(goal_id, event_key) WHERE event_key IS NOT NULL"
         )
+        schema_version = int(db.execute("PRAGMA user_version").fetchone()[0])
+        if schema_version < self.SCHEMA_VERSION:
+            self._migrate_conversation_bindings_tx(db)
+            db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
+        db.commit()
         return db
+
+    def _bind_conversation_tx(
+        self,
+        db: sqlite3.Connection,
+        goal_id: str,
+        conversation_ref: str,
+        *,
+        generation: int,
+        allow_replace_terminal: bool,
+    ) -> None:
+        ref = str(conversation_ref).strip()
+        existing = db.execute(
+            """SELECT c.goal_id, g.state_json
+               FROM goal_conversations c
+               JOIN goals g ON g.goal_id = c.goal_id
+               WHERE c.conversation_ref = ?""",
+            (ref,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing[0]) == goal_id:
+                db.execute(
+                    "UPDATE goal_conversations SET generation = ? WHERE conversation_ref = ?",
+                    (max(1, int(generation)), ref),
+                )
+                return
+            old_goal_id = str(existing[0])
+            old_goal = self._decode_goal(str(existing[1]))
+            old_status = old_goal.status if old_goal is not None else "unknown"
+            if not allow_replace_terminal or old_status not in {"complete", "interrupted"}:
+                raise GoalConflictError(
+                    f"conversation {ref} is already bound to unfinished goal {old_goal_id}"
+                )
+            self._append_event_tx(
+                db,
+                old_goal_id,
+                "conversation_released",
+                {"conversation_ref": ref, "rebound_to_goal": goal_id},
+            )
+        db.execute(
+            """
+            INSERT INTO goal_conversations(conversation_ref, goal_id, generation, bound_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(conversation_ref) DO UPDATE SET
+                goal_id=excluded.goal_id,
+                generation=excluded.generation,
+                bound_at=excluded.bound_at
+            """,
+            (ref, goal_id, max(1, int(generation)), _now_iso()),
+        )
+
+    def _migrate_conversation_bindings_tx(self, db: sqlite3.Connection) -> None:
+        # v2 used a singleton current_goal pointer and stored conversation chains
+        # only inside Goal JSON. Backfill routing deterministically, newest Goal
+        # first, without ever stealing an existing v3 binding.
+        rows = db.execute(
+            "SELECT goal_id, generation, state_json FROM goals ORDER BY updated_at DESC"
+        ).fetchall()
+        for goal_id, generation, state_json in rows:
+            goal = self._decode_goal(str(state_json))
+            if goal is None:
+                continue
+            refs: list[str] = []
+            if goal.conversation_ref:
+                refs.append(goal.conversation_ref)
+            refs.extend(ref for ref in goal.conversations if ref not in refs)
+            for ref in refs:
+                db.execute(
+                    """INSERT OR IGNORE INTO goal_conversations(
+                           conversation_ref, goal_id, generation, bound_at
+                       ) VALUES (?, ?, ?, ?)""",
+                    (ref, str(goal_id), max(1, int(generation)), _now_iso()),
+                )
 
     def _append_event_tx(
         self,
@@ -634,7 +876,27 @@ class GoalStore:
             directory / "checkpoint.md", self._checkpoint_markdown(goal)
         )
         self._write_portable_events(goal_id)
-        self._write_text_atomic(self.current_path(), f"{goal_id}\n")
+
+    def _write_index_projection(self) -> None:
+        goals = self.list_goals(limit=None)
+        payload = {
+            "schema": self.SCHEMA_VERSION,
+            "updated_at": _now_iso(),
+            "goals": [
+                {
+                    "goal_id": goal.goal_id,
+                    "status": goal.status,
+                    "generation": goal.generation,
+                    "conversation_ref": goal.conversation_ref,
+                    "conversations": self.bindings_for_goal(goal),
+                    "objective": goal.objective,
+                    "turn_count": goal.turn_count,
+                    "runner_pid": goal.runner_pid,
+                }
+                for goal in goals
+            ],
+        }
+        self._write_json_atomic(self.index_path(), payload)
 
     def _write_portable_events(self, goal: GoalState | str) -> None:
         goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)

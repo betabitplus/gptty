@@ -923,11 +923,11 @@ def test_goal_command_starts_on_attached_conversation_and_queues_activation(
     prompt = commands.pop_automatic_prompt()
     assert prompt is not None
     assert "GPTTY Goal mode is now active" in prompt
-    assert ("info", "Goal · active · starting") in renderer.events
+    assert any(kind == "info" and str(message).startswith("Goal · active · ") and str(message).endswith(" · starting") for kind, message in renderer.events)
     assert ("info", f"Goal state: {goal_path}") in renderer.events
 
 
-def test_goal_start_restores_previous_pointer_if_chat_state_save_fails(
+def test_goal_start_keeps_authoritative_new_goal_if_local_chat_state_save_fails(
     tmp_path, monkeypatch
 ) -> None:
     previous_goal = GoalState(
@@ -945,16 +945,18 @@ def test_goal_start_restores_previous_pointer_if_chat_state_save_fails(
         raise StateError("disk failed")
 
     monkeypatch.setattr("gptty.ui.commands.save_chat_state", fail_save)
-
     commands.handle('/goal "New goal"')
 
-    assert state.goal == previous_goal
-    assert commands.goal_store.load_current() == previous_goal
-    assert commands.goal_store.current_path().read_text().strip() == "goal-old"
+    assert state.goal is not None
+    assert state.goal.goal_id != "goal-old"
+    assert state.goal.objective == "New goal"
+    assert commands.goal_store.load(state.goal.goal_id) == state.goal
+    assert commands.goal_store.load_for_conversation("conv-1").goal_id == state.goal.goal_id
+    assert commands.goal_store.load("goal-old").status == "complete"
     assert ("warning", "disk failed") in renderer.events
 
 
-def test_goal_clear_restores_pointer_if_chat_state_save_fails(
+def test_goal_clear_keeps_authoritative_unbind_if_local_chat_state_save_fails(
     tmp_path, monkeypatch
 ) -> None:
     goal = GoalState(
@@ -971,11 +973,15 @@ def test_goal_clear_restores_pointer_if_chat_state_save_fails(
         raise StateError("disk failed")
 
     monkeypatch.setattr("gptty.ui.commands.save_chat_state", fail_save)
-
     commands.handle("/goal clear")
 
-    assert state.goal == goal
-    assert commands.goal_store.load_current() == goal
+    assert state.goal is None
+    retained = commands.goal_store.load("goal-clear")
+    assert retained is not None
+    assert retained.status == "interrupted"
+    assert retained.reason == "cleared by user"
+    assert commands.goal_store.load_for_conversation("conv-1") is None
+    assert commands.goal_store.list_goals(statuses={"active", "paused", "blocked"}) == []
     assert renderer.events[-1] == ("warning", "disk failed")
 
 
@@ -1041,7 +1047,7 @@ def test_goal_command_requires_objective_when_no_chat_context_exists(tmp_path) -
     assert commands.state.goal is None
     assert renderer.events[-1] == (
         "warning",
-        "No conversation is attached. Use /goal <objective> to start a goal in a new chat.",
+        "No conversation is attached. Use /goal <objective> to start a Goal in a new chat.",
     )
 
 
@@ -1493,10 +1499,12 @@ def test_goal_user_stop_pauses_and_never_auto_continues(tmp_path, monkeypatch) -
     assert renderer.events.count(("info", "Goal · paused · stopped by user")) == 1
 
 
-def test_goal_pause_resume_clear_and_context_switch_are_safe(tmp_path) -> None:
+def test_goal_pause_resume_and_context_switch_keep_goal_routed_to_original_chat(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
-    commands, _, _, state_path = make_commands(tmp_path, state=state)
+    commands, _, client, state_path = make_commands(tmp_path, state=state)
     commands.handle("/goal important work")
+    assert state.goal is not None
+    goal_id = state.goal.goal_id
     assert commands.pop_automatic_prompt() is not None
 
     commands.handle("/goal pause")
@@ -1506,13 +1514,18 @@ def test_goal_pause_resume_clear_and_context_switch_are_safe(tmp_path) -> None:
     assert commands.pop_automatic_prompt() is not None
 
     commands.handle("/new")
-    assert state.goal is not None and state.goal.status == "paused"
+    assert state.goal is None
     assert state.current_conversation is None
-    assert load_chat_state(state_path).goal is not None
+    routed = commands.goal_store.load_for_conversation("conv-1")
+    assert routed is not None and routed.goal_id == goal_id and routed.status == "paused"
+    assert load_chat_state(state_path).goal is None
 
+    commands._begin_resume("conv-1")
+    finish_pending_resume(commands, client)
+    assert state.goal is not None and state.goal.goal_id == goal_id
     commands.handle("/goal clear")
     assert state.goal is None
-    assert load_chat_state(state_path).goal is None
+    assert commands.goal_store.load_for_conversation("conv-1") is None
 
 
 def test_goal_resume_refuses_to_continue_in_different_conversation(tmp_path) -> None:
@@ -1721,12 +1734,13 @@ def test_remote_live_goal_owner_is_read_only_in_second_commands_instance(tmp_pat
     )
     owner.handle('/goal "owned work"')
     assert owner.state.goal is not None
+    goal_id = owner.state.goal.goal_id
     owner.state.goal.runner_pid = os.getpid()
     owner._save_state(event_type="owner_heartbeat")
 
     remote_state = ChatState(
         current_conversation="conv-owner",
-        goal=owner.goal_store.load_current(),
+        goal=owner.goal_store.load_for_conversation("conv-owner"),
     )
     remote, renderer, _, _ = make_commands(
         tmp_path, state=remote_state, runner_id="other-runner"
@@ -1735,7 +1749,7 @@ def test_remote_live_goal_owner_is_read_only_in_second_commands_instance(tmp_pat
     remote.handle("/goal pause")
     remote.handle("/goal clear")
 
-    authoritative = remote.goal_store.load_current()
+    authoritative = remote.goal_store.load(goal_id)
     assert authoritative is not None
     assert authoritative.status == "active"
     assert authoritative.runner_id == "owner-runner"
@@ -1743,7 +1757,7 @@ def test_remote_live_goal_owner_is_read_only_in_second_commands_instance(tmp_pat
     assert any("another live gptty process" in message for message in warnings)
 
 
-def test_remote_live_goal_blocks_shared_profile_context_mutations(tmp_path) -> None:
+def test_remote_live_goal_does_not_block_local_context_switches(tmp_path) -> None:
     import os
 
     owner_state = ChatState(
@@ -1757,37 +1771,27 @@ def test_remote_live_goal_blocks_shared_profile_context_mutations(tmp_path) -> N
             runner_pid=os.getpid(),
         ),
     )
-    owner, _, _, _ = make_commands(
-        tmp_path, state=owner_state, runner_id="owner-runner"
-    )
+    owner, _, _, _ = make_commands(tmp_path, state=owner_state, runner_id="owner-runner")
     owner._save_state(event_type="owner_ready")
 
     remote_state = ChatState(
         current_conversation="conv-owner",
-        goal=owner.goal_store.load_current(),
+        goal=owner.goal_store.load_for_conversation("conv-owner"),
     )
-    remote, renderer, _, _ = make_commands(
-        tmp_path, state=remote_state, runner_id="remote-runner"
-    )
+    remote, _, _, _ = make_commands(tmp_path, state=remote_state, runner_id="remote-runner")
 
     remote.handle("/new")
-    assert remote.state.current_conversation == "conv-owner"
-    remote.handle("/detach")
-    assert remote.state.current_conversation == "conv-owner"
+    assert remote.state.current_conversation is None
+    assert remote.state.goal is None
     remote._begin_resume("conv-other")
-    assert remote.has_pending_resume is False
+    assert remote.has_pending_resume is True
     remote._apply_model("different-model")
-    assert remote.state.model is None
+    assert remote.state.model == "different-model"
 
-    authoritative = remote.goal_store.load_current()
+    authoritative = remote.goal_store.load("goal-owner-guard")
     assert authoritative is not None
     assert authoritative.status == "active"
     assert authoritative.runner_id == "owner-runner"
-    warnings = [str(message) for kind, message in renderer.events if kind == "warning"]
-    assert any("starting a new conversation is blocked" in message for message in warnings)
-    assert any("detaching the conversation is blocked" in message for message in warnings)
-    assert any("switching conversations is blocked" in message for message in warnings)
-    assert any("changing the model is blocked" in message for message in warnings)
 
 
 def test_unresolved_machine_observed_tool_call_forces_reconciliation_before_complete(tmp_path) -> None:
@@ -1884,7 +1888,7 @@ def test_two_goal_runners_racing_resume_have_single_authoritative_owner(tmp_path
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(lambda command: command._resume_goal(), (first, second)))
 
-    authoritative = store.load_current()
+    authoritative = store.load("goal-resume-race")
     assert authoritative is not None
     assert authoritative.status == "active"
     assert authoritative.runner_id in {"runner-A", "runner-B"}
@@ -1988,3 +1992,314 @@ def test_goal_transport_write_completion_is_durably_journaled(tmp_path) -> None:
     assert len(committed) == 1
     assert committed[0]["payload"]["operation_id"] == operation_id
     assert committed[0]["payload"]["conversation_ref"] == "conv-route-ui-12345678"
+
+
+def test_goal_list_shows_multiple_unfinished_and_all_terminal_goals(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(tmp_path, runner_id="viewer")
+    active = GoalState(
+        goal_id="aaaaaaaa11111111",
+        conversation_ref="conv-a",
+        conversations=["conv-a"],
+        status="active",
+        objective="active objective",
+        runner_id="runner-a",
+        runner_pid=12345,
+        turn_count=2,
+    )
+    paused = GoalState(
+        goal_id="bbbbbbbb22222222",
+        conversation_ref="conv-b",
+        conversations=["conv-b"],
+        status="paused",
+        objective="paused objective",
+        turn_count=4,
+    )
+    complete = GoalState(
+        goal_id="cccccccc33333333",
+        conversation_ref="conv-c",
+        conversations=["conv-c"],
+        status="complete",
+        objective="finished objective",
+        turn_count=6,
+    )
+    for goal in (active, paused, complete):
+        commands.goal_store.save(goal, event_type="goal_created")
+    commands.state.current_conversation = "conv-b"
+    commands.state.goal = commands.goal_store.load_for_conversation("conv-b")
+
+    commands.handle("/goal list")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert "Goals · 2 unfinished" in infos
+    assert any("aaaaaaaa" in line and "active" in line and "conv-a" in line for line in infos)
+    assert any(line.startswith("* paused") and "bbbbbbbb" in line for line in infos)
+    assert not any("cccccccc" in line for line in infos)
+
+    renderer.events.clear()
+    commands.handle("/goal list all")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert "Goals · 3 all" in infos
+    assert any("cccccccc" in line and "complete" in line for line in infos)
+
+
+def test_goal_open_switches_to_target_goal_by_unique_prefix(tmp_path) -> None:
+    client = FakeClient()
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        state=ChatState(current_conversation="conv-a"),
+        client=client,
+        runner_id="runner-view",
+    )
+    left = GoalState(
+        goal_id="aaaabbbb11112222",
+        conversation_ref="conv-a",
+        conversations=["conv-a"],
+        status="paused",
+        objective="left",
+    )
+    right = GoalState(
+        goal_id="ccccdddd33334444",
+        conversation_ref="conv-b",
+        conversations=["conv-b"],
+        status="paused",
+        objective="right",
+    )
+    commands.goal_store.save(left, event_type="goal_created")
+    commands.goal_store.save(right, event_type="goal_created")
+    commands.state.goal = commands.goal_store.load_for_conversation("conv-a")
+
+    commands.handle("/goal open cccc")
+    request = commands.take_pending_resume()
+    assert request is not None
+    assert request.conversation_ref == "conv-b"
+    snapshot = client.conversation_snapshot("conv-b")
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert commands.state.current_conversation == "conv-b"
+    assert commands.state.goal is not None
+    assert commands.state.goal.goal_id == "ccccdddd33334444"
+    assert any(
+        kind == "info" and "Goal · paused" in str(message)
+        for kind, message in renderer.events
+    )
+
+
+def test_goal_open_current_goal_is_instant_and_does_not_reload(tmp_path) -> None:
+    client = FakeClient()
+    goal = GoalState(
+        goal_id="aaaabbbb11112222",
+        conversation_ref="conv-a",
+        conversations=["conv-a"],
+        status="complete",
+        objective="already here",
+        turn_count=3,
+    )
+    state = ChatState(current_conversation="conv-a", goal=goal)
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        state=state,
+        client=client,
+        runner_id="runner-view",
+    )
+    commands.goal_store.save(goal, event_type="goal_created")
+
+    commands.handle("/goal open aaaa")
+
+    assert commands.has_pending_resume is False
+    assert commands.state.current_conversation == "conv-a"
+    assert commands.state.goal is not None
+    assert commands.state.goal.goal_id == "aaaabbbb11112222"
+    assert any(
+        kind == "info" and "Goal · complete" in str(message)
+        for kind, message in renderer.events
+    )
+
+
+def test_resume_picker_labels_conversations_with_goal_status(tmp_path) -> None:
+    commands, _, client, _ = make_commands(tmp_path)
+    commands.goal_store.save(
+        GoalState(
+            goal_id="goal-picker-active",
+            conversation_ref="conv-2",
+            conversations=["conv-2"],
+            status="active",
+            objective="picker active",
+            runner_id="other",
+            runner_pid=999,
+        ),
+        event_type="goal_created",
+    )
+    commands.goal_store.save(
+        GoalState(
+            goal_id="goal-picker-paused",
+            conversation_ref="conv-1",
+            conversations=["conv-1"],
+            status="paused",
+            objective="picker paused",
+        ),
+        event_type="goal_created",
+    )
+
+    options = commands._conversation_options(client)
+    labels = dict(options)
+    assert "Goal active goal-pic" in labels["conv-2"]
+    assert "Goal paused goal-pic" in labels["conv-1"]
+
+
+def test_two_different_goals_can_resume_concurrently_with_independent_owners(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = GoalStore(tmp_path / "gptty_state.json")
+    goal_a = GoalState(
+        goal_id="goal-concurrent-a",
+        conversation_ref="conv-a",
+        conversations=["conv-a"],
+        status="paused",
+        objective="run A",
+    )
+    goal_b = GoalState(
+        goal_id="goal-concurrent-b",
+        conversation_ref="conv-b",
+        conversations=["conv-b"],
+        status="paused",
+        objective="run B",
+    )
+    store.save(goal_a, event_type="goal_created")
+    store.save(goal_b, event_type="goal_created")
+
+    first, _, _, _ = make_commands(
+        tmp_path,
+        state=ChatState(
+            current_conversation="conv-a",
+            goal=store.load_for_conversation("conv-a"),
+        ),
+        runner_id="runner-A",
+    )
+    second, _, _, _ = make_commands(
+        tmp_path,
+        state=ChatState(
+            current_conversation="conv-b",
+            goal=store.load_for_conversation("conv-b"),
+        ),
+        runner_id="runner-B",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda command: command._resume_goal(), (first, second)))
+
+    authoritative_a = store.load("goal-concurrent-a")
+    authoritative_b = store.load("goal-concurrent-b")
+    assert authoritative_a is not None and authoritative_a.status == "active"
+    assert authoritative_b is not None and authoritative_b.status == "active"
+    assert authoritative_a.runner_id == "runner-A"
+    assert authoritative_b.runner_id == "runner-B"
+    assert first.has_automatic_prompt is True
+    assert second.has_automatic_prompt is True
+    assert store.goal_id_for_conversation("conv-a") == "goal-concurrent-a"
+    assert store.goal_id_for_conversation("conv-b") == "goal-concurrent-b"
+
+
+def test_goal_resume_history_hides_internal_protocol_and_preserves_steering(tmp_path) -> None:
+    goal = GoalState(
+        goal_id="goal-history-clean",
+        conversation_ref="conv-goal-history",
+        conversations=["conv-goal-history"],
+        status="complete",
+        objective="clean history",
+        turn_count=2,
+    )
+    state = ChatState(current_conversation=None)
+    commands, renderer, client, _ = make_commands(tmp_path, state=state)
+    commands.goal_store.save(goal, event_type="goal_created")
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {
+                "role": "user",
+                "text": (
+                    "GPTTY Goal mode is now active. Pursue the task.\n\n"
+                    "GPTTY_GOAL: CONTINUE"
+                ),
+            },
+            {
+                "role": "assistant",
+                "text": (
+                    "GPTTY_GOAL: CONTINUE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"half","completed":["one"],'
+                    '"decisions":[],"pending":["two"],"next":"continue"}\n'
+                    "VISIBLE_STAGE"
+                ),
+            },
+            {
+                "role": "user",
+                "text": (
+                    "Keep the CLI stable.\n\n"
+                    "[GPTTY Goal mode remains active. Treat the user message above as steering/refinement "
+                    "of the existing goal.]\nGPTTY_GOAL: CONTINUE"
+                ),
+            },
+            {
+                "role": "assistant",
+                "text": (
+                    "GPTTY_GOAL: COMPLETE\n"
+                    'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],'
+                    '"decisions":[],"pending":[],"next":"none"}\n'
+                    "VISIBLE_DONE"
+                ),
+            },
+        ],
+    }
+
+    commands._begin_resume("conv-goal-history")
+    request = commands.take_pending_resume()
+    assert request is not None
+    assert commands.complete_resume(request, snapshot) is True
+
+    rendered = next(value for kind, value in renderer.events if kind == "messages")
+    assert [(message.role, message.text) for message in rendered] == [
+        ("assistant", "VISIBLE_STAGE"),
+        ("user", "Keep the CLI stable."),
+        ("assistant", "VISIBLE_DONE"),
+    ]
+    assert all("GPTTY_" not in message.text for message in rendered)
+
+
+def test_goal_open_does_not_follow_stale_historical_conversation_binding(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(
+        tmp_path,
+        state=ChatState(current_conversation="conv-shared"),
+        runner_id="viewer",
+    )
+    old = GoalState(
+        goal_id="oldgoal1111111111",
+        conversation_ref="conv-shared",
+        conversations=["conv-shared"],
+        status="complete",
+        objective="old complete goal",
+    )
+    new = GoalState(
+        goal_id="newgoal2222222222",
+        conversation_ref="conv-shared",
+        conversations=["conv-shared"],
+        status="paused",
+        objective="new current goal",
+    )
+    commands.goal_store.save(old, event_type="goal_created")
+    commands.goal_store.save(new, event_type="goal_created")
+    commands.state.goal = commands.goal_store.load_for_conversation("conv-shared")
+
+    assert commands.goal_store.bindings_for_goal(old) == []
+    assert commands.goal_store.goal_id_for_conversation("conv-shared") == new.goal_id
+
+    commands.handle("/goal open oldgoal")
+
+    assert commands.has_pending_resume is False
+    assert commands.state.goal is not None
+    assert commands.state.goal.goal_id == new.goal_id
+    warnings = [str(message) for kind, message in renderer.events if kind == "warning"]
+    assert any("history only" in message for message in warnings)
+
+    renderer.events.clear()
+    commands.handle("/goal list all")
+    infos = [str(message) for kind, message in renderer.events if kind == "info"]
+    assert any("oldgoal1" in line and "history only" in line for line in infos)
+    assert any("newgoal2" in line and "conv-shared" in line for line in infos)

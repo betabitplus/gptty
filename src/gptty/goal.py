@@ -73,6 +73,46 @@ def parse_goal_response(text: str | None) -> ParsedGoalResponse:
 
 
 
+_INTERNAL_GOAL_USER_PREFIXES = (
+    "GPTTY Goal mode is now active.",
+    "Continue pursuing the active goal from this conversation.",
+    "The previous turn ended without a valid GPTTY_GOAL status line.",
+    "The previous goal turn ended in a non-standard transport/chat/process state.",
+    "GPTTY is continuing an existing Goal in a fresh ChatGPT conversation",
+)
+_GOAL_STEERING_MARKER = "\n\n[GPTTY Goal mode remains active."
+_GOAL_OPERATION_MARKER = "\n\n[GPTTY durable operation id:"
+
+
+def sanitize_goal_history_text(role: str, text: str | None) -> str | None:
+    """Hide Goal control protocol while preserving user-visible historical content."""
+    raw = str(text or "")
+    normalized_role = str(role or "").strip().lower()
+    if normalized_role == "assistant":
+        parsed = parse_goal_response(raw)
+        return parsed.body if parsed.signal is not None else raw
+    if normalized_role != "user":
+        return raw
+
+    stripped = raw.lstrip()
+    if (
+        GOAL_PROTOCOL_PREFIX in raw
+        and any(stripped.startswith(prefix) for prefix in _INTERNAL_GOAL_USER_PREFIXES)
+    ):
+        return None
+
+    steering_index = raw.find(_GOAL_STEERING_MARKER)
+    if steering_index >= 0:
+        visible = raw[:steering_index].rstrip()
+        return visible or None
+
+    operation_index = raw.find(_GOAL_OPERATION_MARKER)
+    if operation_index >= 0:
+        visible = raw[:operation_index].rstrip()
+        return visible or None
+    return raw
+
+
 def completion_checkpoint_error(parsed: ParsedGoalResponse) -> str | None:
     """Return why COMPLETE is not safe to accept as a durable terminal claim."""
     if parsed.signal is not GoalSignal.COMPLETE:

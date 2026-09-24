@@ -6,6 +6,7 @@ from gptty.goal import (
     continuation_prompt,
     parse_goal_response,
     rollover_prompt,
+    sanitize_goal_history_text,
     steering_prompt,
 )
 from gptty.state import GoalCheckpoint, GoalState
@@ -158,3 +159,34 @@ def test_complete_requires_at_least_one_verified_completed_claim() -> None:
         "Done."
     )
     assert completion_checkpoint_error(parsed) == "COMPLETE checkpoint has no verified completed work"
+
+
+def test_goal_history_sanitizer_hides_protocol_and_internal_control_prompts() -> None:
+    assistant = (
+        "GPTTY_GOAL: COMPLETE\n"
+        'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],"decisions":[],"pending":[],"next":"none"}\n'
+        "VISIBLE_DONE"
+    )
+    assert sanitize_goal_history_text("assistant", assistant) == "VISIBLE_DONE"
+    assert (
+        sanitize_goal_history_text("user", continuation_prompt(goal=GoalState(goal_id="g")))
+        is None
+    )
+    assert (
+        sanitize_goal_history_text("user", activation_prompt("do work"))
+        is None
+    )
+
+
+def test_goal_history_sanitizer_preserves_user_steering_without_service_suffix() -> None:
+    prompt = steering_prompt(
+        "Keep the CLI stable.",
+        goal=GoalState(goal_id="goal-steer", objective="finish"),
+    )
+    assert sanitize_goal_history_text("user", prompt) == "Keep the CLI stable."
+    assert sanitize_goal_history_text("user", "ordinary user text") == "ordinary user text"
+
+
+def test_goal_history_sanitizer_does_not_hide_matching_user_phrase_without_protocol() -> None:
+    text = "Continue pursuing the active goal from this conversation. This is my own wording."
+    assert sanitize_goal_history_text("user", text) == text

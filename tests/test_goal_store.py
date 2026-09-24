@@ -7,7 +7,7 @@ from gptty.goal_store import GoalStore
 from gptty.state import GoalCheckpoint, GoalState
 
 
-def test_goal_store_writes_portable_json_checkpoint_and_pointer(tmp_path) -> None:
+def test_goal_store_writes_portable_json_checkpoint_and_multi_goal_index(tmp_path) -> None:
     store = GoalStore(tmp_path / "gptty_state.json")
     goal = GoalState(
         goal_id="goal-123",
@@ -32,7 +32,7 @@ def test_goal_store_writes_portable_json_checkpoint_and_pointer(tmp_path) -> Non
 
     assert path == tmp_path / "goals" / "goal-123" / "goal.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["schema"] == 2
+    assert payload["schema"] == 3
     assert payload["goal"]["checkpoint"]["decisions"] == [
         "keep API backwards compatible"
     ]
@@ -44,8 +44,12 @@ def test_goal_store_writes_portable_json_checkpoint_and_pointer(tmp_path) -> Non
     assert "## Recovery context seed" in checkpoint
     assert "commit A verified" in checkpoint
     assert "https://chatgpt.com/c/conv-1" in checkpoint
-    assert store.current_path().read_text(encoding="utf-8").strip() == "goal-123"
-    assert store.load_current() == goal
+    assert not store.current_path().exists()
+    index = json.loads(store.index_path().read_text(encoding="utf-8"))
+    assert index["schema"] == 3
+    assert index["goals"][0]["goal_id"] == "goal-123"
+    assert store.load_for_conversation("conv-2") == goal
+    assert set(store.bindings_for_goal(goal)) == {"conv-1", "conv-2"}
 
 
 def test_goal_store_clear_current_preserves_backupable_goal_directory(tmp_path) -> None:
@@ -96,7 +100,7 @@ def test_goal_store_sqlite_is_authoritative_when_portable_projection_is_stale(tm
     store.save(goal, event_type="turn_terminal")
     portable.write_text(json.dumps(payload), encoding="utf-8")
 
-    recovered = store.load_current()
+    recovered = store.load("goal-authority")
     assert recovered is not None
     assert recovered.turn_count == 2
     assert recovered.revision == 2
@@ -168,7 +172,7 @@ store.save(goal, event_type="turn_terminal", event_payload={"body": "committed"}
     )
     assert child.returncode == 86
 
-    recovered = store.load_current()
+    recovered = store.load("goal-crash")
     assert recovered is not None
     assert recovered.turn_count == 2
     assert recovered.revision == 2
@@ -264,7 +268,7 @@ def test_goal_store_projection_failure_does_not_undo_committed_authoritative_sta
     store.save(goal, event_type="turn_terminal")
 
     assert store.last_projection_error is not None
-    recovered = store.load_current()
+    recovered = store.load("goal-projection")
     assert recovered is not None
     assert recovered.turn_count == 2
     assert recovered.revision == 2
@@ -352,7 +356,7 @@ os._exit(88)
     child = subprocess.run([sys.executable, "-c", script, str(state_path)], check=False)
     assert child.returncode == 88
 
-    recovered = store.load_current()
+    recovered = store.load("goal-wal-recovery")
     assert recovered is not None
     assert recovered.turn_count == 2
     assert recovered.revision == 2
@@ -399,7 +403,7 @@ os._exit(89)
     )
     assert child.returncode == 89
 
-    recovered = store.load_current()
+    recovered = store.load("goal-evidence-crash")
     assert recovered is not None
     assert recovered.active_operation_id == "goal-evidence-crash:g1:t1"
     evidence = store.operation_evidence(recovered, recovered.active_operation_id)
@@ -449,22 +453,30 @@ def test_operation_evidence_does_not_let_unrelated_tool_result_resolve_write(tmp
     assert store.operation_evidence(goal, operation_id)["unresolved_tool_calls"] == 0
 
 
-def test_authoritative_clear_cannot_be_undone_by_stale_portable_current_pointer(tmp_path) -> None:
+def test_legacy_current_pointer_never_overrides_conversation_routing(tmp_path) -> None:
     store = GoalStore(tmp_path / "state.json")
-    goal = GoalState(goal_id="goal-cleared", status="complete")
-    store.save(goal, event_type="goal_created")
-    stale_pointer = store.current_path().read_text(encoding="utf-8")
+    old = GoalState(
+        goal_id="goal-old-pointer",
+        conversation_ref="conv-old",
+        conversations=["conv-old"],
+        status="paused",
+    )
+    new = GoalState(
+        goal_id="goal-routed",
+        conversation_ref="conv-new",
+        conversations=["conv-new"],
+        status="active",
+    )
+    store.save(old, event_type="goal_created")
+    store.save(new, event_type="goal_created")
+    store.current_path().write_text("goal-old-pointer\n", encoding="utf-8")
 
-    # Simulate the crash window: authoritative transaction committed, but the old
-    # human-readable pointer was never removed.
-    with store._connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute("DELETE FROM current_goal WHERE slot=1")
-        db.commit()
-    store.current_path().write_text(stale_pointer, encoding="utf-8")
-
-    assert store.load_current() is None
-    assert store.load("goal-cleared") is not None  # retained backup/history remains readable
+    assert store.load_for_conversation("conv-new").goal_id == "goal-routed"
+    assert store.load_for_conversation("conv-old").goal_id == "goal-old-pointer"
+    assert {goal.goal_id for goal in store.list_goals()} == {
+        "goal-old-pointer",
+        "goal-routed",
+    }
 
 
 def test_observed_event_refreshes_portable_journal_without_becoming_authoritative(tmp_path) -> None:
@@ -482,7 +494,7 @@ def test_observed_event_refreshes_portable_journal_without_becoming_authoritativ
     )
 
     assert "tool_call_observed" in portable.read_text(encoding="utf-8")
-    assert store.load_current() is not None
+    assert store.load("goal-portable-events") is not None
 
 
 def test_goal_store_recovers_unique_committed_conversation_for_open_operation(tmp_path) -> None:
@@ -530,3 +542,170 @@ def test_conflicting_committed_conversation_identities_fail_closed(tmp_path) -> 
         )
 
     assert store.operation_committed_conversation(goal, operation_id) is None
+
+
+def test_multiple_goals_route_independently_by_conversation(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    left = GoalState(
+        goal_id="goal-left",
+        conversation_ref="conv-left",
+        conversations=["conv-left"],
+        status="active",
+        objective="left objective",
+        runner_pid=111,
+    )
+    right = GoalState(
+        goal_id="goal-right",
+        conversation_ref="conv-right",
+        conversations=["conv-right"],
+        status="active",
+        objective="right objective",
+        runner_pid=222,
+    )
+
+    store.save(left, event_type="goal_created")
+    store.save(right, event_type="goal_created")
+
+    assert store.load_for_conversation("conv-left").goal_id == "goal-left"
+    assert store.load_for_conversation("conv-right").goal_id == "goal-right"
+    assert {goal.goal_id for goal in store.list_goals(statuses={"active"})} == {
+        "goal-left",
+        "goal-right",
+    }
+    assert store.bindings_for_goal(left) == ["conv-left"]
+    assert store.bindings_for_goal(right) == ["conv-right"]
+
+
+def test_unfinished_goal_binding_cannot_be_stolen_by_another_goal(tmp_path) -> None:
+    import pytest
+    from gptty.goal_store import GoalConflictError
+
+    store = GoalStore(tmp_path / "state.json")
+    first = GoalState(
+        goal_id="goal-first",
+        conversation_ref="conv-shared",
+        conversations=["conv-shared"],
+        status="paused",
+    )
+    second = GoalState(
+        goal_id="goal-second",
+        conversation_ref="conv-shared",
+        conversations=["conv-shared"],
+        status="active",
+    )
+    store.save(first, event_type="goal_created")
+
+    with pytest.raises(GoalConflictError):
+        store.save(second, event_type="goal_created")
+
+    assert store.load_for_conversation("conv-shared").goal_id == "goal-first"
+    assert store.load("goal-second") is None
+
+
+def test_terminal_goal_conversation_can_be_rebound_to_new_goal(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    old = GoalState(
+        goal_id="goal-old",
+        conversation_ref="conv-reuse",
+        conversations=["conv-reuse"],
+        status="complete",
+    )
+    new = GoalState(
+        goal_id="goal-new",
+        conversation_ref="conv-reuse",
+        conversations=["conv-reuse"],
+        status="active",
+    )
+    store.save(old, event_type="goal_created")
+    store.save(new, event_type="goal_created")
+
+    assert store.load_for_conversation("conv-reuse").goal_id == "goal-new"
+    assert any(event["type"] == "conversation_released" for event in store.events(old))
+
+
+def test_committed_fresh_conversation_binds_goal_before_terminal_state_save(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-fresh:g2:t4"
+    goal = GoalState(
+        goal_id="goal-fresh",
+        generation=2,
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=4,
+    )
+    store.save(goal, event_type="operation_resumed")
+
+    store.record_observed_event(
+        goal,
+        "conversation_write_committed",
+        {
+            "operation_id": operation_id,
+            "conversation_ref": "conv-fresh",
+            "submission_id": "submit-1",
+        },
+        event_key="fresh-route",
+    )
+
+    routed = store.load_for_conversation("conv-fresh")
+    assert routed is not None
+    assert routed.goal_id == "goal-fresh"
+    # Routing is durable immediately, while the Goal state checkpoint deliberately
+    # remains unchanged until startup/terminal reconciliation advances it.
+    assert routed.conversation_ref is None
+    authoritative = store.load("goal-fresh")
+    assert authoritative is not None
+    assert authoritative.conversation_ref is None
+    assert store.goal_id_for_conversation("conv-fresh") == "goal-fresh"
+
+
+def test_multi_goal_index_is_not_a_singleton_pointer(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    for idx in range(2):
+        store.save(
+            GoalState(
+                goal_id=f"goal-{idx}",
+                conversation_ref=f"conv-{idx}",
+                conversations=[f"conv-{idx}"],
+                status="paused",
+                objective=f"objective {idx}",
+            ),
+            event_type="goal_created",
+        )
+    index = json.loads(store.index_path().read_text(encoding="utf-8"))
+    assert {item["goal_id"] for item in index["goals"]} == {"goal-0", "goal-1"}
+    assert not store.current_path().exists()
+
+
+
+def test_v2_singleton_store_migrates_all_conversation_bindings_to_v3(tmp_path) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    legacy = GoalState(
+        goal_id="goal-v2-migrate",
+        generation=2,
+        conversation_ref="conv-new",
+        conversations=["conv-old", "conv-new"],
+        status="paused",
+        objective="migrate safely",
+    )
+    store.save(legacy, event_type="goal_created")
+
+    # Simulate an on-disk v2 database: Goal JSON/history exist, singleton current
+    # exists, but there is no v3 conversation routing and user_version predates v3.
+    with store._connect() as db:
+        db.execute("DELETE FROM goal_conversations")
+        db.execute(
+            "INSERT OR REPLACE INTO current_goal(slot, goal_id) VALUES (1, ?)",
+            (legacy.goal_id,),
+        )
+        db.execute("PRAGMA user_version=2")
+        db.commit()
+
+    migrated = GoalStore(tmp_path / "state.json")
+    assert migrated.load_for_conversation("conv-old").goal_id == "goal-v2-migrate"
+    assert migrated.load_for_conversation("conv-new").goal_id == "goal-v2-migrate"
+    assert set(migrated.bindings_for_goal("goal-v2-migrate")) == {
+        "conv-old",
+        "conv-new",
+    }
+    with migrated._connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3

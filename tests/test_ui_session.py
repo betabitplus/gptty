@@ -716,11 +716,11 @@ def test_contextual_command_completion_exposes_usage_and_subcommands(tmp_path) -
             await asyncio.sleep(0.05)
             assert buffer.complete_state is not None
             top = {item.text: item for item in buffer.complete_state.completions}
-            assert "pause | resume | status | clear" in top["/goal"].display_meta_text
+            assert "list [all] | open <id> | pause | resume | status | clear" in top["/goal"].display_meta_text
             assert "Enter: choose chat" in top["/resume"].display_meta_text
 
             for raw, expected in (
-                ("/goal ", ["pause", "resume", "status", "clear"]),
+                ("/goal ", ["list", "open", "pause", "resume", "status", "clear"]),
                 ("/goal re", ["resume"]),
                 ("/image ", ["clear"]),
                 ("/model ", ["default"]),
@@ -763,7 +763,7 @@ def test_command_toolbar_is_contextual_and_never_hides_active_turn_status(tmp_pa
             buffer.text = "/goal resume"
             session.application.invalidate()
             await asyncio.sleep(0.02)
-            assert "Resume a paused or blocked goal" in session._bottom_toolbar()
+            assert "Resume the attached paused or blocked goal" in session._bottom_toolbar()
 
             controls = TurnControlSignals()
             session.set_active_turn(controls, working_status=lambda: "working · queued 1")

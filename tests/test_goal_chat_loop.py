@@ -365,75 +365,20 @@ def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(
     assert created == []
 
 
-def test_goal_recovers_from_standalone_store_when_chat_state_is_missing(
-    tmp_path,
-) -> None:
+def test_missing_chat_state_does_not_choose_an_arbitrary_durable_goal(tmp_path) -> None:
     state_path = tmp_path / "state.json"
     store = GoalStore(state_path)
-    store.save(
-        GoalState(
-            goal_id="goal-recover",
-            conversation_ref="conv-1",
-            conversations=["conv-1"],
-            status="active",
-            objective="Finish safely",
-            turn_count=5,
-            checkpoint=GoalCheckpoint(
-                summary="Core changes are already applied.",
-                decisions=["do not rewrite commit A"],
-                next_step="verify current repository state",
-                updated_turn=5,
+    for goal_id, ref in (("goal-recover-a", "conv-a"), ("goal-recover-b", "conv-b")):
+        store.save(
+            GoalState(
+                goal_id=goal_id,
+                conversation_ref=ref,
+                conversations=[ref],
+                status="active",
+                objective=f"Finish {goal_id}",
             ),
+            event_type="goal_created",
         )
-    )
-    created: list[object] = []
-
-    class NeverCreateClient:
-        def __init__(self, *args, **kwargs) -> None:
-            created.append(self)
-
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=NeverCreateClient,
-        input_stream=StringIO("/exit\n"),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    restored = load_chat_state(state_path)
-    assert restored.current_conversation == "conv-1"
-    assert restored.goal is not None
-    assert restored.goal.goal_id == "goal-recover"
-    assert restored.goal.status == "paused"
-    assert restored.goal.turn_count == 5
-    assert restored.goal.checkpoint.decisions == ["do not rewrite commit A"]
-    assert restored.goal.reason == "gptty restarted while goal was active"
-    assert created == []
-
-
-def test_goal_recovers_from_standalone_store_when_chat_state_is_corrupt(
-    tmp_path,
-) -> None:
-    state_path = tmp_path / "state.json"
-    state_path.write_text("{broken", encoding="utf-8")
-    store = GoalStore(state_path)
-    store.save(
-        GoalState(
-            goal_id="goal-corrupt-recover",
-            conversation_ref="conv-1",
-            conversations=["conv-1"],
-            status="active",
-            objective="Recover safely",
-            turn_count=4,
-            checkpoint=GoalCheckpoint(
-                summary="Durable work exists.",
-                completed=["commit A already landed"],
-                next_step="inspect current state",
-                updated_turn=4,
-            ),
-        )
-    )
     created: list[object] = []
 
     class NeverCreateClient:
@@ -451,14 +396,56 @@ def test_goal_recovers_from_standalone_store_when_chat_state_is_corrupt(
 
     assert code == 0
     restored = load_chat_state(state_path)
-    assert restored.current_conversation == "conv-1"
-    assert restored.goal is not None
-    assert restored.goal.goal_id == "goal-corrupt-recover"
-    assert restored.goal.status == "paused"
-    assert restored.goal.turn_count == 4
-    assert restored.goal.checkpoint.completed == ["commit A already landed"]
-    assert restored.goal.reason == "gptty restarted while goal was active"
-    assert "recovered Goal state from standalone goal store" in stderr.getvalue()
+    assert restored.current_conversation is None
+    assert restored.goal is None
+    assert {goal.goal_id for goal in store.list_goals(statuses={"active"})} == {
+        "goal-recover-a",
+        "goal-recover-b",
+    }
+    assert "/goal list" not in stderr.getvalue()  # missing file is normal, not corruption
+    assert created == []
+
+
+def test_corrupt_chat_state_preserves_all_durable_goals_without_guessing_selection(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    store = GoalStore(state_path)
+    for goal_id, ref in (("goal-corrupt-a", "conv-a"), ("goal-corrupt-b", "conv-b")):
+        store.save(
+            GoalState(
+                goal_id=goal_id,
+                conversation_ref=ref,
+                conversations=[ref],
+                status="active",
+                objective=f"Recover {goal_id}",
+            ),
+            event_type="goal_created",
+        )
+    created: list[object] = []
+
+    class NeverCreateClient:
+        def __init__(self, *args, **kwargs) -> None:
+            created.append(self)
+
+    stderr = StringIO()
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=NeverCreateClient,
+        input_stream=StringIO("/exit\n"),
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 0
+    restored = load_chat_state(state_path)
+    assert restored.current_conversation is None
+    assert restored.goal is None
+    assert {goal.goal_id for goal in store.list_goals(statuses={"active"})} == {
+        "goal-corrupt-a",
+        "goal-corrupt-b",
+    }
+    assert "durable Goals are preserved" in stderr.getvalue()
+    assert "use /goal list" in stderr.getvalue()
     assert created == []
 
 
@@ -2627,9 +2614,10 @@ def test_starting_second_process_does_not_pause_goal_owned_by_live_process(tmp_p
         turn_count=3,
     )
     store.save(owned, event_type="goal_created")
-    before = store.load_current()
+    before = store.load("goal-live-owner")
     assert before is not None
     before_revision = before.revision
+    save_chat_state(state_path, ChatState(current_conversation="conv-owned"))
 
     class NeverCreateClient:
         def __init__(self, *args, **kwargs) -> None:
@@ -2644,7 +2632,7 @@ def test_starting_second_process_does_not_pause_goal_owned_by_live_process(tmp_p
     )
 
     assert code == 0
-    after = store.load_current()
+    after = store.load("goal-live-owner")
     assert after is not None
     assert after.status == "active"
     assert after.runner_id == "live-owner-token"
@@ -2670,6 +2658,7 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
         ),
         event_type="goal_created",
     )
+    save_chat_state(state_path, ChatState(current_conversation="conv-owned"))
     _FakeRenderer.instances.clear()
     _FakeSession.script = iter(
         [
@@ -2708,7 +2697,7 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
 
     assert code == 0
     assert created == []
-    authoritative = store.load_current()
+    authoritative = store.load("goal-live-dispatch-guard")
     assert authoritative is not None
     assert authoritative.status == "active"
     assert authoritative.runner_id == "live-owner-token"
@@ -2941,7 +2930,7 @@ def test_restart_with_ambiguous_operation_resumes_into_reconciliation_not_replay
     assert code == 0
     assert len(ReconcileClient.instances) == 1
     assert len(ReconcileClient.instances[0].calls) == 1
-    recovered = store.load_current()
+    recovered = store.load("goal-restart-ambiguous")
     assert recovered is not None
     assert recovered.status == "complete"
     assert recovered.turn_count == 4
@@ -2996,7 +2985,7 @@ def test_restart_binds_fresh_chat_from_machine_write_commit_before_pausing_goal(
 
     assert code == 0
     assert created == []
-    recovered = store.load_current()
+    recovered = store.load("goal-route-restart")
     assert recovered is not None
     assert recovered.status == "paused"
     assert recovered.conversation_ref == "conv-fresh-12345678"
@@ -3044,7 +3033,7 @@ def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidenc
 
     assert code == 0
     assert created == []
-    recovered = store.load_current()
+    recovered = store.load("goal-no-route")
     assert recovered is not None
     assert recovered.status == "paused"
     assert recovered.conversation_ref is None

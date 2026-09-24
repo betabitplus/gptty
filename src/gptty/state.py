@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, TextIO
 
 
 class StateError(RuntimeError):
@@ -53,6 +54,59 @@ class ChatState:
 
 def default_chat_state() -> ChatState:
     return ChatState()
+
+
+def session_chat_state_path(
+    base_path: str | Path,
+    *,
+    input_stream: TextIO | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Return a terminal/session-scoped ChatState path when identity is available.
+
+    Goal authority intentionally remains profile-wide in ``<parent>/goals``. Only
+    local UI selection (current conversation/model/cached Goal) is scoped here so
+    concurrent terminal surfaces cannot overwrite each other's recovery pointer.
+    ``GPTTY_SESSION_ID`` is an explicit override and also works for scripted
+    acceptance. Automatic terminal identities are used only for an actual TTY.
+    """
+    base = Path(base_path)
+    env = os.environ if environ is None else environ
+    explicit = str(env.get("GPTTY_SESSION_ID") or "").strip()
+    source: str | None = "custom" if explicit else None
+    identity: str | None = explicit or None
+
+    tty_name: str | None = None
+    if identity is None and input_stream is not None:
+        try:
+            fd = input_stream.fileno()
+            if os.isatty(fd):
+                tty_name = os.ttyname(fd).strip() or None
+        except (AttributeError, OSError, ValueError):
+            tty_name = None
+
+    if identity is None and tty_name is not None:
+        candidates = (
+            ("cmux", env.get("CMUX_SURFACE_ID")),
+            ("term", env.get("TERM_SESSION_ID")),
+            ("wezterm", env.get("WEZTERM_PANE")),
+            ("kitty", env.get("KITTY_WINDOW_ID")),
+            ("tty", tty_name),
+        )
+        for candidate_source, candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                source = candidate_source
+                identity = value
+                break
+
+    if identity is None or source is None:
+        return base
+
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    suffix = base.suffix
+    stem = base.stem if suffix else base.name
+    return base.with_name(f"{stem}.session-{source}-{digest}{suffix}")
 
 
 def load_chat_state(path: str | Path) -> ChatState:

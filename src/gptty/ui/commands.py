@@ -29,6 +29,7 @@ from ..goal import (
     ParsedGoalResponse,
     parse_goal_response,
     rollover_prompt,
+    sanitize_goal_history_text,
     steering_prompt,
 )
 from ..goal_store import GoalConflictError, GoalStore, ensure_goal_id
@@ -187,6 +188,33 @@ class InteractiveCommands:
             return self.state.current_conversation is None
         return goal.conversation_ref == self.state.current_conversation
 
+    def _goal_for_conversation(self, conversation_ref: str | None) -> GoalState | None:
+        return self.goal_store.load_for_conversation(conversation_ref)
+
+    def _attach_goal_for_conversation(self, conversation_ref: str | None) -> GoalState | None:
+        goal = self._goal_for_conversation(conversation_ref)
+        self.state.goal = goal
+        return goal
+
+    def _goal_by_prefix(self, prefix: str) -> GoalState | None:
+        token = prefix.strip().lower()
+        if not token:
+            return None
+        matches = [
+            goal
+            for goal in self.goal_store.list_goals(limit=None)
+            if (goal.goal_id or "").lower().startswith(token)
+        ]
+        if not matches:
+            self.renderer.warning(f"No Goal matches id prefix {prefix}.")
+            return None
+        if len(matches) > 1:
+            self.renderer.warning(
+                f"Goal id prefix {prefix} is ambiguous; use more characters."
+            )
+            return None
+        return matches[0]
+
     @property
     def has_automatic_prompt(self) -> bool:
         return bool(self._automatic_prompts)
@@ -219,10 +247,26 @@ class InteractiveCommands:
 
     def complete_resume(self, request: ResumeRequest, snapshot: Any) -> bool:
         attached_ref = request.conversation_ref
-        previous = self.state.current_conversation
+        previous_ref = self.state.current_conversation
+        previous_goal = self.state.goal
         self.state.current_conversation = attached_ref
-        if not self._save_state():
-            self.state.current_conversation = previous
+        try:
+            if (
+                request.reload
+                and previous_goal is not None
+                and previous_goal.conversation_ref == attached_ref
+            ):
+                self.state.goal = previous_goal
+            else:
+                self._attach_goal_for_conversation(attached_ref)
+        except (OSError, sqlite3.Error) as exc:
+            self.state.current_conversation = previous_ref
+            self.state.goal = previous_goal
+            self.renderer.warning(f"Goal routing failed for resumed conversation: {exc}")
+            return False
+        if not self._save_state(persist_goal=False):
+            self.state.current_conversation = previous_ref
+            self.state.goal = previous_goal
             return False
 
         if not request.reload:
@@ -234,8 +278,25 @@ class InteractiveCommands:
         )
         action = "Reloaded" if request.reload else "Resumed"
         self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
+        if self.state.goal is not None:
+            self._render_goal_status()
         messages = _snapshot_messages(snapshot)
-        self.renderer.messages(normalize_messages(messages))
+        normalized_messages = normalize_messages(messages)
+        if self.state.goal is not None:
+            visible_messages: list[OutputMessage] = []
+            for message in normalized_messages:
+                visible_text = sanitize_goal_history_text(message.role, message.text)
+                if visible_text is None:
+                    continue
+                visible_messages.append(
+                    OutputMessage(
+                        role=message.role,
+                        text=visible_text,
+                        created_at=message.created_at,
+                    )
+                )
+            normalized_messages = visible_messages
+        self.renderer.messages(normalized_messages)
         historical_ui_marker: tuple[str, str, str, str] | None = None
         if isinstance(snapshot, dict):
             ui_state = snapshot.get("historical_ui_state")
@@ -415,7 +476,7 @@ class InteractiveCommands:
                     payload,
                     event_key=event_key,
                 )
-            except (OSError, sqlite3.Error) as exc:
+            except (GoalConflictError, OSError, sqlite3.Error) as exc:
                 self.renderer.warning(f"Goal journal route evidence write failed: {exc}")
             return
 
@@ -1048,6 +1109,101 @@ class InteractiveCommands:
             self._capture_goal_context_history(conversation_ref)
         )
 
+    def _render_goal_list(self, *, include_terminal: bool) -> None:
+        statuses = None if include_terminal else {"active", "paused", "blocked"}
+        try:
+            goals = self.goal_store.list_goals(statuses=statuses, limit=None)
+        except (OSError, sqlite3.Error) as exc:
+            self.renderer.warning(f"Goal list failed: {exc}")
+            return
+        if not goals:
+            suffix = "" if include_terminal else " Use /goal list all for completed/archived Goals."
+            self.renderer.info(f"No matching Goals.{suffix}")
+            return
+        label = "all" if include_terminal else "unfinished"
+        self.renderer.info(f"Goals · {len(goals)} {label}")
+        current_id = self.state.goal.goal_id if self.state.goal is not None else None
+        for goal in goals:
+            goal_id = goal.goal_id or "?"
+            marker = "*" if goal_id == current_id else " "
+            try:
+                bindings = self.goal_store.bindings_for_goal(goal)
+            except (OSError, sqlite3.Error) as exc:
+                self.renderer.warning(f"Goal binding lookup failed: {exc}")
+                return
+            ref = (
+                goal.conversation_ref
+                if goal.conversation_ref in bindings
+                else (bindings[-1] if bindings else None)
+            )
+            route_label = (
+                _short_ref(ref)
+                if ref
+                else ("history only" if goal.conversation_ref or goal.conversations else "new chat")
+            )
+            owner = ""
+            if goal.status == "active" and goal.runner_pid:
+                owner = (
+                    " · this process"
+                    if self._owns_goal_run(goal)
+                    else f" · pid {goal.runner_pid}"
+                )
+            objective = " ".join((goal.objective or "inherited conversation goal").split())
+            if len(objective) > 72:
+                objective = objective[:69] + "..."
+            self.renderer.info(
+                f"{marker} {goal.status:<8} {goal_id[:8]} · "
+                f"{route_label} · t{goal.turn_count}{owner} · {objective}"
+            )
+        self.renderer.info("/goal open <id> switches to a Goal · /goal list all shows terminal Goals")
+
+    def _open_goal(self, prefix: str) -> None:
+        try:
+            goal = self._goal_by_prefix(prefix)
+        except (OSError, sqlite3.Error) as exc:
+            self.renderer.warning(f"Goal lookup failed: {exc}")
+            return
+        if goal is None:
+            return
+        try:
+            bindings = self.goal_store.bindings_for_goal(goal)
+        except (OSError, sqlite3.Error) as exc:
+            self.renderer.warning(f"Goal binding lookup failed: {exc}")
+            return
+        ref = (
+            goal.conversation_ref
+            if goal.conversation_ref in bindings
+            else (bindings[-1] if bindings else None)
+        )
+        if ref is None and (goal.conversation_ref or goal.conversations):
+            self.renderer.warning(
+                f"Goal {(goal.goal_id or '?')[:8]} is history only; it no longer owns a conversation."
+            )
+            return
+        current_goal_id = self.state.goal.goal_id if self.state.goal is not None else None
+        if (
+            current_goal_id == goal.goal_id
+            and ref is not None
+            and self.state.current_conversation == ref
+        ):
+            # `/goal open` is navigation. Re-opening the already attached Goal
+            # must be instantaneous instead of starting a redundant snapshot load
+            # that temporarily blocks the next navigation command.
+            self.state.goal = goal
+            self._render_goal_status()
+            return
+        if ref:
+            self._begin_resume(ref)
+            return
+        # A Goal created before its first ChatGPT write has no conversation yet.
+        # Attaching it locally is enough; /goal resume will safely bootstrap it.
+        self._pause_active_goal("conversation changed")
+        self.state.current_conversation = None
+        self.state.goal = goal
+        self.clear_automatic_prompts()
+        if self._save_state(persist_goal=False):
+            self._render_goal_status()
+
     def _cmd_goal(self, argv: list[str]) -> None:
         if self._conversation_mode == "temporary":
             self.renderer.warning(
@@ -1056,6 +1212,19 @@ class InteractiveCommands:
             return
 
         action = argv[0].strip().lower() if argv else ""
+        if action == "list":
+            if len(argv) > 2 or (len(argv) == 2 and argv[1].strip().lower() != "all"):
+                self.renderer.warning("Usage: /goal list [all]")
+                return
+            self._render_goal_list(include_terminal=len(argv) == 2)
+            return
+        if action == "open":
+            if len(argv) != 2:
+                self.renderer.warning("Usage: /goal open <id-prefix>")
+                return
+            self._open_goal(argv[1])
+            return
+
         if action in {"pause", "resume", "clear", "status"} and len(argv) == 1:
             if action == "pause":
                 if (
@@ -1070,7 +1239,7 @@ class InteractiveCommands:
                 if self._pause_active_goal("paused by user"):
                     self.renderer.info("Goal · paused")
                 elif self.state.goal is None:
-                    self.renderer.info("No goal is configured.")
+                    self.renderer.info("No Goal is attached to this conversation.")
                 else:
                     self.renderer.info(f"Goal · {self.state.goal.status}")
                 return
@@ -1079,31 +1248,50 @@ class InteractiveCommands:
                 return
             if action == "clear":
                 if self.state.goal is None:
-                    self.renderer.info("No goal is configured.")
+                    self.renderer.info("No Goal is attached to this conversation.")
                     return
-                previous_goal = self.state.goal
-                if previous_goal.status == "active" and not self._owns_goal_run(previous_goal):
+                goal = self.state.goal
+                if goal.status == "active" and not self._owns_goal_run(goal):
                     self.renderer.warning(
                         "Goal is active in another live gptty process; it cannot be cleared here."
                     )
                     return
+                if goal.status not in {"complete", "interrupted"}:
+                    goal.status = "interrupted"
+                    goal.reason = "cleared by user"
+                    goal.runner_id = None
+                    goal.runner_pid = 0
+                    try:
+                        self.goal_store.save(
+                            goal,
+                            event_type="goal_interrupted",
+                            event_payload={"reason": goal.reason},
+                        )
+                    except GoalConflictError as exc:
+                        authoritative = self.goal_store.load(goal.goal_id or "")
+                        if authoritative is not None:
+                            self.state.goal = authoritative
+                        self.renderer.warning(
+                            f"Goal state changed in another process; clear was not applied: {exc}"
+                        )
+                        return
+                    except (OSError, sqlite3.Error) as exc:
+                        self.renderer.warning(f"Failed to interrupt Goal before clear: {exc}")
+                        return
+                    if self.goal_store.last_projection_error is not None:
+                        self.renderer.warning(
+                            "Goal authoritative state committed, but portable projection "
+                            f"could not be refreshed: {self.goal_store.last_projection_error}"
+                        )
                 try:
-                    self.goal_store.clear_current()
+                    self.goal_store.unbind_goal(goal)
                 except (OSError, sqlite3.Error) as exc:
-                    self.renderer.warning(f"failed to clear Goal pointer: {exc}")
+                    self.renderer.warning(f"Failed to clear Goal bindings: {exc}")
                     return
                 self.state.goal = None
                 self.clear_automatic_prompts()
-                if self._save_state():
-                    self.renderer.info("Goal · cleared")
-                else:
-                    self.state.goal = previous_goal
-                    try:
-                        self.goal_store.save(previous_goal)
-                    except (OSError, sqlite3.Error) as exc:
-                        self.renderer.warning(
-                            f"failed to restore Goal pointer after state save failure: {exc}"
-                        )
+                if self._save_state(persist_goal=False):
+                    self.renderer.info("Goal · cleared from its conversations; history retained")
                 return
             self._render_goal_status()
             return
@@ -1116,13 +1304,13 @@ class InteractiveCommands:
             and (existing is None or existing.status == "complete")
         ):
             self.renderer.warning(
-                "No conversation is attached. Use /goal <objective> to start a goal in a new chat."
+                "No conversation is attached. Use /goal <objective> to start a Goal in a new chat."
             )
             return
         if existing is not None and existing.status not in {"complete"}:
             if objective:
                 self.renderer.warning(
-                    "An unfinished goal already exists. Use /goal clear before replacing it."
+                    "This conversation already has an unfinished Goal. Use /goal status, /goal resume, or /goal clear."
                 )
                 return
             if existing.status in {"paused", "blocked", "interrupted"}:
@@ -1134,7 +1322,7 @@ class InteractiveCommands:
         context_history = self._capture_goal_context_history(
             self.state.current_conversation
         )
-        self.state.goal = GoalState(
+        new_goal = GoalState(
             conversation_ref=self.state.current_conversation,
             conversations=(
                 [self.state.current_conversation]
@@ -1147,7 +1335,8 @@ class InteractiveCommands:
             runner_id=self.runner_id,
             runner_pid=os.getpid(),
         )
-        ensure_goal_id(self.state.goal)
+        ensure_goal_id(new_goal)
+        self.state.goal = new_goal
         if not self._save_state(
             event_type="goal_created",
             event_payload={
@@ -1156,21 +1345,16 @@ class InteractiveCommands:
                 "context_snapshot": context_history,
             },
         ):
-            self.state.goal = existing
-            try:
-                if existing is None:
-                    self.goal_store.clear_current()
-                else:
-                    self.goal_store.save(existing)
-            except (OSError, sqlite3.Error) as exc:
-                self.renderer.warning(
-                    f"failed to restore Goal pointer after state save failure: {exc}"
-                )
+            # If the authoritative Goal transaction committed but local chat-state
+            # persistence failed, keep the durable Goal visible instead of deleting
+            # or rolling it back through a singleton pointer.
+            authoritative = self.goal_store.load(new_goal.goal_id or "")
+            self.state.goal = authoritative if authoritative is not None else existing
             return
         self.clear_automatic_prompts()
         self._automatic_prompts.append(activation_prompt(objective))
-        self.renderer.info("Goal · active · starting")
-        self.renderer.info(f"Goal state: {self.goal_store.goal_path(self.state.goal)}")
+        self.renderer.info(f"Goal · active · {new_goal.goal_id[:8]} · starting")
+        self.renderer.info(f"Goal state: {self.goal_store.goal_path(new_goal)}")
 
     def _cmd_exit(self, argv: list[str]) -> int:
         self._pause_active_goal("gptty exited")
@@ -1179,14 +1363,15 @@ class InteractiveCommands:
         return 0
 
     def _cmd_new(self, argv: list[str]) -> None:
-        if self._reject_remote_goal_mutation("starting a new conversation"):
-            return
         self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
-        previous = self.state.current_conversation
+        previous_ref = self.state.current_conversation
+        previous_goal = self.state.goal
         self.state.current_conversation = None
-        if not self._save_state():
-            self.state.current_conversation = previous
+        self.state.goal = None
+        if not self._save_state(persist_goal=False):
+            self.state.current_conversation = previous_ref
+            self.state.goal = previous_goal
             return
         self.clear_pending_media()
         self.renderer.clear_context()
@@ -1194,17 +1379,18 @@ class InteractiveCommands:
         self.renderer.info("Started a new conversation.")
 
     def _cmd_temporary(self, argv: list[str]) -> None:
-        if self._reject_remote_goal_mutation("starting a Temporary chat"):
-            return
         if argv:
             self.renderer.warning("/temporary takes no arguments.")
             return
         self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
-        previous = self.state.current_conversation
+        previous_ref = self.state.current_conversation
+        previous_goal = self.state.goal
         self.state.current_conversation = None
-        if not self._save_state():
-            self.state.current_conversation = previous
+        self.state.goal = None
+        if not self._save_state(persist_goal=False):
+            self.state.current_conversation = previous_ref
+            self.state.goal = previous_goal
             return
         self._conversation_mode = "temporary"
         self._reset_temporary_context()
@@ -1219,8 +1405,6 @@ class InteractiveCommands:
         self._cmd_temporary(argv)
 
     def _cmd_detach(self, argv: list[str]) -> None:
-        if self._reject_remote_goal_mutation("detaching the conversation"):
-            return
         self._pause_active_goal("conversation detached")
         if self._conversation_mode == "temporary":
             self._leave_temporary_mode()
@@ -1232,10 +1416,13 @@ class InteractiveCommands:
         if not self.state.current_conversation:
             self.renderer.info("No conversation is attached.")
             return
-        previous = self.state.current_conversation
+        previous_ref = self.state.current_conversation
+        previous_goal = self.state.goal
         self.state.current_conversation = None
-        if not self._save_state():
-            self.state.current_conversation = previous
+        self.state.goal = None
+        if not self._save_state(persist_goal=False):
+            self.state.current_conversation = previous_ref
+            self.state.goal = previous_goal
             return
         self.clear_pending_media()
         self.renderer.clear_context()
@@ -1358,15 +1545,11 @@ class InteractiveCommands:
     def _begin_resume(self, ref: str, *, reload: bool = False) -> None:
         attached_ref = _canonical_conversation_ref(str(ref))
         if (
-            self.goal_owned_elsewhere
-            and attached_ref != (self.state.current_conversation or "")
-        ):
-            self._reject_remote_goal_mutation("switching conversations")
-            return
-        if (
             self.state.current_conversation
             and attached_ref != self.state.current_conversation
         ):
+            # Switching local UI context is always allowed. We only pause a Goal
+            # owned by this process; a Goal running in another process continues.
             self._pause_active_goal("conversation changed")
         self._leave_temporary_mode()
         self._pending_resume = ResumeRequest(
@@ -1420,6 +1603,10 @@ class InteractiveCommands:
             self.renderer.warning(f"Conversation list failed: {exc}")
             return []
         current_ref = _canonical_conversation_ref(self.state.current_conversation or "")
+        try:
+            goal_by_conversation = self.goal_store.conversation_goal_map()
+        except (OSError, sqlite3.Error):
+            goal_by_conversation = {}
         options: list[tuple[str, str]] = []
         for item in conversations:
             conversation_id = _catalog_conversation_id(item)
@@ -1428,15 +1615,14 @@ class InteractiveCommands:
             title = _field_text(item, "title")
             if title:
                 self._conversation_titles[conversation_id] = title
-            options.append(
-                (
-                    conversation_id,
-                    _conversation_label(
-                        item,
-                        current=conversation_id == current_ref,
-                    ),
-                )
+            label = _conversation_label(
+                item,
+                current=conversation_id == current_ref,
             )
+            goal = goal_by_conversation.get(conversation_id)
+            if goal is not None and goal.status != "complete":
+                label += f" · Goal {goal.status} {(goal.goal_id or '?')[:8]}"
+            options.append((conversation_id, label))
         if not options:
             self.renderer.info("No ChatGPT conversations found.")
         return options
@@ -1483,8 +1669,8 @@ class InteractiveCommands:
         return options
 
     def _apply_model(self, selected: str) -> None:
-        if self._reject_remote_goal_mutation("changing the model"):
-            return
+        # Model selection is local UI/session state. It must not be fenced by an
+        # unrelated Goal owner in another process.
         previous = self.state.model
         self.state.model = selected or None
         if not self._save_state():
@@ -1724,18 +1910,18 @@ class InteractiveCommands:
         *,
         event_type: str = "state_saved",
         event_payload: dict[str, Any] | None = None,
+        persist_goal: bool = True,
     ) -> bool:
         try:
-            if self.state.goal is not None:
+            if persist_goal and self.state.goal is not None:
+                goal_id = self.state.goal.goal_id or ""
                 if (
                     self.state.goal.status == "active"
                     and not self._owns_goal_run(self.state.goal)
                 ):
-                    authoritative = self.goal_store.load_current()
+                    authoritative = self.goal_store.load(goal_id)
                     if authoritative is not None:
                         self.state.goal = authoritative
-                        if authoritative.status == "active":
-                            self.state.current_conversation = authoritative.conversation_ref
                 else:
                     self.goal_store.save(
                         self.state.goal,
@@ -1749,8 +1935,9 @@ class InteractiveCommands:
                         )
             save_chat_state(self.state_path, self.state)
         except GoalConflictError as exc:
+            goal_id = self.state.goal.goal_id if self.state.goal is not None else None
             try:
-                current = self.goal_store.load_current()
+                current = self.goal_store.load(goal_id or "") if goal_id else None
             except (OSError, sqlite3.Error) as reload_exc:
                 self.clear_automatic_prompts()
                 self.renderer.warning(
@@ -1759,9 +1946,10 @@ class InteractiveCommands:
                 return False
             if current is not None:
                 self.state.goal = current
-                self.state.current_conversation = current.conversation_ref
             self.clear_automatic_prompts()
-            self.renderer.warning(f"Goal state changed in another process; reloaded authoritative state: {exc}")
+            self.renderer.warning(
+                f"Goal state changed in another process; reloaded that Goal: {exc}"
+            )
             return False
         except (OSError, sqlite3.Error, StateError) as exc:
             self.renderer.warning(str(exc))

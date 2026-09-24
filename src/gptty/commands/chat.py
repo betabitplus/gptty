@@ -34,7 +34,13 @@ from ..goal_store import GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
-from ..state import ChatState, StateError, load_chat_state, save_chat_state
+from ..state import (
+    ChatState,
+    StateError,
+    load_chat_state,
+    save_chat_state,
+    session_chat_state_path,
+)
 from ..tui_archive import TUIArchive
 from ..ui.commands import (
     UNFINISHED_STATUSES,
@@ -647,95 +653,32 @@ def run_chat(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
-    state_path = Path(getattr(args, "state", "gptty_state.json"))
-    goal_store = GoalStore(state_path)
+    base_state_path = Path(getattr(args, "state", "gptty_state.json"))
+    state_path = session_chat_state_path(
+        base_state_path,
+        input_stream=input_stream,
+    )
+    goal_store = GoalStore(base_state_path)
     runner_id = uuid.uuid4().hex
+    state_load_error: StateError | None = None
+    state_source_path = state_path if state_path.exists() else base_state_path
     try:
-        state = load_chat_state(state_path)
+        state = load_chat_state(state_source_path)
     except StateError as exc:
-        try:
-            recovered_goal = goal_store.load_current()
-        except (OSError, sqlite3.Error) as store_exc:
-            print(f"gptty: failed to read Goal store: {store_exc}", file=stderr)
-            return 1
-        if recovered_goal is None:
-            print(f"gptty: {exc}", file=stderr)
-            return 1
+        # Goal state is independently durable. A corrupt local UI-state file must
+        # not force an arbitrary Goal to become "current" in a multi-Goal profile.
+        state_load_error = exc
+        state = ChatState()
         print(
-            "gptty: recovered Goal state from standalone goal store",
+            f"gptty: local chat state could not be loaded; durable Goals are preserved ({exc})",
             file=stderr,
         )
-        state = ChatState(
-            current_conversation=recovered_goal.conversation_ref,
-            goal=recovered_goal,
-        )
 
-    try:
-        current_goal = goal_store.load_current()
-    except (OSError, sqlite3.Error) as exc:
-        print(f"gptty: failed to read Goal store: {exc}", file=stderr)
-        return 1
-    if current_goal is not None:
-        state.goal = current_goal
-        committed_operation_ref = goal_store.operation_committed_conversation(
-            current_goal, current_goal.active_operation_id
-        )
-        owner_alive_at_load = bool(
-            current_goal.status == "active"
-            and current_goal.runner_id
-            and current_goal.runner_pid
-            and _pid_is_alive(current_goal.runner_pid)
-        )
-        if (
-            current_goal.conversation_ref is None
-            and current_goal.active_operation_id
-        ):
-            # Never let stale gptty_state.json choose the chat for an open durable
-            # operation. Only a machine-observed committed transport identity may
-            # rebind it after a crash.
-            state.current_conversation = committed_operation_ref
-            if committed_operation_ref and not owner_alive_at_load:
-                current_goal.conversation_ref = committed_operation_ref
-                if committed_operation_ref not in current_goal.conversations:
-                    current_goal.conversations.append(committed_operation_ref)
-                try:
-                    goal_store.save(
-                        current_goal,
-                        event_type="conversation_bound_from_journal",
-                        event_payload={
-                            "operation_id": current_goal.active_operation_id,
-                            "conversation_ref": committed_operation_ref,
-                            "recovered_after_process_exit": True,
-                        },
-                    )
-                except GoalConflictError:
-                    try:
-                        refreshed = goal_store.load_current()
-                    except (OSError, sqlite3.Error) as exc:
-                        print(f"gptty: failed to reload Goal store after conflict: {exc}", file=stderr)
-                        return 1
-                    if refreshed is not None:
-                        current_goal = refreshed
-                        state.goal = refreshed
-                        state.current_conversation = refreshed.conversation_ref
-                except (OSError, sqlite3.Error) as exc:
-                    print(f"gptty: failed to bind recovered Goal conversation: {exc}", file=stderr)
-                    return 1
-        elif current_goal.status == "active":
-            state.current_conversation = current_goal.conversation_ref
-        elif state.current_conversation is None:
-            state.current_conversation = current_goal.conversation_ref
+    # Import a legacy Goal cached in pre-v3 chat state before conversation routing.
+    cached_goal_id = state.goal.goal_id if state.goal is not None else None
     if state.goal is not None:
-        if state.goal.goal_id and current_goal is None:
-            stored_goal = goal_store.load(state.goal.goal_id)
-            if stored_goal is not None:
-                state.goal = stored_goal
-                current_goal = stored_goal
         ensure_goal_id(state.goal)
         try:
-            # Existing SQLite state is already authoritative; avoid a pointless
-            # revision bump that would race a live Goal owner. Legacy portable/chat
-            # state is imported exactly once into the transactional store.
             if not goal_store.has_authoritative_goal(state.goal):
                 goal_store.save(
                     state.goal,
@@ -748,10 +691,62 @@ def run_chat(
                         f"{goal_store.last_projection_error}",
                         file=stderr,
                     )
-            save_chat_state(state_path, state)
-        except (GoalConflictError, OSError, sqlite3.Error, StateError) as exc:
-            print(f"gptty: failed to persist goal state: {exc}", file=stderr)
+        except (GoalConflictError, OSError, sqlite3.Error) as exc:
+            print(f"gptty: failed to migrate legacy Goal state: {exc}", file=stderr)
             return 1
+
+    # Attach only the Goal routed to this conversation. `state.goal` is a local
+    # session cache, never a profile-wide singleton authority.
+    try:
+        attached_goal = goal_store.load_for_conversation(state.current_conversation)
+        if attached_goal is None and state.current_conversation is None and cached_goal_id:
+            cached = goal_store.load(cached_goal_id)
+            if cached is not None and cached.conversation_ref is None:
+                attached_goal = cached
+    except (OSError, sqlite3.Error) as exc:
+        print(f"gptty: failed to read Goal store: {exc}", file=stderr)
+        return 1
+    state.goal = attached_goal
+
+    # A fresh recovery chat may have been committed by the transport immediately
+    # before process death. The journal binding is authoritative and can restore
+    # this one Goal without consulting any profile-wide pointer.
+    if state.goal is not None and state.goal.conversation_ref is None and state.goal.active_operation_id:
+        try:
+            committed_operation_ref = goal_store.operation_committed_conversation(
+                state.goal, state.goal.active_operation_id
+            )
+        except (OSError, sqlite3.Error) as exc:
+            print(f"gptty: failed to recover Goal conversation binding: {exc}", file=stderr)
+            return 1
+        # A historical conversation binding may have routed us to this Goal, but
+        # an open durable operation must never inherit that stale chat implicitly.
+        state.current_conversation = committed_operation_ref
+        if committed_operation_ref:
+            state.goal.conversation_ref = committed_operation_ref
+            if committed_operation_ref not in state.goal.conversations:
+                state.goal.conversations.append(committed_operation_ref)
+            state.current_conversation = committed_operation_ref
+            try:
+                goal_store.save(
+                    state.goal,
+                    event_type="conversation_bound_from_journal",
+                    event_payload={
+                        "operation_id": state.goal.active_operation_id,
+                        "conversation_ref": committed_operation_ref,
+                        "recovered_after_process_exit": True,
+                    },
+                )
+            except GoalConflictError:
+                refreshed = goal_store.load(state.goal.goal_id or "")
+                if refreshed is None:
+                    print("gptty: Goal binding changed concurrently and could not be reloaded", file=stderr)
+                    return 1
+                state.goal = refreshed
+                state.current_conversation = refreshed.conversation_ref
+            except (OSError, sqlite3.Error) as exc:
+                print(f"gptty: failed to bind recovered Goal conversation: {exc}", file=stderr)
+                return 1
 
     startup_goal_paused = False
     startup_goal_remote_active = False
@@ -765,6 +760,7 @@ def run_chat(
             startup_goal_remote_active = True
         else:
             ambiguous_operation = state.goal.active_operation_id
+            goal_id = state.goal.goal_id or ""
             state.goal.status = "paused"
             state.goal.reason = "gptty restarted while goal was active"
             state.goal.runner_id = None
@@ -780,12 +776,11 @@ def run_chat(
                         "recovered_after_process_exit": True,
                     },
                 )
-                save_chat_state(state_path, state)
-            except (GoalConflictError, OSError, sqlite3.Error, StateError) as exc:
-                # A concurrent owner may have advanced the Goal after our read.
-                # Reload instead of overwriting it or guessing.
+            except (GoalConflictError, OSError, sqlite3.Error) as exc:
+                # Only reload this Goal. A different active Goal in the profile is
+                # unrelated and must never affect recovery of the attached chat.
                 try:
-                    authoritative = goal_store.load_current()
+                    authoritative = goal_store.load(goal_id)
                 except (OSError, sqlite3.Error) as reload_exc:
                     print(f"gptty: failed to reload Goal store: {reload_exc}", file=stderr)
                     return 1
@@ -801,7 +796,17 @@ def run_chat(
                     and authoritative.runner_pid
                     and _pid_is_alive(authoritative.runner_pid)
                 )
-                save_chat_state(state_path, state)
+
+    try:
+        save_chat_state(state_path, state)
+    except StateError as exc:
+        # The authoritative Goal transaction has already succeeded. Preserve it and
+        # fail this local session rather than rolling Goal state back incorrectly.
+        print(f"gptty: failed to persist local chat state: {exc}", file=stderr)
+        return 1
+
+    if state_load_error is not None and state.goal is None:
+        print("gptty: use /goal list to locate preserved Goals", file=stderr)
 
     model = getattr(args, "model", None)
     if model and model != state.model:
@@ -832,8 +837,8 @@ def run_chat(
     interactive_commands: InteractiveCommands | None = None
     if enhanced:
         ui = InteractiveSession(
-            history_file=history_path(state_path),
-            settings_file=ui_settings_path(state_path),
+            history_file=history_path(base_state_path),
+            settings_file=ui_settings_path(base_state_path),
             settings=ui_settings,
         )
         prompt_patch_enabled = False
@@ -2123,7 +2128,7 @@ def _handle_resume_loading_input(
         return None
 
     renderer.warning(
-        f"/{name} is unavailable while the conversation is loading; queued text will send after resume."
+        f"/{name} is unavailable while the conversation is loading; wait for resume to finish."
     )
     return None
 
@@ -2521,7 +2526,7 @@ def _handle_working_input(
 
     if prompt == "/":
         renderer.info(
-            "While working: /stop · /exit · /goal pause · /goal status · /image PATH · /paste"
+            "While working: /stop · /exit · /goal pause · /goal status · /goal list · /image PATH · /paste"
         )
         return True
 
@@ -2551,19 +2556,23 @@ def _handle_working_input(
         return False
 
     if name == "goal":
-        action = argv[0].lower() if len(argv) == 1 else ""
-        if action == "pause" and active.goal_turn and commands.goal_active:
+        action = argv[0].lower() if argv else ""
+        if action == "pause" and len(argv) == 1 and active.goal_turn and commands.goal_active:
             active.pause_goal_after_turn = True
             renderer.info("Goal · pause pending · current turn will finish")
             return True
-        if action == "status" or (not argv and commands.goal_active):
+        if (action == "status" and len(argv) == 1) or (not argv and commands.goal_active):
             if active.pause_goal_after_turn:
                 renderer.info("Goal · active · pause pending")
             else:
                 commands.handle(prompt)
             return True
+        if action == "list" and (len(argv) == 1 or (len(argv) == 2 and argv[1].lower() == "all")):
+            commands.handle(prompt)
+            return True
         renderer.warning(
-            "While working, only /goal pause and /goal status are available."
+            "While working, use /goal pause, /goal status, or /goal list [all]. "
+            "Pause before switching Goals."
         )
         return True
 

@@ -17,7 +17,12 @@ from gptty.commands.chat import (
     response_terminal_error,
     run_chat,
 )
-from gptty.state import ChatState, load_chat_state, save_chat_state
+from gptty.state import (
+    ChatState,
+    load_chat_state,
+    save_chat_state,
+    session_chat_state_path,
+)
 from gptty.tui_archive import TUIArchive
 from gptty.ui.signals import TurnControlSignals
 
@@ -80,6 +85,74 @@ def make_args(tmp_path, **overrides: Any) -> Namespace:
     values.update(overrides)
     return Namespace(**values)
 
+
+
+
+def test_terminal_sessions_keep_independent_chat_selection_on_shared_profile(
+    tmp_path, monkeypatch
+) -> None:
+    class SessionAClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any) -> Response:
+            self.calls.append(("send", (prompt,), options))
+            return Response(text="A", conversation_id="conv-A")
+
+    class SessionBClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any) -> Response:
+            self.calls.append(("send", (prompt,), options))
+            return Response(text="B", conversation_id="conv-B")
+
+    base = tmp_path / "gptty_state.json"
+    save_chat_state(base, ChatState())
+    args = make_args(tmp_path, no_stream=True)
+
+    monkeypatch.setenv("GPTTY_SESSION_ID", "session-A")
+    assert run_chat(
+        args,
+        input_stream=StringIO("hello A\n/exit\n"),
+        client_factory=SessionAClient,
+        stdout=StringIO(),
+    ) == 0
+    path_a = session_chat_state_path(
+        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "session-A"}
+    )
+
+    monkeypatch.setenv("GPTTY_SESSION_ID", "session-B")
+    assert run_chat(
+        args,
+        input_stream=StringIO("hello B\n/exit\n"),
+        client_factory=SessionBClient,
+        stdout=StringIO(),
+    ) == 0
+    path_b = session_chat_state_path(
+        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "session-B"}
+    )
+
+    assert path_a != path_b
+    assert load_chat_state(path_a).current_conversation == "conv-A"
+    assert load_chat_state(path_b).current_conversation == "conv-B"
+    assert load_chat_state(base).current_conversation is None
+    assert (tmp_path / "goals") == (path_a.parent / "goals") == (path_b.parent / "goals")
+
+
+def test_new_terminal_session_seeds_from_legacy_base_state_once(tmp_path, monkeypatch) -> None:
+    base = tmp_path / "gptty_state.json"
+    save_chat_state(base, ChatState(current_conversation="legacy-conv", model="legacy-model"))
+    monkeypatch.setenv("GPTTY_SESSION_ID", "migrated-session")
+
+    assert run_chat(
+        make_args(tmp_path, no_stream=True),
+        input_stream=StringIO("/exit\n"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    ) == 0
+
+    scoped = session_chat_state_path(
+        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "migrated-session"}
+    )
+    assert scoped.exists()
+    assert load_chat_state(scoped).current_conversation == "legacy-conv"
+    assert load_chat_state(scoped).model == "legacy-model"
+    assert load_chat_state(base).current_conversation == "legacy-conv"
 
 def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
