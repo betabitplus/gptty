@@ -44,6 +44,7 @@ from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
 from ..state import ChatState, GoalAcceptanceCriterion, GoalState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
+from ..turn_control import StopOutcome, request_stop_generation
 from .clipboard import ClipboardImageError, capture_clipboard_image
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
@@ -1855,7 +1856,8 @@ class InteractiveCommands:
             self.renderer.info("No conversation is attached.")
             return
         client = self.get_client()
-        if self._request_stop_generation(client, ref):
+        outcome = self._request_stop_generation(client, ref)
+        if outcome is not None and outcome.stopped:
             self.renderer.turn_abort()
             self.renderer.info("Stop requested.")
 
@@ -1883,21 +1885,19 @@ class InteractiveCommands:
             return
         self.renderer.info(f"Exported Markdown: {path}")
 
-    def _request_stop_generation(self, client: Any, ref: str) -> bool:
+    def _request_stop_generation(
+        self,
+        client: Any,
+        ref: str,
+    ) -> StopOutcome | None:
         try:
-            result = client.stop_generation(ref, timeout=2.0)
+            outcome = request_stop_generation(client, ref, timeout=2.0)
         except Exception as exc:  # noqa: BLE001 - interactive command boundary.
             self.renderer.warning(f"Stop failed: {exc}")
-            return False
-        stopped = (
-            bool(result.get("stopped"))
-            if isinstance(result, dict)
-            else bool(getattr(result, "stopped", False))
-        )
-        if not stopped:
+            return None
+        if not outcome.stopped:
             self.renderer.info("No active ChatGPT response to stop.")
-            return False
-        return True
+        return outcome
 
     def _attach_image_input(self, raw: str | None, *, from_prompt: bool) -> None:
         if not raw:

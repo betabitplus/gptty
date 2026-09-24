@@ -38,6 +38,7 @@ from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError, session_handle_for_args
 from ..state import ChatState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
+from ..turn_control import request_stop_generation
 from ..ui.commands import (
     UNFINISHED_STATUSES,
     InteractiveCommands,
@@ -2961,19 +2962,18 @@ def _send_chat_prompt(
                     continue
 
                 try:
-                    stop_result = client.stop_generation(stop_target, timeout=30.0)
+                    stop_outcome = request_stop_generation(
+                        client,
+                        stop_target,
+                        timeout=30.0,
+                    )
                 except Exception as exc:  # noqa: BLE001 - interactive stop is best-effort at this boundary.
                     renderer.warning(f"Stop failed: {exc}")
                     stop_pending = False
                     stop_notice_shown = False
                     continue
 
-                stopped = (
-                    bool(stop_result.get("stopped"))
-                    if isinstance(stop_result, dict)
-                    else bool(getattr(stop_result, "stopped", False))
-                )
-                if not stopped:
+                if not stop_outcome.stopped:
                     renderer.warning(
                         "No active ChatGPT response to stop yet; press Ctrl-C again to retry."
                     )
@@ -2983,17 +2983,9 @@ def _send_chat_prompt(
 
                 stop_pending = False
                 stopped_by_user = True
-                stop_ref = (
-                    stop_result.get("conversationId")
-                    if isinstance(stop_result, dict)
-                    else getattr(stop_result, "conversation_id", None)
-                )
-                if (
-                    isinstance(stop_ref, str)
-                    and stop_ref.strip()
-                    and not stop_ref.strip().startswith("WEB:")
-                ):
-                    active_ref = stop_ref.strip()
+                stop_ref = stop_outcome.conversation_ref
+                if stop_ref and not stop_ref.startswith("WEB:"):
+                    active_ref = stop_ref
                     if not is_temporary and not state.current_conversation:
                         state.current_conversation = active_ref
                         try:
