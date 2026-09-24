@@ -5,7 +5,9 @@ from argparse import Namespace
 from io import StringIO
 from typing import Any
 
+import gptty.commands.status as status_command
 from gptty.commands.status import format_status, run_status
+from gptty.session_state import SessionStateError
 from gptty.state import ChatState, save_chat_state
 
 
@@ -122,7 +124,7 @@ def test_status_returns_2_without_ref(tmp_path) -> None:
     assert "requires a conversation" in stderr.getvalue()
 
 
-def test_status_returns_1_on_state_error(tmp_path) -> None:
+def test_status_recovers_from_corrupt_legacy_state_with_warning(tmp_path) -> None:
     state_path = tmp_path / "bad_state.json"
     state_path.write_text("{", encoding="utf-8")
     stderr = StringIO()
@@ -134,8 +136,27 @@ def test_status_returns_1_on_state_error(tmp_path) -> None:
         stderr=stderr,
     )
 
+    assert code == 2
+    assert "legacy chat state could not be imported" in stderr.getvalue()
+    assert "requires a conversation" in stderr.getvalue()
+
+
+def test_status_returns_1_on_transactional_state_error(monkeypatch, tmp_path) -> None:
+    def fail(*args, **kwargs):
+        raise SessionStateError("local session database failed")
+
+    monkeypatch.setattr(status_command, "resolve_conversation_ref", fail)
+    stderr = StringIO()
+
+    code = run_status(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
     assert code == 1
-    assert "failed to load state" in stderr.getvalue()
+    assert "local session database failed" in stderr.getvalue()
 
 
 def test_format_status_handles_dict_object_and_string() -> None:

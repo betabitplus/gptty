@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, TextIO
 
 from ..sdk_client import GpttyClient
-from ..state import StateError, load_chat_state, save_chat_state
+from ..session_state import SessionStateError
 from ._client import build_client
+from ._session import load_command_session
 
 CONVERSATION_REF_FIELDS = (
     "conversation_url",
@@ -41,10 +41,13 @@ def run_attach(
     stderr: TextIO = sys.stderr,
 ) -> int:
     url_or_id = str(getattr(args, "url_or_id"))
-    state_path = Path(getattr(args, "state", "gptty_state.json"))
+    try:
+        state_handle, state = load_command_session(args, stderr=stderr)
+    except SessionStateError as exc:
+        print(f"gptty: {exc}", file=stderr)
+        return 1
 
     client = build_client(client_factory, args)
-
     try:
         response = client.attach_conversation(url_or_id)
     except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
@@ -54,10 +57,9 @@ def run_attach(
     conversation_ref = extract_attached_ref(response, fallback=url_or_id)
 
     try:
-        state = load_chat_state(state_path)
         state.current_conversation = conversation_ref
-        save_chat_state(state_path, state)
-    except StateError as exc:
+        state_handle.save(state)
+    except SessionStateError as exc:
         print(f"gptty: {exc}", file=stderr)
         return 1
 

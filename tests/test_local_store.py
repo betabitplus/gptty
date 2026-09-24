@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -11,6 +13,7 @@ import pytest
 from gptty.local_store import (
     LocalEventStore,
     LocalStoreCompatibilityError,
+    LocalSessionConflictError,
     SCHEMA_VERSION,
 )
 
@@ -284,3 +287,264 @@ def test_schema_v1_migrates_delivery_tables_in_place(tmp_path: Path) -> None:
     assert store.delivery_events()[-1][1]["event"] == "migrated-delivery"
     with sqlite3.connect(db_path) as db:
         assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
+
+def test_session_registry_compare_and_swap_rejects_stale_writer(tmp_path: Path) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    created = store.create_session(
+        "default",
+        kind="default",
+        discovery_hint=None,
+        current_conversation="conv-a",
+        model="model-a",
+    )
+    assert created["revision"] == 0
+
+    revision = store.save_session(
+        "default",
+        expected_revision=0,
+        current_conversation="conv-b",
+        model="model-b",
+        goal_id=None,
+    )
+    assert revision == 1
+
+    with pytest.raises(LocalSessionConflictError, match="changed concurrently"):
+        store.save_session(
+            "default",
+            expected_revision=0,
+            current_conversation="conv-stale",
+            model="model-stale",
+            goal_id=None,
+        )
+
+    current = store.get_session("default")
+    assert current is not None
+    assert current["revision"] == 1
+    assert current["current_conversation"] == "conv-b"
+    assert current["model"] == "model-b"
+
+
+def test_session_registry_concurrent_creation_preserves_first_seed(tmp_path: Path) -> None:
+    db_path = tmp_path / "runs" / "local.sqlite3"
+    stores = [LocalEventStore(db_path), LocalEventStore(db_path)]
+    barrier = threading.Barrier(3)
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def creator(store: LocalEventStore, conversation: str) -> None:
+        try:
+            barrier.wait(timeout=3)
+            results.append(
+                store.create_session(
+                    "explicit-shared",
+                    kind="explicit",
+                    discovery_hint="explicit:test",
+                    current_conversation=conversation,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=creator, args=(stores[0], "conv-a")),
+        threading.Thread(target=creator, args=(stores[1], "conv-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=3)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert not errors
+    current = stores[0].get_session("explicit-shared")
+    assert current is not None
+    assert current["current_conversation"] in {"conv-a", "conv-b"}
+    assert {result["current_conversation"] for result in results} == {
+        current["current_conversation"]
+    }
+
+
+def test_existing_schema_v3_without_claim_table_is_upgraded_in_place(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "runs" / "local.sqlite3"
+    db_path.parent.mkdir(parents=True)
+    source_path = (tmp_path / "legacy-state.json").resolve()
+    source_path.write_text("{}\n", encoding="utf-8")
+
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            """
+            CREATE TABLE local_sessions(
+                session_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                discovery_hint TEXT,
+                current_conversation TEXT,
+                model TEXT,
+                goal_id TEXT,
+                created_at_ms INTEGER NOT NULL,
+                last_seen_at_ms INTEGER NOT NULL,
+                imported_from TEXT
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO local_sessions(
+                session_id, revision, kind, discovery_hint,
+                current_conversation, model, goal_id,
+                created_at_ms, last_seen_at_ms, imported_from
+            )
+            VALUES(?, 0, 'runtime', 'cmux:old', 'conv-old', NULL, NULL, 1, 1, ?)
+            """,
+            ("runtime-old", str(source_path)),
+        )
+        db.execute("PRAGMA user_version=3")
+        db.commit()
+    finally:
+        db.close()
+
+    store = LocalEventStore(db_path)
+
+    assert store.session_imported_from(source_path) is True
+    row, imported = store.create_session_claiming_import(
+        "runtime-new",
+        source_path=source_path,
+        kind="runtime",
+        discovery_hint="cmux:new",
+        current_conversation="conv-new",
+    )
+    assert row is None
+    assert imported is False
+    assert store.get_session("runtime-old") is not None
+    with sqlite3.connect(db_path) as check:
+        assert (
+            check.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='local_session_imports'"
+            ).fetchone()
+            is not None
+        )
+
+
+def test_legacy_session_import_claim_is_atomic_across_concurrent_sessions(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "runs" / "local.sqlite3"
+    source_path = tmp_path / "legacy-state.json"
+    source_path.write_text("{}\n", encoding="utf-8")
+    stores = [LocalEventStore(db_path), LocalEventStore(db_path)]
+    barrier = threading.Barrier(3)
+    results: list[tuple[dict | None, bool]] = []
+    errors: list[BaseException] = []
+
+    def claimant(store: LocalEventStore, session_id: str, conversation: str) -> None:
+        try:
+            barrier.wait(timeout=3)
+            results.append(
+                store.create_session_claiming_import(
+                    session_id,
+                    source_path=source_path,
+                    kind="runtime",
+                    discovery_hint="cmux:shared",
+                    current_conversation=conversation,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=claimant, args=(stores[0], "runtime-a", "conv-a")),
+        threading.Thread(target=claimant, args=(stores[1], "runtime-b", "conv-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=3)
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert not errors
+    imported = [(row, claimed) for row, claimed in results if claimed]
+    rejected = [(row, claimed) for row, claimed in results if row is None]
+    assert len(imported) == 1
+    assert len(rejected) == 1
+    assert imported[0][0] is not None
+    assert stores[0].session_imported_from(source_path) is True
+
+
+def test_legacy_session_import_claim_is_atomic_across_processes(tmp_path: Path) -> None:
+    db_path = tmp_path / "runs" / "local.sqlite3"
+    source_path = tmp_path / "legacy-state.json"
+    source_path.write_text("{}\n", encoding="utf-8")
+    start_path = tmp_path / "start"
+    result_paths = [tmp_path / "result-a", tmp_path / "result-b"]
+    script = """
+import sys
+import time
+from pathlib import Path
+from gptty.local_store import LocalEventStore
+
+db_path = Path(sys.argv[1])
+source_path = Path(sys.argv[2])
+session_id = sys.argv[3]
+conversation = sys.argv[4]
+start_path = Path(sys.argv[5])
+result_path = Path(sys.argv[6])
+store = LocalEventStore(db_path)
+while not start_path.exists():
+    time.sleep(0.01)
+row, imported = store.create_session_claiming_import(
+    session_id,
+    source_path=source_path,
+    kind="runtime",
+    discovery_hint="cmux:process-race",
+    current_conversation=conversation,
+)
+result_path.write_text(
+    f"{imported}:{row is None}",
+    encoding="utf-8",
+)
+"""
+    env = os.environ.copy()
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        src if not existing_pythonpath else src + os.pathsep + existing_pythonpath
+    )
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(db_path),
+                str(source_path),
+                session_id,
+                conversation,
+                str(start_path),
+                str(result_path),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for session_id, conversation, result_path in (
+            ("runtime-process-a", "conv-a", result_paths[0]),
+            ("runtime-process-b", "conv-b", result_paths[1]),
+        )
+    ]
+    start_path.write_text("go", encoding="utf-8")
+
+    outputs = [process.communicate(timeout=10) for process in processes]
+    assert [process.returncode for process in processes] == [0, 0], outputs
+    assert sorted(path.read_text(encoding="utf-8") for path in result_paths) == [
+        "False:True",
+        "True:False",
+    ]
+    store = LocalEventStore(db_path)
+    assert store.session_imported_from(source_path) is True

@@ -11,7 +11,7 @@ from ..locks import (
     read_conversation_lock,
 )
 from ..runs import read_run_events, read_run_summary, render_run_status
-from ..state import StateError, load_chat_state
+from ..session_state import SessionStateError, session_handle_for_args
 
 NO_CONVERSATION_ERROR = (
     "gptty observe requires a conversation URL/id or an attached conversation. "
@@ -23,7 +23,7 @@ def run_observe(args: Any, *, stdout: TextIO = sys.stdout, stderr: TextIO = sys.
     state_path = Path(getattr(args, "state", "gptty_state.json"))
     try:
         conversation_ref = resolve_conversation_ref(args, state_path=state_path)
-    except StateError as exc:
+    except SessionStateError as exc:
         print(f"gptty: {exc}", file=stderr)
         return 1
 
@@ -72,5 +72,4 @@ def resolve_conversation_ref(args: Any, *, state_path: Path) -> str | None:
     if explicit:
         return str(explicit)
 
-    state = load_chat_state(state_path)
-    return state.current_conversation
+    return session_handle_for_args(args).load().current_conversation

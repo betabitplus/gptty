@@ -128,6 +128,7 @@ def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:
         calls["format"] = args.format
         calls["model"] = args.model
         calls["no_stream"] = args.no_stream
+        calls["session"] = args.session
         calls["stdin_text"] = stdin_text
         return 0
 
@@ -150,6 +151,8 @@ def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:
         "--model",
         "gpt-4o",
         "--no-stream",
+        "--session",
+        "automation-A",
         "review",
     ]) == 0
     assert calls == {
@@ -163,6 +166,7 @@ def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:
         "format": "json",
         "model": "gpt-4o",
         "no_stream": True,
+        "session": "automation-A",
         "stdin_text": "stdin context",
     }
 
@@ -218,6 +222,24 @@ def test_no_args_routes_to_sdk_chat(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert cli.main([]) == 0
     assert calls == {"state": "gptty_state.json"}
+
+
+
+
+def test_chat_explicit_session_option_reaches_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
+    calls: dict[str, Any] = {}
+
+    def fake_run_chat(args: Any) -> int:
+        calls["session"] = args.session
+        return 0
+
+    monkeypatch.setattr(chat_command, "run_chat", fake_run_chat)
+
+    assert cli.main(["chat", "--session", "focused-work"]) == 0
+    assert calls == {"session": "focused-work"}
 
 
 def test_chat_legacy_routes_to_legacy_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

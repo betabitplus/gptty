@@ -6,8 +6,10 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import gptty.commands.send as send_command
 from gptty.commands.send import extract_conversation_ref, run_send
-from gptty.state import ChatState, load_chat_state, save_chat_state
+from gptty.session_state import SessionStateError, session_handle
+from gptty.state import ChatState, save_chat_state
 
 
 class Response:
@@ -38,6 +40,15 @@ class FakeGpttyClient:
         if on_token is not None:
             on_token("reply")
         return Response(text="reply", conversation_id=conversation_ref)
+
+
+def _load_command_session(tmp_path: Path, *, session: str | None = None) -> ChatState:
+    return session_handle(
+        state_path=tmp_path / "gptty_state.json",
+        profile=None,
+        explicit_session=session,
+        environ={},
+    ).load()
 
 
 def make_args(tmp_path: Path, **overrides: Any) -> Namespace:
@@ -77,7 +88,7 @@ def test_send_uses_attached_conversation_by_default(tmp_path: Path) -> None:
         ("send_to_conversation", ("attached-ref", "continue"), {"stream": False}),
     ]
     assert stdout.getvalue() == "reply\n"
-    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "attached-ref"
+    assert _load_command_session(tmp_path).current_conversation == "attached-ref"
 
 
 def test_extract_conversation_ref_supports_nested_sdk_conversation() -> None:
@@ -105,7 +116,7 @@ def test_send_new_persists_nested_sdk_conversation(tmp_path: Path) -> None:
     )
 
     assert code == 0
-    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "nested-new-conv"
+    assert _load_command_session(tmp_path).current_conversation == "nested-new-conv"
     assert stdout.getvalue() == "nested reply\n"
 
 
@@ -120,7 +131,7 @@ def test_send_to_explicit_conversation_updates_state(tmp_path: Path) -> None:
     )
 
     client = FakeGpttyClient.instances[0]
-    state = load_chat_state(tmp_path / "gptty_state.json")
+    state = _load_command_session(tmp_path)
     assert code == 0
     assert client.calls == [
         (
@@ -277,7 +288,7 @@ def test_send_new_starts_new_conversation_and_saves_ref(tmp_path: Path) -> None:
     assert client.calls[0][1] == ("start",)
     assert client.calls[0][2]["stream"] is True
     assert callable(client.calls[0][2]["on_token"])
-    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == "new-conv"
+    assert _load_command_session(tmp_path).current_conversation == "new-conv"
 
 
 def test_send_combines_stdin_and_prompt(tmp_path: Path) -> None:
@@ -333,7 +344,10 @@ def test_send_returns_2_for_empty_prompt(tmp_path: Path) -> None:
     assert "requires a prompt" in stderr.getvalue()
 
 
-def test_send_returns_1_on_state_error(tmp_path: Path) -> None:
+def test_send_recovers_from_corrupt_legacy_state_but_requires_routing(
+    tmp_path: Path,
+) -> None:
+    FakeGpttyClient.instances.clear()
     state_path = tmp_path / "bad_state.json"
     state_path.write_text("{", encoding="utf-8")
     stderr = StringIO()
@@ -345,8 +359,31 @@ def test_send_returns_1_on_state_error(tmp_path: Path) -> None:
         stderr=stderr,
     )
 
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "legacy chat state could not be imported" in stderr.getvalue()
+    assert "requires an attached conversation" in stderr.getvalue()
+
+
+def test_send_returns_1_on_transactional_state_error(monkeypatch, tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+
+    def fail(*args, **kwargs):
+        raise SessionStateError("local session database failed")
+
+    monkeypatch.setattr(send_command, "load_command_session", fail)
+    stderr = StringIO()
+
+    code = run_send(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
     assert code == 1
-    assert "failed to load state" in stderr.getvalue()
+    assert FakeGpttyClient.instances == []
+    assert "local session database failed" in stderr.getvalue()
 
 
 def test_extract_conversation_ref_uses_response_then_fallback() -> None:
@@ -356,3 +393,51 @@ def test_extract_conversation_ref_uses_response_then_fallback() -> None:
     assert extract_conversation_ref(Response(conversation_id="abc"), fallback="fallback") == "abc"
     assert extract_conversation_ref(object(), fallback="fallback") == "fallback"
     assert extract_conversation_ref(object()) is None
+
+def test_successful_remote_send_does_not_fail_or_overwrite_on_session_cas_conflict(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    seed = session_handle(
+        state_path=state_path,
+        profile=None,
+        environ={},
+    )
+    seed_state = seed.load()
+    seed_state.current_conversation = "initial-ref"
+    seed.save(seed_state)
+
+    class ConcurrentClient(FakeGpttyClient):
+        def send_to_conversation(
+            self,
+            conversation_ref: str,
+            prompt: str,
+            **options: Any,
+        ) -> Response:
+            self.calls.append(
+                ("send_to_conversation", (conversation_ref, prompt), options)
+            )
+            winner = session_handle(
+                state_path=state_path,
+                profile=None,
+                environ={},
+            )
+            winner_state = winner.load()
+            winner_state.current_conversation = "concurrent-winner"
+            winner.save(winner_state)
+            return Response(text="remote completed", conversation_id=conversation_ref)
+
+    stderr = StringIO()
+    stdout = StringIO()
+    code = run_send(
+        make_args(tmp_path, to="explicit-ref"),
+        client_factory=ConcurrentClient,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    assert stdout.getvalue() == "remote completed\n"
+    assert "ChatGPT turn completed, but local session state was not updated" in stderr.getvalue()
+    assert _load_command_session(tmp_path).current_conversation == "concurrent-winner"
+    assert len(FakeGpttyClient.instances[-1].calls) == 1

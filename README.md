@@ -54,9 +54,11 @@ gptty export --format markdown --output conversation.md
 - centralized stdin policy for pipe-friendly prompts
 - pipe-friendly prompts, for example `git diff | gptty ask "review this patch"`
 - streaming replies in the terminal
-- minimal SDK chat state file: `gptty_state.json`; interactive terminals use isolated sibling files `gptty_state.session-<source>-<hash>.json`
+- transactional local session state in `local-state.sqlite3` (SQLite/WAL), shared with local run/TUI/delivery evidence
+- independent interactive runtime sessions by default; use `--session NAME` (or `GPTTY_SESSION_ID`) only when you intentionally want several commands/processes to reuse one local conversation/model selection
+- one-time migration from older `gptty_state.json` / `gptty_state.session-*.json` files; those JSON files are no longer runtime authority after import
 - legacy state file for `--legacy`: `webchat_state.json`
-- atomic writes for local state and `auth_data.json`
+- transactional/atomic local-state writes and atomic `auth_data.json` updates
 - legacy image prompts through `/img` in `gptty chat --legacy`
 - `auto` and `wait` auth capture modes
 - English and Russian CLI localization in the legacy runtime
@@ -168,7 +170,7 @@ Send to an explicit conversation without changing first through `attach`:
 gptty send --to https://chatgpt.com/c/... "continue there"
 ```
 
-Start a new conversation and store its returned conversation reference in `gptty_state.json`:
+Start a new conversation and store its returned conversation reference in the current transactional local session:
 
 ```bash
 gptty send --new "start a new conversation"
@@ -330,8 +332,11 @@ Available in `gptty chat --legacy`:
 ## Important Files
 
 - `auth_data.json` - local auth data, do not commit it
-- `gptty_state.json` and `gptty_state.session-*.json` - base/non-interactive state plus per-terminal interactive selection state; do not commit them
-- `webchat_state.json` - legacy chat history and runtime settings, do not commit it
+- `local-state.sqlite3` (plus SQLite `-wal` / `-shm` companions while open) - current transactional authority for local sessions and normal run/TUI/delivery evidence; profile installs keep it under the profile's `runs/` directory, while a custom state path uses `.gptty_runs/` beside that state path
+- `gptty_state.json` and `gptty_state.session-*.json` - legacy/migration inputs for the modern runtime; retained files may be useful for rollback/backup but are not rewritten as authoritative session state
+- `webchat_state.json` - legacy `--legacy` chat history and runtime settings, do not commit it
+
+A plain `gptty chat` starts a fresh local runtime session so simultaneous terminals do not overwrite each other's current-chat/model selection. Use `gptty chat --session NAME`, or the same `--session NAME` on `send`, `attach`, `messages`, `status`, `observe`, and `export`, when intentional reuse is required. `GPTTY_SESSION_ID=NAME` is the environment equivalent. Scripted commands without an explicit session use the stable `default` local session.
 
 ## Notes
 

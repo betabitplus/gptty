@@ -7,8 +7,10 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+import gptty.commands.export as export_command
 from gptty.commands.export import run_export, save_markdown_export
 from gptty.output import OutputMessage
+from gptty.session_state import SessionStateError
 from gptty.state import ChatState, save_chat_state
 
 
@@ -182,7 +184,7 @@ def test_export_returns_1_on_sdk_error(tmp_path: Path) -> None:
     assert "export request failed: backend unavailable" in stderr.getvalue()
 
 
-def test_export_returns_1_on_state_error(tmp_path: Path) -> None:
+def test_export_recovers_from_corrupt_legacy_state_with_warning(tmp_path: Path) -> None:
     state_path = tmp_path / "gptty_state.json"
     state_path.write_text("[]", encoding="utf-8")
     stderr = StringIO()
@@ -193,8 +195,26 @@ def test_export_returns_1_on_state_error(tmp_path: Path) -> None:
         stderr=stderr,
     )
 
+    assert result == 2
+    assert "legacy chat state could not be imported" in stderr.getvalue()
+    assert "requires a conversation" in stderr.getvalue()
+
+
+def test_export_returns_1_on_transactional_state_error(monkeypatch, tmp_path: Path) -> None:
+    def fail(*args, **kwargs):
+        raise SessionStateError("local session database failed")
+
+    monkeypatch.setattr(export_command, "resolve_conversation_ref", fail)
+    stderr = StringIO()
+
+    result = run_export(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stderr=stderr,
+    )
+
     assert result == 1
-    assert "failed to load state" in stderr.getvalue()
+    assert "local session database failed" in stderr.getvalue()
 
 
 def test_export_returns_1_on_file_write_error(tmp_path: Path) -> None:

@@ -75,9 +75,11 @@ class InteractiveCommands:
         renderer: PrettyRenderer,
         tui_archive: TUIArchive | None = None,
         runner_id: str | None = None,
+        save_state: Callable[[ChatState], None] | None = None,
     ) -> None:
         self.state = state
         self.state_path = state_path
+        self._save_chat_state = save_state or (lambda value: save_chat_state(state_path, value))
         self.get_client = get_client
         self.ui = ui
         self.renderer = renderer
@@ -145,6 +147,11 @@ class InteractiveCommands:
             self.renderer.warning(f"Unknown command: /{name}. Press / for actions.")
             return None
         return method(argv)
+
+    def persist_chat_state(self, state: ChatState | None = None) -> None:
+        """Persist local session selection through the configured authority."""
+
+        self._save_chat_state(self.state if state is None else state)
 
     @property
     def conversation_mode(self) -> str:
@@ -2396,7 +2403,7 @@ class InteractiveCommands:
                             "Goal authoritative state committed, but portable projection "
                             f"could not be refreshed: {self.goal_store.last_projection_error}"
                         )
-            save_chat_state(self.state_path, self.state)
+            self._save_chat_state(self.state)
         except GoalConflictError as exc:
             self._release_goal_run_lock()
             goal_id = self.state.goal.goal_id if self.state.goal is not None else None

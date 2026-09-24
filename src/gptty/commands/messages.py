@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, TextIO
 
 from ..output import OutputMessage as ChatMessage
 from ..output import OutputFormat, normalize_messages, render_messages
 from ..sdk_client import GpttyClient
-from ..state import StateError, load_chat_state
+from ..session_state import SessionStateError
 from ._client import build_client
+from ._session import resolve_attached_conversation
 
 NO_CONVERSATION_ERROR = (
     "gptty messages requires a conversation URL/id or an attached conversation. "
@@ -25,8 +25,8 @@ def run_messages(
     stderr: TextIO = sys.stderr,
 ) -> int:
     try:
-        conversation_ref = resolve_conversation_ref(args)
-    except StateError as exc:
+        conversation_ref = resolve_conversation_ref(args, stderr=stderr)
+    except SessionStateError as exc:
         print(f"gptty: {exc}", file=stderr)
         return 1
 
@@ -52,13 +52,16 @@ def run_messages(
     return 0
 
 
-def resolve_conversation_ref(args: Any) -> str | None:
-    explicit = getattr(args, "url_or_id", None)
-    if explicit:
-        return str(explicit)
-
-    state = load_chat_state(Path(getattr(args, "state", "gptty_state.json")))
-    return state.current_conversation
+def resolve_conversation_ref(
+    args: Any,
+    *,
+    stderr: TextIO = sys.stderr,
+) -> str | None:
+    return resolve_attached_conversation(
+        args,
+        explicit=getattr(args, "url_or_id", None),
+        stderr=stderr,
+    )
 
 
 def format_messages(messages: list[ChatMessage]) -> str:

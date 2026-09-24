@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- sessions: replace terminal-hash JSON session authority with a revisioned SQLite session registry, add intentional `--session NAME` reuse, atomically claim one-time legacy imports, retain legacy Goal payload as crash-recovery input, and fail closed on stale local writers without age-evicting unleased live sessions or making an already-completed ChatGPT turn retryable
 - durability: make one SQLite/WAL local event store authoritative for run events and normal TUI observations, with bounded recent queries, transactional dedupe, private storage, incremental portable projections, and projection repair after crashes
 - diagnostics: move stream-delivery evidence into the shared transactional store, import legacy rotated JSONL evidence once, and replace multiprocess-unsafe rename rotation with a bounded lock-serialized support projection
 - performance: tail the optional CodexPro activity journal incrementally by file identity and offset, recover from truncation/rotation, and cap the in-memory activity window instead of reparsing all history on every refresh

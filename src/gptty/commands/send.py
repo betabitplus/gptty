@@ -19,8 +19,9 @@ from ..prompt import build_prompt
 from ..required_action import maybe_render_required_action
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
-from ..state import StateError, load_chat_state, save_chat_state
+from ..session_state import SessionStateError
 from ._client import build_client
+from ._session import load_command_session
 
 EMPTY_PROMPT_ERROR = "gptty send requires a prompt argument or piped stdin."
 NO_CONVERSATION_ERROR = (
@@ -60,8 +61,8 @@ def run_send(
 
     state_path = Path(getattr(args, "state", "gptty_state.json"))
     try:
-        state = load_chat_state(state_path)
-    except StateError as exc:
+        state_handle, state = load_command_session(args, stderr=stderr)
+    except SessionStateError as exc:
         print(f"gptty: {exc}", file=stderr)
         return 1
 
@@ -172,26 +173,24 @@ def run_send(
         else:
             print(render_response(normalized, output_format), file=stdout)
 
+        session_changed = False
         if updated_ref and updated_ref != state.current_conversation:
             state.current_conversation = updated_ref
-            if model:
-                state.model = model
-            try:
-                save_chat_state(state_path, state)
-            except StateError as exc:
-                if recorder is not None:
-                    recorder.fail(str(exc))
-                print(f"gptty: {exc}", file=stderr)
-                return 1
-        elif model and model != state.model:
+            session_changed = True
+        if model and model != state.model:
             state.model = model
+            session_changed = True
+        if session_changed:
             try:
-                save_chat_state(state_path, state)
-            except StateError as exc:
+                state_handle.save(state)
+            except SessionStateError as exc:
                 if recorder is not None:
-                    recorder.fail(str(exc))
-                print(f"gptty: {exc}", file=stderr)
-                return 1
+                    recorder.event("local_session_state_not_updated", message=str(exc))
+                print(
+                    "gptty: ChatGPT turn completed, but local session state was not "
+                    f"updated: {exc}",
+                    file=stderr,
+                )
 
         if recorder is not None:
             recorder.complete()

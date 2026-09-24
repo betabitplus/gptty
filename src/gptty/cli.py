@@ -33,9 +33,23 @@ def _add_profile_option(parser: argparse.ArgumentParser, *, suppress_default: bo
     )
 
 
+def _add_session_identity_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Reuse an explicit local gptty session. Without this option, interactive "
+            "chat creates an independent runtime session and scripted commands use "
+            "the default session."
+        ),
+    )
+
+
 def _add_session_options(parser: argparse.ArgumentParser) -> None:
     _add_profile_option(parser)
     _add_backend_option(parser)
+    _add_session_identity_option(parser)
     parser.add_argument(
         "--auth",
         default=None,
@@ -273,6 +287,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_profile_option(chat_parser)
     _add_backend_option(chat_parser)
+    _add_session_identity_option(chat_parser)
     chat_parser.add_argument(
         "--legacy",
         action="store_true",

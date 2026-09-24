@@ -3,18 +3,24 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .file_lock import KernelFileLock
 from .profiles import profile_paths
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_FILENAME = "local-state.sqlite3"
 
 
 class LocalStoreCompatibilityError(RuntimeError):
     """Raised when local durable state was written by a newer schema."""
+
+
+class LocalSessionConflictError(RuntimeError):
+    """Raised when a stale session writer would overwrite a newer revision."""
 
 
 def local_store_root(*, profile: str | None, state_path: str | Path) -> Path:
@@ -28,11 +34,16 @@ def local_store_path(*, profile: str | None, state_path: str | Path) -> Path:
 
 
 class LocalEventStore:
-    """Transactional authority for local run and TUI observation events."""
+    """Transactional authority for local sessions and operational event state."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path).expanduser()
-        self._initialize_schema()
+        bootstrap_lock = KernelFileLock(Path(f"{self.db_path}.bootstrap.lock"))
+        bootstrap_lock.acquire(timeout=10.0)
+        try:
+            self._initialize_schema()
+        finally:
+            bootstrap_lock.release()
 
     def create_run(
         self,
@@ -299,6 +310,257 @@ class LocalEventStore:
             if item is not None:
                 result.append((int(row[0]), item))
         return result
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT session_id, revision, kind, discovery_hint,
+                       current_conversation, model, goal_id,
+                       created_at_ms, last_seen_at_ms, imported_from
+                FROM local_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return self._session_row(row)
+
+    def session_imported_from(self, source_path: str | Path) -> bool:
+        source = str(Path(source_path).expanduser().resolve())
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT 1
+                FROM local_session_imports
+                WHERE source_path = ?
+                UNION ALL
+                SELECT 1
+                FROM local_sessions
+                WHERE imported_from = ?
+                LIMIT 1
+                """,
+                (source, source),
+            ).fetchone()
+        return row is not None
+
+    def create_session_claiming_import(
+        self,
+        session_id: str,
+        *,
+        source_path: str | Path,
+        kind: str,
+        discovery_hint: str | None,
+        current_conversation: str | None = None,
+        model: str | None = None,
+        goal_id: str | None = None,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Create one session while atomically claiming a legacy state source.
+
+        Returns ``(session, imported)``. If another distinct session has already
+        claimed the legacy source, ``session`` is ``None`` so the caller can seed
+        from the normal default instead. If this same session was concurrently
+        created by another process, its existing row is returned with
+        ``imported=False``.
+        """
+
+        source = str(Path(source_path).expanduser().resolve())
+        now_ms = int(time.time() * 1000)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                """
+                SELECT session_id, revision, kind, discovery_hint,
+                       current_conversation, model, goal_id,
+                       created_at_ms, last_seen_at_ms, imported_from
+                FROM local_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if existing is not None:
+                db.commit()
+                session = self._session_row(existing)
+                if session is None:
+                    raise RuntimeError(f"failed to read local session: {session_id}")
+                return session, False
+
+            claimed = db.execute(
+                """
+                SELECT session_id
+                FROM local_session_imports
+                WHERE source_path = ?
+                UNION ALL
+                SELECT session_id
+                FROM local_sessions
+                WHERE imported_from = ?
+                LIMIT 1
+                """,
+                (source, source),
+            ).fetchone()
+            if claimed is not None:
+                db.commit()
+                return None, False
+
+            db.execute(
+                """
+                INSERT INTO local_sessions(
+                    session_id, revision, kind, discovery_hint,
+                    current_conversation, model, goal_id,
+                    created_at_ms, last_seen_at_ms, imported_from
+                )
+                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    kind,
+                    discovery_hint,
+                    current_conversation,
+                    model,
+                    goal_id,
+                    now_ms,
+                    now_ms,
+                    source,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO local_session_imports(source_path, session_id, imported_at_ms)
+                VALUES(?, ?, ?)
+                """,
+                (source, session_id, now_ms),
+            )
+            row = db.execute(
+                """
+                SELECT session_id, revision, kind, discovery_hint,
+                       current_conversation, model, goal_id,
+                       created_at_ms, last_seen_at_ms, imported_from
+                FROM local_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            db.commit()
+        session = self._session_row(row)
+        if session is None:
+            raise RuntimeError(f"failed to create local session: {session_id}")
+        return session, True
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        kind: str,
+        discovery_hint: str | None,
+        current_conversation: str | None = None,
+        model: str | None = None,
+        goal_id: str | None = None,
+        imported_from: str | None = None,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT OR IGNORE INTO local_sessions(
+                    session_id, revision, kind, discovery_hint,
+                    current_conversation, model, goal_id,
+                    created_at_ms, last_seen_at_ms, imported_from
+                )
+                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    kind,
+                    discovery_hint,
+                    current_conversation,
+                    model,
+                    goal_id,
+                    now_ms,
+                    now_ms,
+                    imported_from,
+                ),
+            )
+            row = db.execute(
+                """
+                SELECT session_id, revision, kind, discovery_hint,
+                       current_conversation, model, goal_id,
+                       created_at_ms, last_seen_at_ms, imported_from
+                FROM local_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            db.commit()
+        session = self._session_row(row)
+        if session is None:
+            raise RuntimeError(f"failed to create local session: {session_id}")
+        return session
+
+    def save_session(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int,
+        current_conversation: str | None,
+        model: str | None,
+        goal_id: str | None,
+        discovery_hint: str | None = None,
+    ) -> int:
+        now_ms = int(time.time() * 1000)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """
+                UPDATE local_sessions
+                SET revision = revision + 1,
+                    current_conversation = ?,
+                    model = ?,
+                    goal_id = ?,
+                    discovery_hint = COALESCE(?, discovery_hint),
+                    last_seen_at_ms = ?
+                WHERE session_id = ? AND revision = ?
+                """,
+                (
+                    current_conversation,
+                    model,
+                    goal_id,
+                    discovery_hint,
+                    now_ms,
+                    session_id,
+                    int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                actual = db.execute(
+                    "SELECT revision FROM local_sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                db.rollback()
+                if actual is None:
+                    raise LocalSessionConflictError(
+                        f"local session disappeared: {session_id}"
+                    )
+                raise LocalSessionConflictError(
+                    f"local session changed concurrently: {session_id} "
+                    f"expected={expected_revision} actual={int(actual[0])}"
+                )
+            revision = int(expected_revision) + 1
+            db.commit()
+        return revision
+
+    def touch_session(self, session_id: str, *, discovery_hint: str | None = None) -> None:
+        now_ms = int(time.time() * 1000)
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE local_sessions
+                SET last_seen_at_ms = ?,
+                    discovery_hint = COALESCE(?, discovery_hint)
+                WHERE session_id = ?
+                """,
+                (now_ms, discovery_hint, session_id),
+            )
+            db.commit()
 
     def put_pending_tui_event(self, turn_id: str, event: dict[str, Any]) -> None:
         with self._connect() as db:
@@ -612,6 +874,15 @@ class LocalEventStore:
         self._protect_path(self.db_path.parent, directory=True)
         db = self._open_connection()
         try:
+            journal_mode = str(db.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if journal_mode != "wal":
+                journal_mode = str(
+                    db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                ).lower()
+                if journal_mode != "wal":
+                    raise RuntimeError(
+                        f"failed to enable WAL for local state database: {journal_mode}"
+                    )
             current = int(db.execute("PRAGMA user_version").fetchone()[0])
             if current > SCHEMA_VERSION:
                 raise LocalStoreCompatibilityError(
@@ -652,6 +923,30 @@ class LocalEventStore:
                     source_path TEXT PRIMARY KEY,
                     imported_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS local_sessions(
+                    session_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    discovery_hint TEXT,
+                    current_conversation TEXT,
+                    model TEXT,
+                    goal_id TEXT,
+                    created_at_ms INTEGER NOT NULL,
+                    last_seen_at_ms INTEGER NOT NULL,
+                    imported_from TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_local_sessions_kind_seen
+                    ON local_sessions(kind, last_seen_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_local_sessions_imported_from
+                    ON local_sessions(imported_from);
+                CREATE TABLE IF NOT EXISTS local_session_imports(
+                    source_path TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    imported_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_local_session_imports_session_id
+                    ON local_session_imports(session_id);
 
                 CREATE TABLE IF NOT EXISTS tui_events(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -700,11 +995,13 @@ class LocalEventStore:
 
     def _open_connection(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=5.0)
-        db.execute("PRAGMA journal_mode=WAL")
+        # Install the busy handler before any pragma/transaction that may need a
+        # database lock. WAL itself is a persistent database property and is set
+        # once by schema bootstrap rather than on every connection.
+        db.execute("PRAGMA busy_timeout=5000")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA fullfsync=ON")
         db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA busy_timeout=5000")
         return db
 
     def _protect_database_files(self) -> None:
@@ -720,6 +1017,23 @@ class LocalEventStore:
             path.chmod(0o700 if directory else 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _session_row(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "session_id": str(row[0]),
+            "revision": int(row[1]),
+            "kind": str(row[2]),
+            "discovery_hint": str(row[3]) if row[3] is not None else None,
+            "current_conversation": str(row[4]) if row[4] is not None else None,
+            "model": str(row[5]) if row[5] is not None else None,
+            "goal_id": str(row[6]) if row[6] is not None else None,
+            "created_at_ms": int(row[7]),
+            "last_seen_at_ms": int(row[8]),
+            "imported_from": str(row[9]) if row[9] is not None else None,
+        }
 
     @staticmethod
     def _encode(payload: dict[str, Any]) -> str:

@@ -9,13 +9,29 @@ from types import SimpleNamespace
 from gptty.commands import chat as chat_module
 from gptty.commands.chat import run_chat
 from gptty.goal_store import GoalStore
+from gptty.session_state import session_handle
 from gptty.state import (
     ChatState,
     GoalCheckpoint,
     GoalState,
-    load_chat_state,
     save_chat_state,
 )
+
+
+def _load_session_state(state_path):
+    return session_handle(
+        state_path=state_path,
+        profile=None,
+        environ={},
+    ).load()
+
+
+def _load_session_goal(state_path):
+    session = _load_session_state(state_path)
+    assert session.goal_id is not None
+    goal = GoalStore(state_path).load(session.goal_id)
+    assert goal is not None
+    return session, goal
 
 
 class _GoalLoopClient:
@@ -314,11 +330,10 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
     assert [call[0] for call in client.calls] == ["send", "send_to_conversation"]
     assert "GPTTY Goal mode is now active" in client.calls[0][1]
     assert "Continue pursuing the active goal" in client.calls[1][1]
-    state = load_chat_state(tmp_path / "state.json")
+    state, goal = _load_session_goal(tmp_path / "state.json")
     assert state.current_conversation == "conv-goal"
-    assert state.goal is not None
-    assert state.goal.status == "complete"
-    assert state.goal.turn_count == 2
+    assert goal.status == "complete"
+    assert goal.turn_count == 2
     assert normal_notifications == []
     assert goal_notifications == [
         {
@@ -357,11 +372,11 @@ def test_active_goal_is_paused_on_process_restart_and_does_not_auto_resume(
     )
 
     assert code == 0
-    restored = load_chat_state(state_path)
-    assert restored.goal is not None
-    assert restored.goal.status == "paused"
-    assert restored.goal.reason == "gptty restarted while goal was active"
-    assert restored.goal.turn_count == 7
+    restored, goal = _load_session_goal(state_path)
+    assert restored.goal_id == goal.goal_id
+    assert goal.status == "paused"
+    assert goal.reason == "gptty restarted while goal was active"
+    assert goal.turn_count == 7
     assert created == []
 
 
@@ -395,9 +410,9 @@ def test_missing_chat_state_does_not_choose_an_arbitrary_durable_goal(tmp_path) 
     )
 
     assert code == 0
-    restored = load_chat_state(state_path)
+    restored = _load_session_state(state_path)
     assert restored.current_conversation is None
-    assert restored.goal is None
+    assert restored.goal_id is None
     assert {goal.goal_id for goal in store.list_goals(statuses={"active"})} == {
         "goal-recover-a",
         "goal-recover-b",
@@ -437,9 +452,9 @@ def test_corrupt_chat_state_preserves_all_durable_goals_without_guessing_selecti
     )
 
     assert code == 0
-    restored = load_chat_state(state_path)
+    restored = _load_session_state(state_path)
     assert restored.current_conversation is None
-    assert restored.goal is None
+    assert restored.goal_id is None
     assert {goal.goal_id for goal in store.list_goals(statuses={"active"})} == {
         "goal-corrupt-a",
         "goal-corrupt-b",
@@ -529,21 +544,20 @@ def test_goal_hard_chat_limit_rolls_over_to_new_chat_and_completes(
     assert "fresh ChatGPT conversation" in handoff
     assert "Do not repeat completed external actions" in handoff
     assert "user: Keep the API stable and finish the task." in handoff
-    state = load_chat_state(tmp_path / "state.json")
+    state, goal = _load_session_goal(tmp_path / "state.json")
     assert state.current_conversation == "conv-new"
-    assert state.goal is not None
-    assert state.goal.status == "complete"
-    assert state.goal.rollover_count == 1
-    assert state.goal.conversations == ["conv-old", "conv-new"]
-    assert state.goal.checkpoint.decisions == ["keep API stable"]
+    assert goal.status == "complete"
+    assert goal.rollover_count == 1
+    assert goal.conversations == ["conv-old", "conv-new"]
+    assert goal.checkpoint.decisions == ["keep API stable"]
     assert goal_notifications == [
         {
             "chat_title": "Recovered goal",
             "final_response": "Recovered in the new chat and finished safely.",
         }
     ]
-    goal_json = tmp_path / "goals" / state.goal.goal_id / "goal.json"
-    checkpoint = tmp_path / "goals" / state.goal.goal_id / "checkpoint.md"
+    goal_json = tmp_path / "goals" / goal.goal_id / "goal.json"
+    checkpoint = tmp_path / "goals" / goal.goal_id / "checkpoint.md"
     assert goal_json.exists()
     assert checkpoint.exists()
 
@@ -626,10 +640,9 @@ def test_goal_queued_steering_replaces_pending_auto_continuation(
     assert "Prioritize the release notes before finishing" in client.calls[1][1]
     assert "GPTTY Goal mode remains active" in client.calls[1][1]
     assert "Continue pursuing the active goal" not in client.calls[1][1]
-    state = load_chat_state(tmp_path / "state.json")
-    assert state.goal is not None
-    assert state.goal.status == "complete"
-    assert state.goal.turn_count == 2
+    _state, goal = _load_session_goal(tmp_path / "state.json")
+    assert goal.status == "complete"
+    assert goal.turn_count == 2
 
 
 def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
@@ -701,11 +714,10 @@ def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
     assert code == 0, stderr.getvalue()
     client = PauseClient.instances[0]
     assert len(client.calls) == 1
-    state = load_chat_state(tmp_path / "state.json")
-    assert state.goal is not None
-    assert state.goal.status == "paused"
-    assert state.goal.reason == "paused by user"
-    assert state.goal.turn_count == 1
+    _state, goal = _load_session_goal(tmp_path / "state.json")
+    assert goal.status == "paused"
+    assert goal.reason == "paused by user"
+    assert goal.turn_count == 1
     renderer = _FakeRenderer.instances[0]
     assert (
         "info",
@@ -791,7 +803,7 @@ def test_stop_command_while_working_preserves_and_sends_queued_prompt(
     assert client.calls[0] == ("send", "Produce a long response")
     assert client.calls[1] == ("stop_generation", None)
     assert client.calls[2] == ("send_to_conversation", "Queued follow-up should run")
-    state = load_chat_state(tmp_path / "state.json")
+    state = _load_session_state(tmp_path / "state.json")
     assert state.current_conversation == "conv-stop-command"
     renderer = _FakeRenderer.instances[0]
     assert ("info", "Stopping ChatGPT…") in renderer.events
@@ -886,7 +898,7 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
     assert code == 0
     client = IncompleteClient.instances[0]
     assert client.calls == ["Start a tool-heavy turn"]
-    state = load_chat_state(tmp_path / "state.json")
+    state = _load_session_state(tmp_path / "state.json")
     assert state.current_conversation == "conv-incomplete"
     renderer = _FakeRenderer.instances[0]
     assert (
@@ -971,11 +983,10 @@ def test_goal_incomplete_turn_reconciles_same_chat_then_completes(
     recovery_prompt = client.calls[1][1]
     assert "non-standard transport/chat/process state" in recovery_prompt
     assert "Do not blindly repeat the previous action" in recovery_prompt
-    state = load_chat_state(tmp_path / "state.json")
-    assert state.goal is not None
-    assert state.goal.status == "complete"
-    assert state.goal.turn_count == 2
-    assert state.goal.checkpoint.completed == ["verified prior side effect"]
+    _state, goal = _load_session_goal(tmp_path / "state.json")
+    assert goal.status == "complete"
+    assert goal.turn_count == 2
+    assert goal.checkpoint.completed == ["verified prior side effect"]
 
 
 def test_resume_loading_queues_text_without_concurrent_cwa_request(
@@ -1062,9 +1073,7 @@ def test_resume_loading_queues_text_without_concurrent_cwa_request(
         ("snapshot", "conv-resume"),
         ("send_to_conversation", "conv-resume"),
     ]
-    assert (
-        load_chat_state(tmp_path / "state.json").current_conversation == "conv-resume"
-    )
+    assert _load_session_state(tmp_path / "state.json").current_conversation == "conv-resume"
 
 
 def test_unfinished_resume_follows_live_events_without_blocking_prompt(
@@ -2341,7 +2350,7 @@ def test_exit_during_resume_loading_does_not_wait_for_snapshot(
 
     assert code == 0
     assert BlockingResumeClient.snapshot_started.is_set()
-    assert load_chat_state(tmp_path / "state.json").current_conversation is None
+    assert _load_session_state(tmp_path / "state.json").current_conversation is None
 
 
 def test_unfinished_resume_returns_to_prompt_without_polling(
@@ -2400,7 +2409,7 @@ def test_unfinished_resume_returns_to_prompt_without_polling(
     assert code == 0
     client = UnfinishedResumeClient.instances[0]
     assert client.calls == [("snapshot", "conv-stale")]
-    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"
+    assert _load_session_state(tmp_path / "state.json").current_conversation == "conv-stale"
 
 
 def test_resume_terminal_backend_override_does_not_enter_follow(
@@ -2490,7 +2499,7 @@ def test_resume_terminal_backend_override_does_not_enter_follow(
     assert "Following active response in background…" not in infos
     warnings = [str(event[1]) for event in renderer.events if event[0] == "warning"]
     assert not any("unfinished turn" in warning for warning in warnings)
-    assert load_chat_state(tmp_path / "state.json").current_conversation == "conv-stale"
+    assert _load_session_state(tmp_path / "state.json").current_conversation == "conv-stale"
 
 
 def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
@@ -2817,10 +2826,10 @@ def test_goal_transport_tool_evidence_is_in_reconciliation_prompt_after_incomple
     assert "touch durable-marker.txt" in recovery
     assert "tool_result_observed" in recovery
     assert "do not blindly repeat" in recovery.lower()
-    final_state = load_chat_state(tmp_path / "state.json")
-    assert final_state.goal is not None
-    assert final_state.goal.status == "complete"
-    events = GoalStore(tmp_path / "state.json").events(final_state.goal)
+    final_state, goal = _load_session_goal(tmp_path / "state.json")
+    assert final_state.goal_id == goal.goal_id
+    assert goal.status == "complete"
+    events = GoalStore(tmp_path / "state.json").events(goal)
     assert [event["type"] for event in events].count("tool_call_observed") == 1
     assert [event["type"] for event in events].count("tool_result_observed") == 1
 
@@ -3026,7 +3035,7 @@ def test_restart_binds_fresh_chat_from_machine_write_commit_before_pausing_goal(
     assert recovered.status == "paused"
     assert recovered.conversation_ref == "conv-fresh-12345678"
     assert recovered.conversations == ["conv-old-12345678", "conv-fresh-12345678"]
-    chat_state = load_chat_state(state_path)
+    chat_state = _load_session_state(state_path)
     assert chat_state.current_conversation == "conv-fresh-12345678"
     types = [event["type"] for event in store.events(recovered)]
     assert "conversation_bound_from_journal" in types
@@ -3073,4 +3082,4 @@ def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidenc
     assert recovered is not None
     assert recovered.status == "paused"
     assert recovered.conversation_ref is None
-    assert load_chat_state(state_path).current_conversation is None
+    assert _load_session_state(state_path).current_conversation is None

@@ -17,12 +17,8 @@ from gptty.commands.chat import (
     response_terminal_error,
     run_chat,
 )
-from gptty.state import (
-    ChatState,
-    load_chat_state,
-    save_chat_state,
-    session_chat_state_path,
-)
+from gptty.session_state import session_handle
+from gptty.state import ChatState, load_chat_state, save_chat_state
 from gptty.tui_archive import TUIArchive
 from gptty.ui.signals import TurnControlSignals
 
@@ -86,6 +82,19 @@ def make_args(tmp_path, **overrides: Any) -> Namespace:
     return Namespace(**values)
 
 
+def _load_command_session(
+    tmp_path,
+    *,
+    explicit_session: str | None = None,
+) -> ChatState:
+    return session_handle(
+        state_path=tmp_path / "gptty_state.json",
+        profile=None,
+        explicit_session=explicit_session,
+        environ={},
+    ).load()
+
+
 
 
 def test_terminal_sessions_keep_independent_chat_selection_on_shared_profile(
@@ -112,9 +121,7 @@ def test_terminal_sessions_keep_independent_chat_selection_on_shared_profile(
         client_factory=SessionAClient,
         stdout=StringIO(),
     ) == 0
-    path_a = session_chat_state_path(
-        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "session-A"}
-    )
+    state_a = _load_command_session(tmp_path, explicit_session="session-A")
 
     monkeypatch.setenv("GPTTY_SESSION_ID", "session-B")
     assert run_chat(
@@ -123,15 +130,12 @@ def test_terminal_sessions_keep_independent_chat_selection_on_shared_profile(
         client_factory=SessionBClient,
         stdout=StringIO(),
     ) == 0
-    path_b = session_chat_state_path(
-        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "session-B"}
-    )
+    state_b = _load_command_session(tmp_path, explicit_session="session-B")
 
-    assert path_a != path_b
-    assert load_chat_state(path_a).current_conversation == "conv-A"
-    assert load_chat_state(path_b).current_conversation == "conv-B"
+    assert state_a.current_conversation == "conv-A"
+    assert state_b.current_conversation == "conv-B"
+    assert _load_command_session(tmp_path).current_conversation is None
     assert load_chat_state(base).current_conversation is None
-    assert (tmp_path / "goals") == (path_a.parent / "goals") == (path_b.parent / "goals")
 
 
 def test_new_terminal_session_seeds_from_legacy_base_state_once(tmp_path, monkeypatch) -> None:
@@ -146,13 +150,11 @@ def test_new_terminal_session_seeds_from_legacy_base_state_once(tmp_path, monkey
         stdout=StringIO(),
     ) == 0
 
-    scoped = session_chat_state_path(
-        base, input_stream=StringIO(), environ={"GPTTY_SESSION_ID": "migrated-session"}
-    )
-    assert scoped.exists()
-    assert load_chat_state(scoped).current_conversation == "legacy-conv"
-    assert load_chat_state(scoped).model == "legacy-model"
+    migrated = _load_command_session(tmp_path, explicit_session="migrated-session")
+    assert migrated.current_conversation == "legacy-conv"
+    assert migrated.model == "legacy-model"
     assert load_chat_state(base).current_conversation == "legacy-conv"
+    assert not list(tmp_path.glob("gptty_state.session-*.json"))
 
 def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
@@ -181,9 +183,7 @@ def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     ]
     assert callable(client.calls[0][2]["on_token"])
     assert callable(client.calls[0][2]["on_event"])
-    assert (
-        load_chat_state(tmp_path / "gptty_state.json").current_conversation == "conv-1"
-    )
+    assert _load_command_session(tmp_path).current_conversation == "conv-1"
 
 
 def test_first_prompt_persists_nested_cwa_conversation_shape(tmp_path) -> None:
@@ -204,10 +204,54 @@ def test_first_prompt_persists_nested_cwa_conversation_shape(tmp_path) -> None:
     )
 
     assert code == 0
-    assert (
-        load_chat_state(tmp_path / "gptty_state.json").current_conversation
-        == "nested-conv"
+    assert _load_command_session(tmp_path).current_conversation == "nested-conv"
+
+
+
+
+def test_chat_stops_locally_after_successful_turn_when_session_cas_conflicts(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    seed = session_handle(
+        state_path=state_path,
+        profile=None,
+        environ={},
     )
+    seed_state = seed.load()
+    seed_state.current_conversation = None
+    seed.save(seed_state)
+
+    class ConcurrentClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any) -> Response:
+            self.calls.append(("send", (prompt,), options))
+            winner = session_handle(
+                state_path=state_path,
+                profile=None,
+                environ={},
+            )
+            winner_state = winner.load()
+            winner_state.current_conversation = "concurrent-winner"
+            winner.save(winner_state)
+            return Response(text="first completed", conversation_id="remote-new")
+
+    ConcurrentClient.instances.clear()
+    stderr = StringIO()
+    stdout = StringIO()
+    code = run_chat(
+        make_args(tmp_path, no_stream=True),
+        input_stream=StringIO("first\nsecond\n/exit\n"),
+        client_factory=ConcurrentClient,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert code == 0
+    client = ConcurrentClient.instances[0]
+    assert [call[1][0] for call in client.calls] == ["first"]
+    assert "first completed" in stdout.getvalue()
+    assert "local session state was not updated" in stderr.getvalue()
+    assert _load_command_session(tmp_path).current_conversation == "concurrent-winner"
 
 
 def test_response_model_diagnostics_reads_cwa_request_metadata() -> None:
@@ -584,7 +628,7 @@ def test_new_command_clears_conversation_without_sdk_init(tmp_path) -> None:
 
     assert code == 0
     assert stdout.getvalue() == "Started a new chat.\n"
-    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation is None
+    assert _load_command_session(tmp_path).current_conversation is None
     assert FakeGpttyClient.instances == []
 
 
@@ -645,7 +689,7 @@ def test_no_stream_passes_stream_false_and_prints_response_text(tmp_path) -> Non
         ("hello",),
         {"stream": False, "model": "gpt-4o"},
     )
-    assert load_chat_state(tmp_path / "gptty_state.json").model == "gpt-4o"
+    assert _load_command_session(tmp_path).model == "gpt-4o"
 
 
 def test_completed_enhanced_turn_notifies_with_chat_and_final_response(

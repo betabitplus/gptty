@@ -35,13 +35,8 @@ from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, e
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
-from ..state import (
-    ChatState,
-    StateError,
-    load_chat_state,
-    save_chat_state,
-    session_chat_state_path,
-)
+from ..session_state import SessionStateError, session_handle_for_args
+from ..state import ChatState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from ..ui.commands import (
     UNFINISHED_STATUSES,
@@ -655,25 +650,35 @@ def run_chat(
     stderr: TextIO = sys.stderr,
 ) -> int:
     base_state_path = Path(getattr(args, "state", "gptty_state.json"))
-    state_path = session_chat_state_path(
-        base_state_path,
+    state_path = base_state_path
+    interactive = _is_interactive(input_stream)
+    state_handle = session_handle_for_args(
+        args,
+        interactive=interactive,
         input_stream=input_stream,
     )
     goal_store = GoalStore(base_state_path)
     runner_id = uuid.uuid4().hex
-    state_load_error: StateError | None = None
-    state_source_path = state_path if state_path.exists() else base_state_path
+    state_load_error: SessionStateError | None = None
     try:
-        state = load_chat_state(state_source_path)
-    except StateError as exc:
-        # Goal state is independently durable. A corrupt local UI-state file must
-        # not force an arbitrary Goal to become "current" in a multi-Goal profile.
+        state = state_handle.load()
+    except SessionStateError as exc:
+        # Transactional session authority itself failed. Goal state is independently
+        # durable, so do not guess a current Goal from profile-wide records.
         state_load_error = exc
         state = ChatState()
         print(
             f"gptty: local chat state could not be loaded; durable Goals are preserved ({exc})",
             file=stderr,
         )
+    else:
+        if state_handle.migration_warning is not None:
+            state_load_error = SessionStateError(str(state_handle.migration_warning))
+            print(
+                "gptty: legacy chat state could not be imported; "
+                f"durable Goals are preserved ({state_handle.migration_warning})",
+                file=stderr,
+            )
 
     # Import a legacy Goal cached in pre-v3 chat state before conversation routing.
     cached_goal_id = state.goal.goal_id if state.goal is not None else None
@@ -828,7 +833,7 @@ def run_chat(
                 recovery_lock.release()
 
     try:
-        save_chat_state(state_path, state)
+        state_handle.save(state)
     except StateError as exc:
         # The authoritative Goal transaction has already succeeded. Preserve it and
         # fail this local session rather than rolling Goal state back incorrectly.
@@ -842,13 +847,12 @@ def run_chat(
     if model and model != state.model:
         state.model = model
         try:
-            save_chat_state(state_path, state)
+            state_handle.save(state)
         except StateError as exc:
             print(f"gptty: {exc}", file=stderr)
             return 1
 
     client: Any | None = None
-    interactive = _is_interactive(input_stream)
     enhanced, ui_settings = should_use_enhanced_ui(
         input_stream=input_stream,
         output_stream=stdout,
@@ -906,6 +910,7 @@ def run_chat(
             renderer=renderer,
             tui_archive=tui_archive,
             runner_id=runner_id,
+            save_state=state_handle.save,
         )
         renderer.header(
             profile=getattr(args, "profile", None),
@@ -1012,6 +1017,7 @@ def run_chat(
                         prompt,
                         state=state,
                         state_path=state_path,
+                        save_state=state_handle.save,
                         stdout=stdout,
                         stderr=stderr,
                     )
@@ -1071,6 +1077,7 @@ def run_chat(
                 turn_client,
                 state=state,
                 state_path=state_path,
+                save_state=state_handle.save,
                 profile=getattr(args, "profile", None),
                 prompt=prompt,
                 model=state.model,
@@ -1125,6 +1132,10 @@ def run_chat(
                     )
                 interactive_commands.close()
             return code
+        if turn_result.get("local_session_state_not_updated"):
+            if interactive_commands is not None:
+                interactive_commands.close()
+            return 0
         if interactive_commands is not None and media:
             interactive_commands.clear_pending_media()
         if interactive_commands is not None and goal_turn:
@@ -2362,6 +2373,7 @@ def _start_enhanced_turn(
             get_client(),
             state=state,
             state_path=state_path,
+            save_state=commands.persist_chat_state,
             profile=getattr(args, "profile", None),
             prompt=prompt,
             model=state.model,
@@ -2641,6 +2653,7 @@ def _handle_chat_command(
     *,
     state: ChatState,
     state_path: Path,
+    save_state: Callable[[ChatState], None] | None = None,
     stdout: TextIO,
     stderr: TextIO,
 ) -> int | None:
@@ -2651,8 +2664,9 @@ def _handle_chat_command(
         return None
     if command == "/new":
         state.current_conversation = None
+        persist_state = save_state or partial(save_chat_state, state_path)
         try:
-            save_chat_state(state_path, state)
+            persist_state(state)
         except StateError as exc:
             print(f"gptty: {exc}", file=stderr)
             return 1
@@ -2670,6 +2684,7 @@ def _send_chat_prompt(
     *,
     state: ChatState,
     state_path: Path,
+    save_state: Callable[[ChatState], None] | None = None,
     profile: str | None,
     prompt: str,
     model: str | None,
@@ -2709,6 +2724,7 @@ def _send_chat_prompt(
     controls = turn_controls or TurnControlSignals()
     if conversation_mode not in {"normal", "temporary"}:
         raise ValueError(f"unsupported conversation mode: {conversation_mode}")
+    persist_state = save_state or partial(save_chat_state, state_path)
     is_temporary = conversation_mode == "temporary"
     active_ref = attached_ref if is_temporary else state.current_conversation
     if active_ref and not is_temporary:
@@ -2821,7 +2837,7 @@ def _send_chat_prompt(
         state.current_conversation = write_conversation_ref
         active_ref = write_conversation_ref
         try:
-            save_chat_state(state_path, state)
+            persist_state(state)
         except StateError as exc:
             if renderer is not None:
                 renderer.warning(str(exc))
@@ -2981,7 +2997,7 @@ def _send_chat_prompt(
                     if not is_temporary and not state.current_conversation:
                         state.current_conversation = active_ref
                         try:
-                            save_chat_state(state_path, state)
+                            persist_state(state)
                         except StateError as exc:
                             renderer.warning(str(exc))
                 if on_stop_confirmed is not None:
@@ -3195,12 +3211,23 @@ def _send_chat_prompt(
         elif conversation_ref and conversation_ref != state.current_conversation:
             state.current_conversation = conversation_ref
             try:
-                save_chat_state(state_path, state)
+                persist_state(state)
             except StateError as exc:
+                message = (
+                    "ChatGPT turn completed, but local session state was not updated: "
+                    f"{exc}"
+                )
                 if recorder is not None:
-                    recorder.fail(str(exc))
-                print(f"gptty: {exc}", file=stderr)
-                return 1
+                    recorder.event(
+                        "local_session_state_not_updated",
+                        message=str(exc),
+                    )
+                if result_out is not None:
+                    result_out["local_session_state_not_updated"] = str(exc)
+                if renderer is not None:
+                    renderer.warning(message)
+                else:
+                    print(f"gptty: {message}", file=stderr)
 
         if (
             renderer is not None

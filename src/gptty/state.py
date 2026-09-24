@@ -67,6 +67,7 @@ class GoalState:
 class ChatState:
     current_conversation: str | None = None
     model: str | None = None
+    goal_id: str | None = None
     goal: GoalState | None = None
 
 
@@ -80,13 +81,12 @@ def session_chat_state_path(
     input_stream: TextIO | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Path:
-    """Return a terminal/session-scoped ChatState path when identity is available.
+    """Return the pre-SQLite terminal-scoped state path for migration only.
 
-    Goal authority intentionally remains profile-wide in ``<parent>/goals``. Only
-    local UI selection (current conversation/model/cached Goal) is scoped here so
-    concurrent terminal surfaces cannot overwrite each other's recovery pointer.
-    ``GPTTY_SESSION_ID`` is an explicit override and also works for scripted
-    acceptance. Automatic terminal identities are used only for an actual TTY.
+    Current local session authority lives in the transactional session registry.
+    This helper reproduces the historical sibling filename so ``session_state`` can
+    import an existing per-terminal selection exactly once during upgrade. New
+    runtime writes must not use the returned JSON path as authoritative state.
     """
     base = Path(base_path)
     env = os.environ if environ is None else environ
@@ -142,10 +142,15 @@ def load_chat_state(path: str | Path) -> ChatState:
             f"failed to load state from {state_path}: expected JSON object"
         )
 
+    goal = goal_state_from_dict(data.get("goal"))
+    goal_id = _optional_str(data.get("goal_id"))
+    if goal_id is None and goal is not None:
+        goal_id = goal.goal_id
     return ChatState(
         current_conversation=_optional_str(data.get("current_conversation")),
         model=_optional_str(data.get("model")),
-        goal=goal_state_from_dict(data.get("goal")),
+        goal_id=goal_id,
+        goal=goal,
     )
 
 
@@ -155,6 +160,8 @@ def save_chat_state(path: str | Path, state: ChatState) -> None:
         f".{state_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
     data = asdict(state)
+    if data.get("goal_id") is None:
+        data.pop("goal_id", None)
     if data.get("goal") is None:
         data.pop("goal", None)
     payload = json.dumps(data, indent=2, sort_keys=True) + "\n"

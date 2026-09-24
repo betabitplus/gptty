@@ -4,8 +4,9 @@ from argparse import Namespace
 from io import StringIO
 from typing import Any
 
+import gptty.commands.attach as attach_command
 from gptty.commands.attach import extract_attached_ref, run_attach
-from gptty.state import load_chat_state
+from gptty.session_state import SessionStateError, session_handle
 
 
 class Response:
@@ -55,13 +56,16 @@ def test_attach_calls_sdk_and_saves_conversation(tmp_path) -> None:
     assert client.calls == [
         ("attach_conversation", ("https://chatgpt.com/c/input",), {}),
     ]
-    assert load_chat_state(tmp_path / "gptty_state.json").current_conversation == (
-        "https://chatgpt.com/c/attached"
-    )
+    state = session_handle(
+        state_path=tmp_path / "gptty_state.json",
+        profile=None,
+        environ={},
+    ).load()
+    assert state.current_conversation == "https://chatgpt.com/c/attached"
     assert stdout.getvalue() == "Attached conversation: https://chatgpt.com/c/attached\n"
 
 
-def test_attach_returns_1_on_state_error(tmp_path) -> None:
+def test_attach_recovers_from_corrupt_legacy_state_with_visible_warning(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
     state_path = tmp_path / "bad_state.json"
     state_path.write_text("{", encoding="utf-8")
@@ -74,8 +78,35 @@ def test_attach_returns_1_on_state_error(tmp_path) -> None:
         stderr=stderr,
     )
 
+    assert code == 0
+    assert "legacy chat state could not be imported" in stderr.getvalue()
+    state = session_handle(
+        state_path=state_path,
+        profile=None,
+        environ={},
+    ).load()
+    assert state.current_conversation == "https://chatgpt.com/c/attached"
+
+
+def test_attach_returns_1_on_transactional_state_error(monkeypatch, tmp_path) -> None:
+    FakeGpttyClient.instances.clear()
+
+    def fail(*args, **kwargs):
+        raise SessionStateError("local session database failed")
+
+    monkeypatch.setattr(attach_command, "load_command_session", fail)
+    stderr = StringIO()
+
+    code = run_attach(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
     assert code == 1
-    assert "failed to load state" in stderr.getvalue()
+    assert FakeGpttyClient.instances == []
+    assert "local session database failed" in stderr.getvalue()
 
 
 def test_extract_attached_ref_falls_back_to_input() -> None:
