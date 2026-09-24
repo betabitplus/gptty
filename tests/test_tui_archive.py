@@ -180,6 +180,173 @@ def test_chat_level_terminal_marker_is_persistent_but_turn_marker_is_not(
         "stream",
     )
 
+def test_chat_terminal_resolution_is_append_only_and_restart_safe(tmp_path) -> None:
+    root = tmp_path / "archive"
+    archive = TUIArchive(root)
+    conversation = "conv-resolution"
+
+    archive.record_observed_terminal(
+        conversation_ref=conversation,
+        label="chat",
+        status="unavailable",
+        text="ChatGPT web UI cannot load this conversation.",
+        source="web-ui",
+    )
+    assert archive.conversation_terminal_marker(conversation) == (
+        "chat",
+        "unavailable",
+        "ChatGPT web UI cannot load this conversation.",
+        "web-ui",
+    )
+
+    assert archive.record_chat_terminal_resolution(
+        conversation_ref=conversation,
+        resolved_status="unavailable",
+        source="canonical-read",
+    ) is True
+    assert archive.conversation_terminal_marker(conversation) is None
+
+    events = archive.store.tui_events(conversation)
+    assert events[-1]["terminal_resolution"] is True
+    assert events[-1]["resolved_status"] == "unavailable"
+    assert events[-1]["terminal_source"] == "canonical-read"
+    transcript = archive.conversation_paths(conversation)["transcript"].read_text(
+        encoding="utf-8"
+    )
+    assert "Newer canonical evidence superseded" not in transcript
+    assert "## CHAT — resolved" not in transcript
+    assert any(
+        event.get("status") == "unavailable"
+        and event.get("role") == "chat"
+        for event in events[:-1]
+    )
+
+    restarted = TUIArchive(root, db_path=archive.store.db_path)
+    assert restarted.conversation_terminal_marker(conversation) is None
+    rebuilt_transcript = restarted.conversation_paths(conversation)[
+        "transcript"
+    ].read_text(encoding="utf-8")
+    assert "Newer canonical evidence superseded" not in rebuilt_transcript
+    assert "## CHAT — resolved" not in rebuilt_transcript
+
+    # The same semantic observation is valid again after a resolution. Historical
+    # dedupe must not suppress a new recurrence of the current terminal state.
+    restarted.record_observed_terminal(
+        conversation_ref=conversation,
+        label="chat",
+        status="unavailable",
+        text="ChatGPT web UI cannot load this conversation.",
+        source="web-ui",
+    )
+    assert restarted.conversation_terminal_marker(conversation) == (
+        "chat",
+        "unavailable",
+        "ChatGPT web UI cannot load this conversation.",
+        "web-ui",
+    )
+
+    restarted.record_observed_terminal(
+        conversation_ref=conversation,
+        label="chat",
+        status="unavailable",
+        text="Unavailable again after a later observation.",
+        source="web-ui",
+    )
+    assert restarted.conversation_terminal_marker(conversation) == (
+        "chat",
+        "unavailable",
+        "Unavailable again after a later observation.",
+        "web-ui",
+    )
+
+
+def test_chat_terminal_resolution_requires_matching_current_status(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    conversation = "conv-limit"
+
+    archive.record_observed_terminal(
+        conversation_ref=conversation,
+        label="chat",
+        status="limit-reached",
+        text="This conversation reached its maximum length.",
+        source="web-ui",
+    )
+
+    assert archive.record_chat_terminal_resolution(
+        conversation_ref=conversation,
+        resolved_status="unavailable",
+        source="canonical-read",
+    ) is False
+    assert archive.conversation_terminal_marker(conversation) == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its maximum length.",
+        "web-ui",
+    )
+
+
+def test_terminal_resolution_cannot_hide_newer_concurrent_chat_marker(tmp_path) -> None:
+    root = tmp_path / "archive"
+    first = TUIArchive(root)
+    second = TUIArchive(root, db_path=first.store.db_path)
+
+    for index in range(20):
+        conversation = f"conv-race-{index}"
+        first.record_observed_terminal(
+            conversation_ref=conversation,
+            label="chat",
+            status="unavailable",
+            text=f"unavailable-{index}",
+            source="stream",
+        )
+
+        barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def resolve() -> None:
+            try:
+                barrier.wait(timeout=2)
+                first.record_chat_terminal_resolution(
+                    conversation_ref=conversation,
+                    resolved_status="unavailable",
+                    source="canonical-read",
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        def record_new_terminal() -> None:
+            try:
+                barrier.wait(timeout=2)
+                second.record_observed_terminal(
+                    conversation_ref=conversation,
+                    label="chat",
+                    status="limit-reached",
+                    text=f"limit-{index}",
+                    source="web-ui",
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=resolve),
+            threading.Thread(target=record_new_terminal),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=2)
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+        assert not errors
+        assert first.conversation_terminal_marker(conversation) == (
+            "chat",
+            "limit-reached",
+            f"limit-{index}",
+            "web-ui",
+        )
+
+
 def test_run_and_tui_archive_share_one_transactional_store(tmp_path) -> None:
     state_path = tmp_path / "gptty_state.json"
     db_path = local_store_path(profile=None, state_path=state_path)

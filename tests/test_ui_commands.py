@@ -428,6 +428,193 @@ def test_resume_switches_while_already_attached_without_detach(tmp_path) -> None
     assert load_chat_state(state_path).current_conversation == "conv-2"
 
 
+def _seed_chat_terminal(
+    archive: TUIArchive,
+    conversation: str,
+    *,
+    status: str,
+    text: str,
+    source: str = "stream",
+) -> None:
+    archive.record_observed_terminal(
+        conversation_ref=conversation,
+        label="chat",
+        status=status,
+        text=text,
+        source=source,
+    )
+
+
+def test_fresh_resume_supersedes_stale_local_unavailable_marker(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-direct",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "answer"},
+        ],
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert archive.conversation_terminal_marker("conv-direct") is None
+    assert not any(
+        kind == "turn_marker"
+        and event.get("label") == "chat"
+        and event.get("status") == "unavailable"
+        for kind, event in renderer.events
+        if isinstance(event, dict)
+    )
+    events = archive.store.tui_events("conv-direct")
+    assert events[-1]["terminal_resolution"] is True
+    assert events[-1]["resolved_status"] == "unavailable"
+    assert events[-1]["terminal_source"] == "canonical-read"
+
+
+def test_cached_resume_does_not_supersede_unavailable_marker(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-direct",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "cached answer"},
+        ],
+        "canonical_cache_stale": True,
+        "canonical_cache_age_seconds": 30,
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert archive.conversation_terminal_marker("conv-direct") == (
+        "chat",
+        "unavailable",
+        "This conversation was previously unavailable.",
+        "stream",
+    )
+    assert (
+        "turn_marker",
+        {
+            "label": "chat",
+            "status": "unavailable",
+            "message": "This conversation was previously unavailable.",
+        },
+    ) in renderer.events
+
+
+def test_fresh_resume_does_not_treat_readability_as_limit_resolution(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-direct",
+        status="limit-reached",
+        text="This conversation reached its maximum length.",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "final answer"},
+        ],
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert archive.conversation_terminal_marker("conv-direct") == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its maximum length.",
+        "stream",
+    )
+    assert (
+        "turn_marker",
+        {
+            "label": "chat",
+            "status": "limit-reached",
+            "message": "This conversation reached its maximum length.",
+        },
+    ) in renderer.events
+
+
+def test_current_web_ui_unavailable_prevents_canonical_supersession(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-direct",
+        status="unavailable",
+        text="Older local unavailable marker.",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+        ],
+        "historical_ui_state": {
+            "code": "conversation_unavailable",
+            "scope": "chat",
+            "status": "unavailable",
+            "detail": "ChatGPT web UI cannot load this conversation.",
+            "source": "web-ui",
+        },
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert archive.conversation_terminal_marker("conv-direct") == (
+        "chat",
+        "unavailable",
+        "ChatGPT web UI cannot load this conversation.",
+        "web-ui",
+    )
+    assert (
+        "turn_marker",
+        {
+            "label": "chat",
+            "status": "unavailable",
+            "message": "ChatGPT web UI cannot load this conversation.",
+        },
+    ) in renderer.events
+
+
 def test_resume_direct_ref_skips_catalog_picker(tmp_path) -> None:
     commands, _, client, state_path = make_commands(tmp_path)
 

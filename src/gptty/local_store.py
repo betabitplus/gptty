@@ -758,22 +758,72 @@ class LocalEventStore:
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = db.execute(
+            current = db.execute(
                 """
-                SELECT 1
+                SELECT status, text_value, terminal_source
                 FROM tui_events
                 WHERE conversation_id = ?
                   AND role = ?
-                  AND status = ?
-                  AND text_value = ?
-                  AND terminal_source = ?
+                  AND status <> ''
+                  AND text_value <> ''
+                ORDER BY id DESC
                 LIMIT 1
                 """,
-                (conversation_id, role, status, text, source),
+                (conversation_id, role),
             ).fetchone()
-            if existing is not None:
+            if current is not None and (
+                str(current[0] or "") == status
+                and str(current[1] or "") == text
+                and str(current[2] or "") == source
+            ):
                 db.commit()
                 return False
+            cursor = self._insert_tui_event_row(db, conversation_id, event)
+            inserted = cursor.rowcount == 1
+            db.commit()
+            return inserted
+
+    def insert_tui_terminal_resolution_if_current(
+        self,
+        conversation_id: str,
+        event: dict[str, Any],
+        *,
+        resolved_status: str,
+    ) -> bool:
+        """Atomically supersede one current chat-level terminal status."""
+
+        expected_status = str(resolved_status or "").strip().lower()
+        if not expected_status:
+            raise ValueError("resolved_status is required")
+        if event.get("terminal_resolution") is not True:
+            raise ValueError("terminal resolution event must declare terminal_resolution")
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """
+                SELECT status, payload_json
+                FROM tui_events
+                WHERE conversation_id = ?
+                  AND lower(role) = 'chat'
+                  AND status <> ''
+                  AND text_value <> ''
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            current_payload = self._decode_dict(row[1]) if row is not None else None
+            current_status = str(row[0] or "").strip().lower() if row is not None else ""
+            if (
+                row is None
+                or current_payload is None
+                or current_payload.get("terminal_resolution") is True
+                or current_status != expected_status
+            ):
+                db.commit()
+                return False
+
             cursor = self._insert_tui_event_row(db, conversation_id, event)
             inserted = cursor.rowcount == 1
             db.commit()

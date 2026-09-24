@@ -387,6 +387,32 @@ class InteractiveCommands:
                 )
             except Exception:
                 persistent_chat_marker = None
+
+            fresh_canonical_read = not (
+                isinstance(snapshot, dict)
+                and snapshot.get("canonical_cache_stale") is True
+            )
+            current_ui_confirms_unavailable = bool(
+                historical_ui_marker is not None
+                and historical_ui_marker[0] == "chat"
+                and historical_ui_marker[1] == "unavailable"
+            )
+            if (
+                persistent_chat_marker is not None
+                and persistent_chat_marker[1] == "unavailable"
+                and fresh_canonical_read
+                and not current_ui_confirms_unavailable
+            ):
+                try:
+                    resolved = self.tui_archive.record_chat_terminal_resolution(
+                        conversation_ref=attached_ref,
+                        resolved_status="unavailable",
+                        source="canonical-read",
+                    )
+                except Exception:
+                    resolved = False
+                if resolved:
+                    persistent_chat_marker = None
         if persistent_chat_marker is not None:
             self.renderer.turn_marker(*persistent_chat_marker[:3])
         elif historical_ui_marker is not None:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import patch_stdout
+from chatgpt_web_adapter.types import ConversationRef
 
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
@@ -311,6 +312,18 @@ CONVERSATION_REF_FIELDS = (
     "url",
     "id",
 )
+
+
+def _same_conversation_ref(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return (
+            ConversationRef.from_any(left).conversation_id
+            == ConversationRef.from_any(right).conversation_id
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def extract_conversation_ref(response: Any) -> str | None:
@@ -3040,6 +3053,7 @@ def _send_chat_prompt(
         )
         terminal_observed, terminal_source = response_terminal_diagnostics(response)
         terminal_error_code, terminal_error = response_terminal_error(response)
+        response_conversation_ref = extract_conversation_ref(response)
         terminal_marker = _turn_terminal_marker(
             finish_reason=finish_reason,
             terminal_observed=terminal_observed,
@@ -3047,9 +3061,9 @@ def _send_chat_prompt(
             terminal_error=terminal_error,
             stopped_by_user=stopped_by_user,
         )
+        persistent_marker: tuple[str, str, str, str | None] | None = None
         if (
-            terminal_marker is None
-            and not stopped_by_user
+            not stopped_by_user
             and not is_temporary
             and tui_archive is not None
             and active_ref
@@ -3058,9 +3072,29 @@ def _send_chat_prompt(
                 persistent_marker = tui_archive.conversation_terminal_marker(active_ref)
             except Exception:
                 persistent_marker = None
-            if persistent_marker is not None:
-                terminal_marker = persistent_marker[:3]
-                terminal_source = "conversation_archive"
+
+            if (
+                persistent_marker is not None
+                and persistent_marker[0] == "chat"
+                and persistent_marker[1] in {"unavailable", "limit-reached"}
+                and terminal_observed is True
+                and not str(terminal_error_code or "").strip()
+                and _same_conversation_ref(active_ref, response_conversation_ref)
+            ):
+                try:
+                    resolved = tui_archive.record_chat_terminal_resolution(
+                        conversation_ref=active_ref,
+                        resolved_status=persistent_marker[1],
+                        source=terminal_source or "terminal-turn",
+                    )
+                except Exception:
+                    resolved = False
+                if resolved:
+                    persistent_marker = None
+
+        if terminal_marker is None and persistent_marker is not None:
+            terminal_marker = persistent_marker[:3]
+            terminal_source = "conversation_archive"
         incomplete_turn = finish_reason == "incomplete"
         abnormal_turn = terminal_marker is not None
         if renderer is not None:

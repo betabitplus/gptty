@@ -199,16 +199,62 @@ class TUIArchive:
                 return
             self._project_inserted_event(conversation_id, event)
 
+    def record_chat_terminal_resolution(
+        self,
+        *,
+        conversation_ref: str,
+        resolved_status: str,
+        source: str,
+    ) -> bool:
+        """Append proof that newer evidence superseded one chat-level marker."""
+
+        normalized_status = str(resolved_status or "").strip()
+        normalized_source = str(source or "").strip()
+        if not normalized_status or not normalized_source:
+            return False
+
+        conversation_id = _conversation_id(conversation_ref)
+        self._ensure_conversation_imported(conversation_id)
+
+        turn_id = uuid.uuid4().hex
+        event = {
+            "schema": 1,
+            "event_id": f"{turn_id}:terminal-resolution",
+            "turn_id": turn_id,
+            "observed_at": _now_iso(),
+            "source": "gptty-tui",
+            "scope": "tui-observed",
+            "role": "chat",
+            "text": (
+                "Newer canonical evidence superseded the prior local "
+                f"chat-level {normalized_status} marker."
+            ),
+            "status": "resolved",
+            "terminal_source": normalized_source,
+            "terminal_resolution": True,
+            "resolved_status": normalized_status,
+            "conversation_id": conversation_id,
+        }
+        with self._projection_guard(conversation_id):
+            if not self.store.insert_tui_terminal_resolution_if_current(
+                conversation_id,
+                event,
+                resolved_status=normalized_status,
+            ):
+                return False
+            self._project_inserted_event(conversation_id, event)
+        return True
+
     def conversation_terminal_marker(
         self,
         conversation_ref: str,
     ) -> tuple[str, str, str, str | None] | None:
-        """Return the latest persistent chat-level terminal state, if known."""
+        """Return the latest unresolved persistent chat-level terminal state."""
 
         conversation_id = _conversation_id(conversation_ref)
         self._ensure_conversation_imported(conversation_id)
         event = self.store.latest_chat_terminal(conversation_id)
-        if event is None:
+        if event is None or event.get("terminal_resolution") is True:
             return None
         status = str(event.get("status") or "").strip()
         text = str(event.get("text") or "").strip()
@@ -378,6 +424,8 @@ class TUIArchive:
 
     @staticmethod
     def _event_markdown(event: dict[str, Any]) -> str:
+        if event.get("terminal_resolution") is True:
+            return ""
         role = str(event.get("role") or "event").upper()
         observed = str(event.get("observed_at") or "")
         status = str(event.get("status") or "").strip()
