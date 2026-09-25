@@ -25,7 +25,6 @@ from prompt_toolkit.completion import (
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.filters import Condition, has_focus, to_filter
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
-from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import CompletionsMenu, Float, FloatContainer, Layout
@@ -38,6 +37,7 @@ from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.markdown import Markdown
 
+from .history import PrivatePromptHistory
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
 
@@ -67,6 +67,12 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("detach", "Detach locally from the current conversation"),
     CommandSpec("reload", "Refresh the currently attached conversation"),
     CommandSpec("stop", "Stop the active ChatGPT response"),
+    CommandSpec(
+        "history",
+        "Manage local prompt history",
+        "clear",
+        (CommandOptionSpec("clear", "Delete persisted and in-memory prompt history"),),
+    ),
     CommandSpec(
         "goal",
         "Run the current task until complete or blocked",
@@ -518,6 +524,10 @@ class InteractiveSession:
         self._picker_previous_prompt: str | None = None
         self._picker_previous_completer: Any | None = None
         self._command_completer: Any | None = None
+        self._history = PrivatePromptHistory(
+            self.history_file,
+            limit=self.settings.history_limit,
+        )
         self._session: PromptSession[str]
         self._build_session()
 
@@ -633,7 +643,7 @@ class InteractiveSession:
         editing_mode = EditingMode.VI if self.settings.editor == "vi" else EditingMode.EMACS
         kwargs: dict[str, Any] = {
             "message": self._prompt_text,
-            "history": FileHistory(str(self.history_file)),
+            "history": self._history,
             "auto_suggest": AutoSuggestFromHistory(),
             "completer": completer,
             "complete_while_typing": True,
@@ -1282,6 +1292,16 @@ class InteractiveSession:
     @property
     def application(self) -> Any:
         return self._session.app
+
+    def set_history_persistent(self, enabled: bool) -> None:
+        self._history.set_persistent(enabled)
+
+    def clear_history(self) -> None:
+        self._history.clear()
+
+    @property
+    def history_persistent(self) -> bool:
+        return self._history.persistent
 
     @property
     def active_turn_controls(self) -> TurnControlSignals | None:

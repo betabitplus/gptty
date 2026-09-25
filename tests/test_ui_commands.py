@@ -21,6 +21,15 @@ class FakeUI:
         self.choices = list(choices or [])
         self.image_paths = list(image_paths or [])
         self.seen: list[tuple[str, list[tuple[object, str]]]] = []
+        self.history_persistent = True
+        self.history_clear_count = 0
+        self.settings = SimpleNamespace(history_limit=2_000)
+
+    def set_history_persistent(self, enabled):
+        self.history_persistent = bool(enabled)
+
+    def clear_history(self):
+        self.history_clear_count += 1
 
     def choose_searchable(self, message, options, *, default=None):
         self.seen.append((message, list(options)))
@@ -924,6 +933,27 @@ def test_temporary_command_clears_persistent_attachment_without_persisting_temp_
         event == ("header", {"model": "latest frontier · High", "temporary": True})
         for event in renderer.events
     )
+    assert commands.ui.history_persistent is False
+
+
+def test_new_reenables_persistent_history_after_temporary(tmp_path) -> None:
+    commands, _, _, _ = make_commands(tmp_path)
+    commands.handle("/temporary")
+    assert commands.ui.history_persistent is False
+
+    commands.handle("/new")
+
+    assert commands.conversation_mode == "normal"
+    assert commands.ui.history_persistent is True
+
+
+def test_history_clear_delegates_to_ui_and_reports_success(tmp_path) -> None:
+    commands, renderer, _, _ = make_commands(tmp_path)
+
+    commands.handle("/history clear")
+
+    assert commands.ui.history_clear_count == 1
+    assert renderer.events[-1] == ("info", "Prompt history cleared.")
 
 
 def test_temporary_export_uses_live_transcript_and_prints_exact_path(

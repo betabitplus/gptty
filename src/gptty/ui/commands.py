@@ -179,6 +179,11 @@ class InteractiveCommands:
     def pending_media_count(self) -> int:
         return len(self._pending_media)
 
+    def _set_history_persistent(self, enabled: bool) -> None:
+        setter = getattr(self.ui, "set_history_persistent", None)
+        if callable(setter):
+            setter(enabled)
+
     def _acquire_goal_run_lock(self, goal: GoalState) -> bool:
         goal_id = ensure_goal_id(goal)
         current = self._goal_run_lock
@@ -1263,6 +1268,7 @@ class InteractiveCommands:
             self.renderer.warning(f"Temporary chat cleanup failed: {exc}")
         self._conversation_mode = "normal"
         self._reset_temporary_context()
+        self._set_history_persistent(True)
 
     def _capture_goal_context_history(
         self, conversation_ref: str | None
@@ -1833,6 +1839,29 @@ class InteractiveCommands:
         self.renderer.info(f"Goal · active · {new_goal.goal_id[:8]} · starting")
         self.renderer.info(f"Goal state: {self.goal_store.goal_path(new_goal)}")
 
+    def _cmd_history(self, argv: list[str]) -> None:
+        if not argv:
+            persistent = bool(getattr(self.ui, "history_persistent", True))
+            settings = getattr(self.ui, "settings", None)
+            limit = getattr(settings, "history_limit", None)
+            mode = "persistent" if persistent else "memory-only"
+            detail = f" · limit {limit}" if isinstance(limit, int) else ""
+            self.renderer.info(f"Prompt history: {mode}{detail}.")
+            return
+        if argv != ["clear"]:
+            self.renderer.warning("Usage: /history clear")
+            return
+        clear = getattr(self.ui, "clear_history", None)
+        if not callable(clear):
+            self.renderer.warning("Prompt history is unavailable in this UI.")
+            return
+        try:
+            clear()
+        except Exception as exc:  # noqa: BLE001 - history cleanup is best-effort UI state.
+            self.renderer.warning(f"Failed to clear prompt history: {exc}")
+            return
+        self.renderer.info("Prompt history cleared.")
+
     def _cmd_exit(self, argv: list[str]) -> int:
         self._pause_active_goal("gptty exited")
         self._leave_temporary_mode()
@@ -1871,6 +1900,7 @@ class InteractiveCommands:
             return
         self._conversation_mode = "temporary"
         self._reset_temporary_context()
+        self._set_history_persistent(False)
         self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(

@@ -17,6 +17,7 @@ class UISettings:
     thinking: bool = True
     tools: str = "compact"
     editor: str = "emacs"
+    history_limit: int = 2_000
 
 
 def ui_settings_path(state_path: str | Path) -> Path:
@@ -41,12 +42,17 @@ def load_ui_settings(path: str | Path) -> UISettings:
         tools = "compact"
     if editor not in {"emacs", "vi"}:
         editor = "emacs"
+    history_limit = data.get("history_limit", 2_000)
+    if isinstance(history_limit, bool) or not isinstance(history_limit, int):
+        history_limit = 2_000
+    history_limit = min(100_000, max(0, history_limit))
     return UISettings(
         pretty=pretty,
         markdown=bool(data.get("markdown", True)),
         thinking=bool(data.get("thinking", True)),
         tools=tools,
         editor=editor,
+        history_limit=history_limit,
     )
 
 

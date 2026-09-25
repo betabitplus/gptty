@@ -870,6 +870,31 @@ def test_prompt_session_reads_input_and_persists_history(tmp_path) -> None:
     assert "hello" in (tmp_path / "history").read_text(encoding="utf-8")
 
 
+def test_temporary_history_mode_does_not_persist_prompt_then_normal_mode_does(tmp_path) -> None:
+    history = tmp_path / "history"
+    with create_pipe_input() as pipe:
+        session = InteractiveSession(
+            history_file=history,
+            settings_file=tmp_path / "ui.json",
+            prompt_input=pipe,
+            prompt_output=DummyOutput(),
+        )
+        session.set_history_persistent(False)
+        pipe.send_text("temporary secret\r")
+
+        assert session.read_prompt() == "temporary secret"
+        assert not history.exists()
+
+        session.set_history_persistent(True)
+        pipe.send_text("ordinary prompt\r")
+
+        assert session.read_prompt() == "ordinary prompt"
+
+    persisted_text = history.read_text(encoding="utf-8")
+    assert "ordinary prompt" in persisted_text
+    assert "temporary secret" not in persisted_text
+
+
 def test_alt_enter_inserts_newline_before_submit(tmp_path) -> None:
     with create_pipe_input() as pipe:
         session = InteractiveSession(
@@ -1269,6 +1294,7 @@ def test_command_registry_exposes_session_actions() -> None:
         "detach",
         "reload",
         "stop",
+        "history",
         "goal",
         "export",
         "image",

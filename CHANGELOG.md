@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- privacy: make interactive prompt history owner-only and bounded, keep Temporary Chat prompts memory-only and remove them from normal in-process history when Temporary mode ends, and add `/history clear` plus configurable `history_limit`
 - automation: add a versioned `jsonl` contract for `ask`/`send`, rich final JSON with conversation/message/model/effort/finality provenance, typed tool/action/source/citation observations, machine-readable required-action and ambiguous-write failures, and durable pre-write run journals for new chats; one-off `send --to` no longer mutates the attached local session
 - scripting: make stdin explicit and bounded — stdin and positional prompts are no longer silently combined, text stdin is capped at 4 MiB by default with `--stdin-max-bytes` override, and NUL/binary-looking or oversized input fails before any ChatGPT write with stable JSONL error classes
 - recovery: supersede stale local chat-level terminal evidence only from stronger typed proof, use explicit CWA canonical-read provenance for resume/follow reconciliation, keep resolution append-only and race-safe, and preserve recurring terminal states after resolution without leaking reconciliation bookkeeping into the human transcript
