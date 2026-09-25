@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from io import StringIO
 from typing import Any, TextIO
 
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
+from rich.style import Style
 from rich.text import Text
 
 from ..output import OutputMessage, RevisionTextState, _tool_result_error, render_tool_call_parts
 from .state import UISettings
+from .terminal_safety import sanitize_terminal_text
 
 
 @dataclass
@@ -59,18 +62,37 @@ class PrettyRenderer:
         self._answer_stream_suppressed = False
 
     def _rule(self, title: str, *, style: str | None = None) -> None:
+        safe_title = sanitize_terminal_text(title)
         write_rule = getattr(self.stdout, "write_rule", None)
         if callable(write_rule):
-            write_rule(title, style=style)
+            write_rule(safe_title, style=style)
             return
-        self.console.print(Rule(title, style=style))
+        self.console.print(Rule(Text(safe_title), style=style))
 
     def _markdown(self, text: str) -> None:
+        safe_text = sanitize_terminal_text(text)
         write_markdown = getattr(self.stdout, "write_markdown", None)
         if callable(write_markdown):
-            write_markdown(text)
+            write_markdown(safe_text)
             return
-        self.console.print(Markdown(text))
+
+        # Rich can generate OSC-8 hyperlinks from Markdown even when the source
+        # itself contains no raw escape bytes. Render off-terminal, then retain
+        # only presentation SGR before writing to the real terminal stream.
+        buffer = StringIO()
+        rendered_console = Console(
+            file=buffer,
+            highlight=False,
+            soft_wrap=False,
+            force_terminal=self.console.is_terminal,
+            width=self.console.width,
+        )
+        rendered_console.print(Markdown(safe_text))
+        rendered = sanitize_terminal_text(buffer.getvalue(), allow_sgr=True)
+        self.stdout.write(rendered)
+        flush = getattr(self.stdout, "flush", None)
+        if callable(flush):
+            flush()
 
     def header(
         self,
@@ -83,13 +105,13 @@ class PrettyRenderer:
         self._rule("ChatGPT", style="dim")
         details: list[str] = []
         if profile:
-            details.append(f"profile: {profile}")
+            details.append(f"profile: {sanitize_terminal_text(profile)}")
         if model:
-            details.append(f"model: {model}")
+            details.append(f"model: {sanitize_terminal_text(model)}")
         if temporary:
             details.append("temporary chat")
         if details:
-            self.console.print(" · ".join(details), style="dim")
+            self.console.print(Text(" · ".join(details), style="dim"))
         if conversation:
             self.chat_link(conversation)
         if details or conversation:
@@ -98,7 +120,7 @@ class PrettyRenderer:
     def chat_link(self, conversation: str) -> None:
         url = _conversation_url(conversation)
         line = Text("chat: ", style="dim")
-        line.append(url, style=f"underline link {url}")
+        line.append(url, style=Style(underline=True, link=url))
         self.console.print(line)
 
     def answer_model(
@@ -108,9 +130,9 @@ class PrettyRenderer:
         requested_model: str | None = None,
         sent_model: str | None = None,
     ) -> None:
-        observed = str(observed_model or "").strip()
-        requested = str(requested_model or "").strip()
-        sent = str(sent_model or "").strip()
+        observed = sanitize_terminal_text(str(observed_model or "")).strip()
+        requested = sanitize_terminal_text(str(requested_model or "")).strip()
+        sent = sanitize_terminal_text(str(sent_model or "")).strip()
 
         line = Text("model: ", style="dim")
         line.append(observed or "unknown")
@@ -123,9 +145,9 @@ class PrettyRenderer:
         self.console.print(line)
 
     def turn_marker(self, label: str, status: str, message: str) -> None:
-        prefix = str(label or "turn").strip() or "turn"
-        state = str(status or "abnormal").strip() or "abnormal"
-        detail = str(message or "").strip()
+        prefix = sanitize_terminal_text(str(label or "turn")).strip() or "turn"
+        state = sanitize_terminal_text(str(status or "abnormal")).strip() or "abnormal"
+        detail = sanitize_terminal_text(str(message or "")).strip()
         caution_states = {
             "filtered",
             "incomplete",
@@ -334,27 +356,27 @@ class PrettyRenderer:
     def thinking(self, text: str) -> None:
         self._gap_before("thinking")
         self.console.print(Text("Thinking", style="dim italic"))
-        self.console.print(Text(text, style="dim"))
+        self.console.print(Text(sanitize_terminal_text(text), style="dim"))
         self.state.last_block = "thinking"
 
     def commentary(self, text: str) -> None:
         self._gap_before("commentary")
-        self.console.print(Text(text))
+        self.console.print(Text(sanitize_terminal_text(text)))
         self.state.last_block = "commentary"
 
     def tool(self, tool_name: str, label: str = "") -> None:
         self._gap_before("tool")
         line = Text()
         line.append("◇ ", style="dim")
-        line.append(tool_name, style="bold")
+        line.append(sanitize_terminal_text(tool_name), style="bold")
         if label:
-            line.append(f"  {label}")
+            line.append(f"  {sanitize_terminal_text(label)}")
         self.console.print(line)
         self.state.last_block = "tool"
 
     def activity(self, text: str) -> None:
         self._gap_before("activity")
-        self.console.print(Text(text, style="dim"))
+        self.console.print(Text(sanitize_terminal_text(text), style="dim"))
         self.state.last_block = "activity"
 
     def _start_stream_answer(self) -> None:
@@ -377,11 +399,12 @@ class PrettyRenderer:
         self._answer_stream_suppressed = True
 
     def _write_answer_fragment(self, text: str) -> None:
+        safe_text = sanitize_terminal_text(text)
         writer = getattr(self.stdout, "write_stream_fragment", None)
         if callable(writer):
-            writer(text)
+            writer(safe_text)
             return
-        self.console.print(Text(text), end="")
+        self.console.print(Text(safe_text), end="")
 
     def _render_stream_answer_event(
         self,
@@ -448,7 +471,7 @@ class PrettyRenderer:
             if self.settings.markdown and text:
                 self._markdown(text)
             else:
-                self.console.print(text)
+                self.console.print(Text(sanitize_terminal_text(text)))
             self.state.last_block = "answer"
             self.state.turn_active = False
             return
@@ -458,18 +481,18 @@ class PrettyRenderer:
         if self.settings.markdown and text:
             self._markdown(text)
         else:
-            self.console.print(text)
+            self.console.print(Text(sanitize_terminal_text(text)))
         self.state.last_block = "answer"
         self.state.turn_active = False
 
     def info(self, text: str) -> None:
         self._gap_before("info")
-        self.console.print(text)
+        self.console.print(Text(sanitize_terminal_text(text)))
         self.state.last_block = "info"
 
     def warning(self, text: str) -> None:
         self._gap_before("warning")
-        self.console.print(Text(text, style="bold"))
+        self.console.print(Text(sanitize_terminal_text(text), style="bold"))
         self.state.last_block = "warning"
 
     def messages(self, messages: list[OutputMessage]) -> None:
@@ -484,11 +507,13 @@ class PrettyRenderer:
             if message.role == "user":
                 self.console.print(_user_message_text(message.text))
                 continue
-            self.console.print(Text(message.role, style="bold"))
+            self.console.print(
+                Text(sanitize_terminal_text(message.role), style="bold")
+            )
             if self.settings.markdown and message.text:
                 self._markdown(message.text)
             else:
-                self.console.print(message.text)
+                self.console.print(Text(sanitize_terminal_text(message.text)))
         self.state.last_block = "messages"
 
     def _gap_before(self, block: str) -> None:
@@ -501,7 +526,7 @@ class PrettyRenderer:
 
 
 def _user_message_text(value: str) -> Text:
-    lines = value.rstrip().splitlines() or [""]
+    lines = sanitize_terminal_text(value).rstrip().splitlines() or [""]
     result = Text()
     result.append(" YOU ", style="bold reverse")
     result.append("❯ ")
@@ -513,11 +538,11 @@ def _user_message_text(value: str) -> Text:
 
 
 def _clean(value: Any) -> str:
-    return value.strip() if isinstance(value, str) else ""
+    return sanitize_terminal_text(value.strip()) if isinstance(value, str) else ""
 
 
 def _conversation_url(ref: str) -> str:
-    value = ref.strip()
+    value = sanitize_terminal_text(ref).strip()
     if value.startswith(("https://", "http://")):
         return value
     return f"https://chatgpt.com/c/{value}"

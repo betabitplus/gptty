@@ -401,3 +401,67 @@ def test_renderer_never_recommends_destructive_action_from_silence_alone() -> No
     assert "Ctrl-C" not in rendered
     assert "new turn" not in rendered
     assert "resend" not in rendered.lower()
+
+
+class _ForcedTerminalStringIO(StringIO):
+    supports_rich_ansi = True
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _assert_only_sgr_terminal_controls(value: str) -> None:
+    import re
+
+    remainder = re.sub(r"\x1b\[[0-9;:]*m", "", value)
+    assert "\x1b" not in remainder
+    for char in remainder:
+        codepoint = ord(char)
+        assert char in {"\n", "\t"} or (
+            codepoint >= 0x20
+            and codepoint != 0x7F
+            and not 0x80 <= codepoint <= 0x9F
+        )
+
+
+def test_renderer_strips_untrusted_terminal_controls_on_direct_tty_path() -> None:
+    out = _ForcedTerminalStringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.commentary(
+        "comment\x1b]52;c;Y2xpcGJvYXJk\x07ary\x1b[2J!"
+    )
+    renderer.tool(
+        "tool\x1b[Hname",
+        "label\x1bPsecret\x1b\\done",
+    )
+    renderer.warning("warn\x1b_private\x1b\\ing")
+    renderer.answer("final\x00\x08\x7f answer")
+
+    rendered = out.getvalue()
+    _assert_only_sgr_terminal_controls(rendered)
+    assert "commentary!" in rendered
+    assert "toolname" in rendered
+    assert "labeldone" in rendered
+    assert "warning" in rendered
+    assert "final answer" in rendered
+    assert "Y2xpcGJvYXJk" not in rendered
+    assert "secret" not in rendered
+    assert "private" not in rendered
+
+
+def test_renderer_markdown_removes_generated_osc8_hyperlinks_on_direct_tty() -> None:
+    out = _ForcedTerminalStringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=True))
+
+    renderer.answer(
+        "Visit [safe label](https://example.invalid/path) "
+        "and ignore \x1b]52;c;Y2xpcGJvYXJk\x07."
+    )
+
+    rendered = out.getvalue()
+    _assert_only_sgr_terminal_controls(rendered)
+    assert "safe label" in rendered
+    assert "Y2xpcGJvYXJk" not in rendered
+    assert "\x1b]8" not in rendered
+    assert "\x1b]52" not in rendered

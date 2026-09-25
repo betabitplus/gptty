@@ -1303,3 +1303,87 @@ def test_command_registry_exposes_session_actions() -> None:
         "model",
         "exit",
     }
+
+
+def test_transcript_strictly_strips_untrusted_terminal_controls(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+
+    stream.write(
+        "A"
+        "\x1b[31mred\x1b[0m"
+        "\x1b[2J"
+        "B"
+        "\x1b]52;c;Y2xpcGJvYXJk\x07"
+        "C"
+        "\x1bPprivate-dcs\x1b\\"
+        "D"
+        "\x1b_private-apc\x1b\\"
+        "E\x00\x08\x7fF\n"
+    )
+
+    fragments = session._formatted_transcript()
+    visible = "".join(fragment[1] for fragment in fragments)
+
+    assert visible == "AredBCDEF\n"
+    assert any("ansired" in style for style, _text in fragments)
+    assert "\x1b" not in visible
+    assert "\x07" not in visible
+    assert "\x00" not in visible
+    assert "\x08" not in visible
+    assert "\x7f" not in visible
+
+
+def test_transcript_markdown_strips_raw_controls_before_storage(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    stream = session.transcript_stream(StringIO(), stream_name="stdout")
+
+    stream.write_markdown(
+        "safe **markdown** "
+        "\x1b]52;c;Y2xpcGJvYXJk\x07"
+        "\x1b[2J"
+        "tail"
+    )
+
+    blocks = [
+        line.markdown_text
+        for line in session._transcript_lines
+        if line.markdown_text is not None
+    ]
+    assert blocks == ["safe **markdown** tail"]
+    rows = session._visible_transcript(80, 10)
+    visible = "\n".join("".join(text for _style, text in row) for row in rows)
+    assert "safe markdown tail" in visible
+    assert "\x1b" not in visible
+
+
+def test_transcript_ansi_parser_failure_never_falls_back_to_raw_escape_bytes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import gptty.ui.session as session_module
+
+    class BrokenANSI:
+        def __init__(self, _value: str) -> None:
+            raise ValueError("synthetic parser failure")
+
+    monkeypatch.setattr(session_module, "ANSI", BrokenANSI)
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+
+    session.append_transcript("before\x1b[31mred\x1b[0mafter")
+
+    visible = "".join(text for _style, text in session._formatted_transcript())
+    assert visible == "beforeredafter"
+    assert "\x1b" not in visible

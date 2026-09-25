@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import signal
 from collections import deque
 from contextlib import suppress
@@ -40,6 +39,7 @@ from rich.markdown import Markdown
 from .history import PrivatePromptHistory
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
+from .terminal_safety import sanitize_terminal_text
 
 
 @dataclass(frozen=True)
@@ -168,9 +168,6 @@ class _ContextualCommandCompleter(Completer):
             )
 
 
-_OSC_SEQUENCE_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
-
-
 def _text_width(value: str) -> int:
     return sum(get_cwidth(char) for char in value)
 
@@ -225,14 +222,24 @@ def _compact_active_status(status: str) -> str:
     return compact
 
 
+def _ansi_fragments(value: str) -> list[tuple[str, str]]:
+    safe = sanitize_terminal_text(value, allow_sgr=True)
+    if not safe:
+        return []
+    if "\x1b" not in safe:
+        return [("", safe)]
+    try:
+        parsed = to_formatted_text(ANSI(safe))
+        return [(style, text) for style, text, *_rest in parsed]
+    except Exception:
+        # A parser failure must never reintroduce raw escape bytes.
+        return [("", sanitize_terminal_text(safe))]
+
+
 def _ansi_rows(value: str) -> tuple[tuple[tuple[str, str], ...], ...]:
     if not value:
         return ((),)
-    try:
-        parsed = to_formatted_text(ANSI(value))
-        fragments = [(style, text) for style, text, *_rest in parsed]
-    except Exception:
-        fragments = [("", value)]
+    fragments = _ansi_fragments(value)
 
     rows: list[list[tuple[str, str]]] = [[]]
     for style, text in fragments:
@@ -898,16 +905,7 @@ class InteractiveSession:
     def append_transcript(self, text: str) -> None:
         if not text:
             return
-        normalized = text.replace("\r\n", "\n").replace("\r", "")
-        normalized = _OSC_SEQUENCE_RE.sub("", normalized)
-        if "\x1b" in normalized:
-            try:
-                parsed = to_formatted_text(ANSI(normalized))
-                fragments = [(style, value) for style, value, *_rest in parsed]
-            except Exception:
-                fragments = [("", normalized)]
-        else:
-            fragments = [("", normalized)]
+        fragments = _ansi_fragments(text)
         for style, value in fragments:
             if not value:
                 continue
@@ -928,7 +926,7 @@ class InteractiveSession:
             pass
 
     def append_markdown(self, text: str) -> None:
-        value = str(text)
+        value = sanitize_terminal_text(str(text))
         if not value:
             return
         current = self._transcript_lines[-1]
@@ -965,7 +963,7 @@ class InteractiveSession:
         self._trim_transcript()
 
     def append_rule(self, title: str, *, style: str | None = None) -> None:
-        title = str(title).strip()
+        title = sanitize_terminal_text(str(title)).strip()
         if not title:
             return
         current = self._transcript_lines[-1]
