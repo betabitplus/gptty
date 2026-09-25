@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import patch_stdout
-from chatgpt_web_adapter.types import ConversationRef
 
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
@@ -34,6 +33,11 @@ from ..goal_lock import try_acquire_goal_lock
 from ..local_store import local_store_path
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
+from ..reconciliation import (
+    ChatTerminalEvidence,
+    chat_terminal_resolution,
+    same_conversation_ref,
+)
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError, session_handle_for_args
@@ -260,6 +264,7 @@ class _EnhancedFollow:
     event_task: asyncio.Task[dict[str, Any]] | None = None
     stop_requested: bool = False
     stopped_by_user: bool = False
+    tui_archive: TUIArchive | None = None
 
 
 class _ThreadsafeRendererProxy:
@@ -312,18 +317,6 @@ CONVERSATION_REF_FIELDS = (
     "url",
     "id",
 )
-
-
-def _same_conversation_ref(left: str | None, right: str | None) -> bool:
-    if not left or not right:
-        return False
-    try:
-        return (
-            ConversationRef.from_any(left).conversation_id
-            == ConversationRef.from_any(right).conversation_id
-        )
-    except (TypeError, ValueError):
-        return False
 
 
 def extract_conversation_ref(response: Any) -> str | None:
@@ -1402,6 +1395,7 @@ async def _enhanced_loop_core(
                         renderer=renderer,
                         activity_tracker=activity_tracker,
                         delivery_journal=delivery_journal,
+                        tui_archive=getattr(commands, "tui_archive", None),
                     )
                     if active_follow is not None:
                         _refresh_active_follow_ui(ui, active_follow, queued_prompts)
@@ -1622,6 +1616,7 @@ def _seed_enhanced_follow(
     renderer: PrettyRenderer,
     activity_tracker: CodexProActivityTracker | None = None,
     delivery_journal: StreamDeliveryJournal | None = None,
+    tui_archive: TUIArchive | None = None,
 ) -> _EnhancedFollow | None:
     if not isinstance(snapshot, dict) or "emitted_message_ids" not in snapshot:
         return None
@@ -1704,6 +1699,7 @@ def _seed_enhanced_follow(
         # terminal reconciliation may recover those missed events, rendering the
         # final answer eagerly can put older progress after the final text.
         defer_stream_answer_until_terminal=True,
+        tui_archive=tui_archive,
     )
 
 
@@ -1948,6 +1944,51 @@ def _start_enhanced_follow_poll(
     ).start()
 
 
+def _follow_snapshot_chat_status(snapshot: dict[str, Any]) -> str | None:
+    ui_state = snapshot.get("historical_ui_state")
+    if not isinstance(ui_state, dict):
+        return None
+    if str(ui_state.get("scope") or "").strip().lower() != "chat":
+        return None
+    status = str(ui_state.get("status") or "").strip().lower()
+    return status or None
+
+
+def _reconcile_follow_chat_terminal_evidence(
+    follow: _EnhancedFollow,
+    snapshot: dict[str, Any],
+) -> bool:
+    archive = follow.tui_archive
+    if archive is None or snapshot.get("canonical_read_fresh") is not True:
+        return False
+
+    try:
+        marker = archive.conversation_terminal_marker(follow.conversation_ref)
+    except Exception:
+        return False
+
+    provenance = str(snapshot.get("snapshot_provenance") or "canonical-read").strip()
+    resolution = chat_terminal_resolution(
+        marker,
+        ChatTerminalEvidence(
+            kind="canonical-read",
+            source=provenance or "canonical-read",
+            fresh=True,
+            current_chat_status=_follow_snapshot_chat_status(snapshot),
+        ),
+    )
+    if resolution is None:
+        return False
+    try:
+        return archive.record_chat_terminal_resolution(
+            conversation_ref=follow.conversation_ref,
+            resolved_status=resolution.status,
+            source=resolution.source,
+        )
+    except Exception:
+        return False
+
+
 def _apply_enhanced_follow_snapshot(
     follow: _EnhancedFollow,
     snapshot: Any,
@@ -1957,6 +1998,8 @@ def _apply_enhanced_follow_snapshot(
     if not isinstance(snapshot, dict):
         renderer.warning("Live follow stopped: invalid canonical snapshot.")
         return False
+
+    _reconcile_follow_chat_terminal_evidence(follow, snapshot)
 
     events = snapshot.get("events")
     raw_event_items = (
@@ -3073,19 +3116,34 @@ def _send_chat_prompt(
             except Exception:
                 persistent_marker = None
 
-            if (
-                persistent_marker is not None
-                and persistent_marker[0] == "chat"
-                and persistent_marker[1] in {"unavailable", "limit-reached"}
-                and terminal_observed is True
-                and not str(terminal_error_code or "").strip()
-                and _same_conversation_ref(active_ref, response_conversation_ref)
-            ):
+            current_chat_status = (
+                terminal_marker[1]
+                if terminal_marker is not None and terminal_marker[0] == "chat"
+                else None
+            )
+            resolution = chat_terminal_resolution(
+                persistent_marker,
+                ChatTerminalEvidence(
+                    kind="terminal-turn",
+                    source=terminal_source or "terminal-turn",
+                    terminal_observed=terminal_observed,
+                    terminal_error_present=bool(
+                        str(terminal_error_code or "").strip()
+                        or str(terminal_error or "").strip()
+                    ),
+                    same_conversation=same_conversation_ref(
+                        active_ref,
+                        response_conversation_ref,
+                    ),
+                    current_chat_status=current_chat_status,
+                ),
+            )
+            if resolution is not None:
                 try:
                     resolved = tui_archive.record_chat_terminal_resolution(
                         conversation_ref=active_ref,
-                        resolved_status=persistent_marker[1],
-                        source=terminal_source or "terminal-turn",
+                        resolved_status=resolution.status,
+                        source=resolution.source,
                     )
                 except Exception:
                     resolved = False

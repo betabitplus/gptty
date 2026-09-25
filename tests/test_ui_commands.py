@@ -466,6 +466,8 @@ def test_fresh_resume_supersedes_stale_local_unavailable_marker(tmp_path) -> Non
             {"message_id": "u1", "role": "user", "text": "question"},
             {"message_id": "a1", "role": "assistant", "text": "answer"},
         ],
+        "snapshot_provenance": "canonical-read",
+        "canonical_read_fresh": True,
     }
 
     assert commands.complete_resume(request, snapshot) is True
@@ -482,6 +484,47 @@ def test_fresh_resume_supersedes_stale_local_unavailable_marker(tmp_path) -> Non
     assert events[-1]["terminal_resolution"] is True
     assert events[-1]["resolved_status"] == "unavailable"
     assert events[-1]["terminal_source"] == "canonical-read"
+
+
+def test_resume_without_canonical_provenance_keeps_unavailable_marker(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-direct",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+    )
+    commands, renderer, _client, _state_path = make_commands(
+        tmp_path,
+        tui_archive=archive,
+    )
+    commands.handle("/resume conv-direct")
+    request = commands.take_pending_resume()
+    assert request is not None
+    snapshot = {
+        "status": SimpleNamespace(status="completed"),
+        "messages": [
+            {"message_id": "u1", "role": "user", "text": "question"},
+            {"message_id": "a1", "role": "assistant", "text": "legacy answer"},
+        ],
+    }
+
+    assert commands.complete_resume(request, snapshot) is True
+
+    assert archive.conversation_terminal_marker("conv-direct") == (
+        "chat",
+        "unavailable",
+        "This conversation was previously unavailable.",
+        "stream",
+    )
+    assert (
+        "turn_marker",
+        {
+            "label": "chat",
+            "status": "unavailable",
+            "message": "This conversation was previously unavailable.",
+        },
+    ) in renderer.events
 
 
 def test_cached_resume_does_not_supersede_unavailable_marker(tmp_path) -> None:
@@ -507,6 +550,8 @@ def test_cached_resume_does_not_supersede_unavailable_marker(tmp_path) -> None:
         ],
         "canonical_cache_stale": True,
         "canonical_cache_age_seconds": 30,
+        "snapshot_provenance": "canonical-cache",
+        "canonical_read_fresh": False,
     }
 
     assert commands.complete_resume(request, snapshot) is True
@@ -548,6 +593,8 @@ def test_fresh_resume_does_not_treat_readability_as_limit_resolution(tmp_path) -
             {"message_id": "u1", "role": "user", "text": "question"},
             {"message_id": "a1", "role": "assistant", "text": "final answer"},
         ],
+        "snapshot_provenance": "canonical-read",
+        "canonical_read_fresh": True,
     }
 
     assert commands.complete_resume(request, snapshot) is True
@@ -588,6 +635,8 @@ def test_current_web_ui_unavailable_prevents_canonical_supersession(tmp_path) ->
         "messages": [
             {"message_id": "u1", "role": "user", "text": "question"},
         ],
+        "snapshot_provenance": "canonical-read",
+        "canonical_read_fresh": True,
         "historical_ui_state": {
             "code": "conversation_unavailable",
             "scope": "chat",

@@ -8,7 +8,6 @@ from typing import Any, ClassVar
 
 from gptty.commands.chat import (
     LOCAL_QUIT_CODE,
-    _same_conversation_ref,
     _send_chat_prompt,
     _turn_failure_marker,
     _turn_terminal_marker,
@@ -622,15 +621,6 @@ def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
     assert client.calls[0][2]["stream"] is True
 
 
-def test_same_conversation_ref_normalizes_chatgpt_url() -> None:
-    conversation_id = "conv-12345678"
-    assert _same_conversation_ref(
-        conversation_id,
-        f"https://chatgpt.com/c/{conversation_id}",
-    )
-    assert not _same_conversation_ref(conversation_id, "conv-other")
-
-
 def test_existing_turn_inherits_persistent_chat_terminal_state(tmp_path) -> None:
     archive = TUIArchive(tmp_path / "archive")
     conversation_ref = "conv-12345678"
@@ -768,6 +758,92 @@ def test_proven_existing_turn_supersedes_stale_chat_terminal_state(tmp_path) -> 
     )
     assert transcript.count("## CHAT — limit-reached") == 1
     assert "## CHAT — resolved" not in transcript
+
+
+def test_current_chat_error_blocks_supersession_of_older_marker(tmp_path) -> None:
+    class CurrentLimitClient(FakeGpttyClient):
+        def send_to_conversation(
+            self,
+            conversation_ref: str,
+            prompt: str,
+            **options: Any,
+        ) -> Any:
+            self.calls.append(
+                ("send_to_conversation", (conversation_ref, prompt), options)
+            )
+            return SimpleNamespace(
+                text="partial final text",
+                conversation_id=conversation_ref,
+                title="Test Chat",
+                conversation=SimpleNamespace(finish_reason="stop"),
+                request=SimpleNamespace(
+                    terminal_observed=True,
+                    terminal_source="browser-stream",
+                    terminal_error_code=None,
+                    terminal_error=(
+                        "You've reached the maximum length for this conversation. "
+                        "Start a new chat to continue."
+                    ),
+                ),
+            )
+
+    archive = TUIArchive(tmp_path / "archive")
+    conversation_ref = "conv-12345678"
+    old_turn = archive.record_user(
+        "old question",
+        conversation_ref=conversation_ref,
+        model=None,
+    )
+    archive.record_terminal(
+        old_turn,
+        conversation_ref=conversation_ref,
+        label="chat",
+        status="unavailable",
+        text="This conversation is no longer available; continue in a new chat.",
+        source="stream",
+    )
+    current_turn = archive.record_user(
+        "continue",
+        conversation_ref=conversation_ref,
+        model=None,
+    )
+    state_path = tmp_path / "gptty_state.json"
+    state = ChatState(current_conversation=conversation_ref)
+    save_chat_state(state_path, state)
+    result: dict[str, object] = {}
+
+    code = _send_chat_prompt(
+        CurrentLimitClient(),
+        state=state,
+        state_path=state_path,
+        profile=None,
+        prompt="continue",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        conversation_mode="normal",
+        tui_archive=archive,
+        archive_turn_id=current_turn,
+        result_out=result,
+    )
+
+    assert code == 0
+    assert result["terminal_marker"] == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its maximum length; start a new chat to continue.",
+    )
+    assert result["terminal_source"] == "browser-stream"
+    assert archive.conversation_terminal_marker(conversation_ref) == (
+        "chat",
+        "limit-reached",
+        "This conversation reached its maximum length; start a new chat to continue.",
+        "browser-stream",
+    )
+    events = archive.store.tui_events(conversation_ref)
+    assert not any(event.get("terminal_resolution") is True for event in events)
 
 
 def test_proven_turn_for_different_conversation_does_not_supersede_marker(

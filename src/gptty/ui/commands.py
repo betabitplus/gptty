@@ -42,6 +42,7 @@ from ..goal_lock import (
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
+from ..reconciliation import ChatTerminalEvidence, chat_terminal_resolution
 from ..state import ChatState, GoalAcceptanceCriterion, GoalState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from ..turn_control import StopOutcome, request_stop_generation
@@ -388,26 +389,30 @@ class InteractiveCommands:
             except Exception:
                 persistent_chat_marker = None
 
-            fresh_canonical_read = not (
-                isinstance(snapshot, dict)
-                and snapshot.get("canonical_cache_stale") is True
-            )
-            current_ui_confirms_unavailable = bool(
-                historical_ui_marker is not None
+            current_ui_chat_status = (
+                historical_ui_marker[1]
+                if historical_ui_marker is not None
                 and historical_ui_marker[0] == "chat"
-                and historical_ui_marker[1] == "unavailable"
+                else None
             )
-            if (
-                persistent_chat_marker is not None
-                and persistent_chat_marker[1] == "unavailable"
-                and fresh_canonical_read
-                and not current_ui_confirms_unavailable
-            ):
+            resolution = chat_terminal_resolution(
+                persistent_chat_marker,
+                ChatTerminalEvidence(
+                    kind="canonical-read",
+                    source="canonical-read",
+                    fresh=bool(
+                        isinstance(snapshot, dict)
+                        and snapshot.get("canonical_read_fresh") is True
+                    ),
+                    current_chat_status=current_ui_chat_status,
+                ),
+            )
+            if resolution is not None:
                 try:
                     resolved = self.tui_archive.record_chat_terminal_resolution(
                         conversation_ref=attached_ref,
-                        resolved_status="unavailable",
-                        source="canonical-read",
+                        resolved_status=resolution.status,
+                        source=resolution.source,
                     )
                 except Exception:
                     resolved = False

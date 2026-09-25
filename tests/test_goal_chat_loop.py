@@ -16,6 +16,7 @@ from gptty.state import (
     GoalState,
     save_chat_state,
 )
+from gptty.tui_archive import TUIArchive
 
 
 def _load_session_state(state_path):
@@ -2115,6 +2116,112 @@ def test_unfinished_resume_does_not_poll_while_live_stream_is_silent(
     assert client.stream_count == 1
     assert client.snapshot_count == 1
     assert ("stream", "conv-silent") in client.calls
+
+
+def test_follow_requires_fresh_canonical_read_to_supersede_unavailable_marker(
+    tmp_path,
+) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    archive.record_observed_terminal(
+        conversation_ref="conv-live",
+        label="chat",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+        source="stream",
+    )
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={},
+        deadline=10_000.0,
+        tui_archive=archive,
+    )
+    base_snapshot = {
+        "status": SimpleNamespace(status="tool_running"),
+        "messages": [],
+        "events": [],
+        "emitted_message_ids": [],
+    }
+
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        {
+            **base_snapshot,
+            "snapshot_provenance": "stream-terminal",
+            "canonical_read_fresh": False,
+        },
+        renderer=renderer,
+    )
+    assert archive.conversation_terminal_marker("conv-live") == (
+        "chat",
+        "unavailable",
+        "This conversation was previously unavailable.",
+        "stream",
+    )
+
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        {
+            **base_snapshot,
+            "snapshot_provenance": "canonical-read",
+            "canonical_read_fresh": True,
+        },
+        renderer=renderer,
+    )
+    assert archive.conversation_terminal_marker("conv-live") is None
+    events = archive.store.tui_events("conv-live")
+    assert events[-1]["terminal_resolution"] is True
+    assert events[-1]["resolved_status"] == "unavailable"
+    assert events[-1]["terminal_source"] == "canonical-read"
+
+
+def test_follow_current_chat_marker_blocks_fresh_canonical_supersession(tmp_path) -> None:
+    archive = TUIArchive(tmp_path / "archive")
+    archive.record_observed_terminal(
+        conversation_ref="conv-live",
+        label="chat",
+        status="unavailable",
+        text="Older local unavailable marker.",
+        source="stream",
+    )
+    renderer = _FakeRenderer(StringIO(), SimpleNamespace())
+    follow = chat_module._EnhancedFollow(
+        conversation_ref="conv-live",
+        emitted_message_ids=set(),
+        seen_messages={},
+        deadline=10_000.0,
+        tui_archive=archive,
+    )
+
+    assert chat_module._apply_enhanced_follow_snapshot(
+        follow,
+        {
+            "status": SimpleNamespace(status="tool_running"),
+            "messages": [],
+            "events": [],
+            "emitted_message_ids": [],
+            "snapshot_provenance": "canonical-read",
+            "canonical_read_fresh": True,
+            "historical_ui_state": {
+                "scope": "chat",
+                "status": "unavailable",
+                "detail": "Still unavailable in the web UI.",
+                "source": "web-ui",
+            },
+        },
+        renderer=renderer,
+    )
+    assert archive.conversation_terminal_marker("conv-live") == (
+        "chat",
+        "unavailable",
+        "Older local unavailable marker.",
+        "stream",
+    )
+    assert not any(
+        event.get("terminal_resolution") is True
+        for event in archive.store.tui_events("conv-live")
+    )
 
 
 def test_resume_follow_replaces_corrupt_stream_final_with_canonical_snapshot(
