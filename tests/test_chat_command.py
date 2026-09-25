@@ -522,6 +522,62 @@ def test_send_result_preserves_post_submit_ambiguity_over_429(tmp_path) -> None:
     assert classification["reconciliation_required"] is True
 
 
+def test_plain_chat_ambiguous_write_uses_typed_failure_policy(tmp_path) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_OUTCOME_UNKNOWN,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    error = BrowserOwnedWriteRuntimeError(
+        "provider failed after delegation",
+        failure_kind=WRITE_OUTCOME_UNKNOWN,
+        automatic_retry_allowed=False,
+        manual_retry_safe_after_repair=False,
+        write_may_have_been_submitted=True,
+        reconciliation_required=True,
+        request_stage="browser_owned_write",
+        status_code=429,
+    )
+
+    class AmbiguousClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def send_to_conversation(self, conversation_ref, prompt, **options):
+            self.calls += 1
+            raise error
+
+    client = AmbiguousClient()
+    result: dict[str, Any] = {}
+    stderr = StringIO()
+
+    code = _send_chat_prompt(
+        client,
+        state=ChatState(current_conversation="conv-1"),
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="hello once",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=stderr,
+        renderer=None,
+        result_out=result,
+    )
+
+    assert code == 1
+    assert client.calls == 1
+    assert result["terminal_marker"][:2] == ("turn", "unconfirmed")
+    classification = result["failure_classification"]
+    assert classification["source"] == "structured"
+    assert classification["code"] == WRITE_OUTCOME_UNKNOWN
+    assert classification["write_may_have_been_submitted"] is True
+    assert classification["reconciliation_required"] is True
+    assert "may have accepted this turn" in stderr.getvalue()
+    assert "reconcile the conversation before retrying" in stderr.getvalue()
+
+
 def test_send_can_suppress_live_answer_events_for_goal_protocol(tmp_path) -> None:
     class EventClient:
         def send(self, prompt: str, **options):

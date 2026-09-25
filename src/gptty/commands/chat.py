@@ -2888,10 +2888,25 @@ def _send_chat_prompt(
             try:
                 response = perform_send()
             except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
+                failure = classify_turn_failure(exc)
                 if recorder is not None:
-                    recorder.fail(str(exc))
+                    recorder.fail(
+                        str(exc),
+                        failure_classification=failure.to_dict(),
+                    )
+                if result_out is not None:
+                    result_out.update(
+                        terminal_marker=failure.marker,
+                        terminal_source="request_error",
+                        failure_classification=failure.to_dict(),
+                        conversation_ref=(
+                            active_ref
+                            or write_conversation_ref
+                            or state.current_conversation
+                        ),
+                    )
                 if not suppress_request_error_output:
-                    print(f"gptty: chat request failed: {exc}", file=stderr)
+                    print(f"gptty: chat request failed: {failure.message}", file=stderr)
                 return 1
         else:
             outcome: dict[str, Any] = {}
@@ -3042,6 +3057,7 @@ def _send_chat_prompt(
                 error = None
             if error is not None:
                 if isinstance(error, Exception):
+                    failure = classify_turn_failure(error)
                     if recorder is not None:
                         recorder.fail(
                             str(error),
@@ -3052,8 +3068,8 @@ def _send_chat_prompt(
                                     error.__traceback__,
                                 )
                             ),
+                            failure_classification=failure.to_dict(),
                         )
-                    failure = classify_turn_failure(error)
                     marker = failure.marker
                     marker_ref = (
                         active_ref

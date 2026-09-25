@@ -58,6 +58,33 @@ def test_fail_persists_traceback_in_summary_and_event(tmp_path) -> None:
 
 
 
+def test_fail_persists_typed_failure_classification(tmp_path) -> None:
+    recorder = start_run(
+        profile=None,
+        state_path=tmp_path / "gptty_state.json",
+        command="send",
+        conversation_ref="conv-1",
+    )
+    classification = {
+        "label": "turn",
+        "status": "unconfirmed",
+        "message": "reconcile before retrying",
+        "source": "structured",
+        "write_may_have_been_submitted": True,
+        "reconciliation_required": True,
+    }
+
+    recorder.fail("provider detail", failure_classification=classification)
+
+    summary = read_run_summary(recorder.run_file)
+    events = read_run_events(recorder.events_file, from_start=True)
+
+    assert summary["error"] == "provider detail"
+    assert summary["failure_classification"] == classification
+    assert events[-1]["type"] == "failed"
+    assert events[-1]["failure_classification"] == classification
+
+
 def test_sqlite_remains_authority_when_run_projections_are_corrupted(tmp_path) -> None:
     recorder = start_run(
         profile=None,

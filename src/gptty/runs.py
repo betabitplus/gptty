@@ -67,13 +67,23 @@ class RunRecorder:
         self.summary["completed_at"] = utc_now()
         self.event("completed")
 
-    def fail(self, message: str, *, traceback_text: str | None = None) -> None:
+    def fail(
+        self,
+        message: str,
+        *,
+        traceback_text: str | None = None,
+        failure_classification: dict[str, Any] | None = None,
+    ) -> None:
         self.summary["status"] = "failed"
         self.summary["error"] = message
+        if isinstance(failure_classification, dict):
+            self.summary["failure_classification"] = dict(failure_classification)
         if isinstance(traceback_text, str) and traceback_text.strip():
             self.summary["traceback"] = traceback_text
         self.summary["completed_at"] = utc_now()
         event_data: dict[str, Any] = {"message": message}
+        if isinstance(failure_classification, dict):
+            event_data["failure_classification"] = dict(failure_classification)
         if isinstance(traceback_text, str) and traceback_text.strip():
             event_data["traceback"] = traceback_text
         self.event("failed", **event_data)

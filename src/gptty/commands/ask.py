@@ -8,6 +8,7 @@ from ..media import MediaInputError, collect_media_inputs
 from ..prompt import build_prompt
 from ..required_action import maybe_render_required_action
 from ..sdk_client import GpttyClient
+from ..turn_failure import classify_turn_failure
 from ._client import build_client
 
 
@@ -81,7 +82,8 @@ def run_ask(
             ),
         )
     except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
-        print(f"gptty: ask request failed: {exc}", file=stderr)
+        failure = classify_turn_failure(exc)
+        print(f"gptty: ask request failed: {failure.message}", file=stderr)
         return 1
 
     response_text = _response_text(response)

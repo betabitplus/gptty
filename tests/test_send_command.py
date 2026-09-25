@@ -8,6 +8,7 @@ from typing import Any
 
 import gptty.commands.send as send_command
 from gptty.commands.send import extract_conversation_ref, run_send
+from gptty.runs import read_run_events, read_run_summary
 from gptty.session_state import SessionStateError, session_handle
 from gptty.state import ChatState, save_chat_state
 
@@ -441,3 +442,62 @@ def test_successful_remote_send_does_not_fail_or_overwrite_on_session_cas_confli
     assert "ChatGPT turn completed, but local session state was not updated" in stderr.getvalue()
     assert _load_command_session(tmp_path).current_conversation == "concurrent-winner"
     assert len(FakeGpttyClient.instances[-1].calls) == 1
+
+
+def test_send_ambiguous_write_requires_reconciliation_and_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_OUTCOME_UNKNOWN,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    error = BrowserOwnedWriteRuntimeError(
+        "provider failed after delegation",
+        failure_kind=WRITE_OUTCOME_UNKNOWN,
+        automatic_retry_allowed=False,
+        manual_retry_safe_after_repair=False,
+        write_may_have_been_submitted=True,
+        reconciliation_required=True,
+        request_stage="browser_owned_write",
+        status_code=429,
+    )
+
+    class AmbiguousClient(FakeGpttyClient):
+        def send_to_conversation(
+            self,
+            conversation_ref: str,
+            prompt: str,
+            **options: Any,
+        ) -> Response:
+            self.calls.append(
+                ("send_to_conversation", (conversation_ref, prompt), options)
+            )
+            raise error
+
+    FakeGpttyClient.instances.clear()
+    stderr = StringIO()
+
+    code = run_send(
+        make_args(tmp_path, to="explicit-ref"),
+        client_factory=AmbiguousClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 1
+    assert len(FakeGpttyClient.instances[-1].calls) == 1
+    assert "may have accepted this turn" in stderr.getvalue()
+    assert "reconcile the conversation before retrying" in stderr.getvalue()
+
+    run_files = sorted((tmp_path / ".gptty_runs").glob("*.json"))
+    assert len(run_files) == 1
+    summary = read_run_summary(run_files[0])
+    events = read_run_events(run_files[0].with_suffix(".jsonl"), from_start=True)
+    classification = summary["failure_classification"]
+    assert classification["status"] == "unconfirmed"
+    assert classification["code"] == WRITE_OUTCOME_UNKNOWN
+    assert classification["status_code"] == 429
+    assert classification["write_may_have_been_submitted"] is True
+    assert classification["reconciliation_required"] is True
+    assert events[-1]["failure_classification"] == classification

@@ -20,6 +20,7 @@ from ..required_action import maybe_render_required_action
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError
+from ..turn_failure import classify_turn_failure
 from ._client import build_client
 from ._session import load_command_session
 
@@ -141,9 +142,13 @@ def run_send(
             else:
                 response = client.send_to_conversation(conversation_ref, prompt, **options)
         except Exception as exc:  # noqa: BLE001 - command boundary converts SDK errors to exit codes.
+            failure = classify_turn_failure(exc)
             if recorder is not None:
-                recorder.fail(str(exc))
-            print(f"gptty: send request failed: {exc}", file=stderr)
+                recorder.fail(
+                    str(exc),
+                    failure_classification=failure.to_dict(),
+                )
+            print(f"gptty: send request failed: {failure.message}", file=stderr)
             return 1
 
         updated_ref = extract_conversation_ref(response, fallback=conversation_ref)
