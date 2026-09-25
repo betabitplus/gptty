@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 from typing import Any
 
 import pytest
@@ -73,6 +74,30 @@ def test_ask_stdin_flag_forces_stdin_mode(monkeypatch: pytest.MonkeyPatch) -> No
     }
 
 
+
+def test_ask_custom_stdin_limit_is_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    def fake_read_stdin_text(mode: str, *, max_bytes: int) -> str:
+        calls["mode"] = mode
+        calls["max_bytes"] = max_bytes
+        return "bounded"
+
+    def fake_run_ask(args: Any, *, stdin_text: str | None = None) -> int:
+        calls["stdin_text"] = stdin_text
+        return 0
+
+    monkeypatch.setattr(cli, "read_stdin_text", fake_read_stdin_text)
+    monkeypatch.setattr(ask_command, "run_ask", fake_run_ask)
+
+    assert cli.main(["ask", "--stdin-max-bytes", "1234"]) == 0
+    assert calls == {
+        "mode": "auto",
+        "max_bytes": 1234,
+        "stdin_text": "bounded",
+    }
+
+
 def test_ask_no_stdin_flag_ignores_piped_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: dict[str, Any] = {}
 
@@ -109,6 +134,34 @@ def test_ask_stdin_read_error_returns_1(monkeypatch: pytest.MonkeyPatch, capsys:
     assert cli.main(["ask", "review"]) == 1
     captured = capsys.readouterr()
     assert "gptty: failed to read stdin" in captured.err
+
+
+
+def test_ask_jsonl_stdin_limit_failure_is_machine_readable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_read_stdin_text(mode: str) -> str:
+        raise StdinReadError(
+            "stdin exceeds safety limit",
+            error_class="stdin_too_large",
+            exit_code=2,
+        )
+
+    def fake_run_ask(args: Any, *, stdin_text: str | None = None) -> int:
+        raise AssertionError("run_ask should not be called when stdin validation fails")
+
+    monkeypatch.setattr(cli, "read_stdin_text", fake_read_stdin_text)
+    monkeypatch.setattr(ask_command, "run_ask", fake_run_ask)
+
+    assert cli.main(["ask", "--format", "jsonl"]) == 2
+    captured = capsys.readouterr()
+    row = json.loads(captured.out.strip())
+    assert row["contract"] == "gptty.turn.result"
+    assert row["exit_code"] == 2
+    assert row["error"]["class"] == "stdin_too_large"
+    assert row["error"]["source"] == "stdin"
+    assert "stdin exceeds safety limit" in captured.err
 
 
 def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -92,6 +92,93 @@ def test_send_uses_attached_conversation_by_default(tmp_path: Path) -> None:
     assert _load_command_session(tmp_path).current_conversation == "attached-ref"
 
 
+
+def test_send_jsonl_stream_matches_durable_run_events(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-ref"),
+    )
+    stdout = StringIO()
+
+    code = run_send(
+        make_args(tmp_path, format="jsonl", no_stream=False),
+        client_factory=FakeGpttyClient,
+        stdout=stdout,
+    )
+
+    rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert code == 0
+    assert [row["type"] for row in rows] == [
+        "run_started",
+        "prompt_sent",
+        "waiting_for_reply",
+        "token_delta",
+        "turn_result",
+    ]
+    assert all(row.get("contract") for row in rows)
+    assert rows[-1]["contract"] == "gptty.turn.result"
+    assert rows[-1]["status"] == "completed"
+    assert rows[-1]["text"] == "reply"
+    assert rows[-1]["identity"]["conversation_id"] == "attached-ref"
+
+    run_file = next((tmp_path / ".gptty_runs").glob("*.json"))
+    summary = read_run_summary(run_file)
+    events = read_run_events(summary["events_file"], from_start=True)
+    emitted_events = [row for row in rows if row["contract"] == "gptty.run.event"]
+    assert [event["event_id"] for event in emitted_events] == [
+        event["event_id"] for event in events[:-1]
+    ]
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["turn_result"]["contract"] == "gptty.turn.result"
+
+
+def test_send_new_creates_prewrite_journal_before_product_write(tmp_path: Path) -> None:
+    snapshots: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+
+    class InspectingClient(FakeGpttyClient):
+        def send(self, prompt: str, **options: Any) -> Response:
+            run_file = next((tmp_path / ".gptty_runs").glob("*.json"))
+            summary = read_run_summary(run_file)
+            events = read_run_events(summary["events_file"], from_start=True)
+            snapshots.append((summary, events))
+            self.calls.append(("send", (prompt,), options))
+            return Response(text="new reply", conversation_id="new-conv")
+
+    stdout = StringIO()
+    code = run_send(
+        make_args(tmp_path, new=True),
+        client_factory=InspectingClient,
+        stdout=stdout,
+    )
+
+    assert code == 0
+    assert len(snapshots) == 1
+    summary_before_write, events_before_write = snapshots[0]
+    assert summary_before_write["status"] == "running"
+    assert summary_before_write["conversation_ref"] is None
+    assert [event["type"] for event in events_before_write] == [
+        "run_started",
+        "prompt_sent",
+        "waiting_for_reply",
+    ]
+
+    run_file = next((tmp_path / ".gptty_runs").glob("*.json"))
+    summary = read_run_summary(run_file)
+    events = read_run_events(summary["events_file"], from_start=True)
+    assert summary["status"] == "completed"
+    assert summary["conversation_ref"] == "new-conv"
+    assert [event["type"] for event in events] == [
+        "run_started",
+        "prompt_sent",
+        "waiting_for_reply",
+        "conversation_bound",
+        "token_delta",
+        "completed",
+    ]
+    assert _load_command_session(tmp_path).current_conversation == "new-conv"
+
+
 def test_extract_conversation_ref_supports_nested_sdk_conversation() -> None:
     nested = type("Conversation", (), {"conversation_id": "nested-conv"})()
     response = type("SDKResponse", (), {"conversation": nested})()
@@ -121,8 +208,15 @@ def test_send_new_persists_nested_sdk_conversation(tmp_path: Path) -> None:
     assert stdout.getvalue() == "nested reply\n"
 
 
-def test_send_to_explicit_conversation_updates_state(tmp_path: Path) -> None:
+def test_send_to_explicit_conversation_does_not_mutate_attached_state(
+    tmp_path: Path,
+) -> None:
     FakeGpttyClient.instances.clear()
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(
+        state_path,
+        ChatState(current_conversation="attached-ref", model="attached-model"),
+    )
     stdout = StringIO()
 
     code = run_send(
@@ -141,8 +235,8 @@ def test_send_to_explicit_conversation_updates_state(tmp_path: Path) -> None:
             {"stream": False, "model": "gpt-4o"},
         ),
     ]
-    assert state.current_conversation == "explicit-ref"
-    assert state.model == "gpt-4o"
+    assert state.current_conversation == "attached-ref"
+    assert state.model == "attached-model"
 
 
 def test_send_passes_image_media_to_attached_conversation(tmp_path: Path) -> None:
@@ -247,10 +341,19 @@ def test_send_json_format_forces_non_streaming_response(tmp_path: Path) -> None:
     assert client.calls == [
         ("send_to_conversation", ("attached-ref", "continue"), {"stream": False}),
     ]
-    assert json.loads(stdout.getvalue()) == {
-        "text": "reply",
-        "conversation": "attached-ref",
+    payload = json.loads(stdout.getvalue())
+    assert payload["schema"] == 1
+    assert payload["contract"] == "gptty.turn.result"
+    assert payload["status"] == "completed"
+    assert payload["text"] == "reply"
+    assert payload["conversation"] == "attached-ref"
+    assert payload["identity"]["conversation_id"] == "attached-ref"
+    assert payload["model"] == {
+        "requested": None,
+        "sent": None,
+        "observed": None,
     }
+    assert payload["finality"]["terminal_observed"] is None
 
 
 def test_send_markdown_format_forces_non_streaming_response(tmp_path: Path) -> None:
@@ -292,23 +395,22 @@ def test_send_new_starts_new_conversation_and_saves_ref(tmp_path: Path) -> None:
     assert _load_command_session(tmp_path).current_conversation == "new-conv"
 
 
-def test_send_combines_stdin_and_prompt(tmp_path: Path) -> None:
+def test_send_rejects_implicit_stdin_and_prompt_combination(tmp_path: Path) -> None:
     FakeGpttyClient.instances.clear()
     save_chat_state(tmp_path / "gptty_state.json", ChatState(current_conversation="attached-ref"))
+    stderr = StringIO()
 
     code = run_send(
         make_args(tmp_path, prompt=["review", "this"]),
         stdin_text="diff --git",
         client_factory=FakeGpttyClient,
         stdout=StringIO(),
+        stderr=stderr,
     )
 
-    client = FakeGpttyClient.instances[0]
-    assert code == 0
-    assert client.calls[0][1] == (
-        "attached-ref",
-        "diff --git\n\nUser prompt:\nreview this",
-    )
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "cannot be combined implicitly" in stderr.getvalue()
 
 
 def test_send_returns_2_without_attached_conversation(tmp_path: Path) -> None:
@@ -395,7 +497,7 @@ def test_extract_conversation_ref_uses_response_then_fallback() -> None:
     assert extract_conversation_ref(object(), fallback="fallback") == "fallback"
     assert extract_conversation_ref(object()) is None
 
-def test_successful_remote_send_does_not_fail_or_overwrite_on_session_cas_conflict(
+def test_explicit_remote_send_does_not_touch_concurrently_updated_session(
     tmp_path: Path,
 ) -> None:
     state_path = tmp_path / "gptty_state.json"
@@ -439,7 +541,7 @@ def test_successful_remote_send_does_not_fail_or_overwrite_on_session_cas_confli
 
     assert code == 0
     assert stdout.getvalue() == "remote completed\n"
-    assert "ChatGPT turn completed, but local session state was not updated" in stderr.getvalue()
+    assert stderr.getvalue() == ""
     assert _load_command_session(tmp_path).current_conversation == "concurrent-winner"
     assert len(FakeGpttyClient.instances[-1].calls) == 1
 
@@ -501,3 +603,54 @@ def test_send_ambiguous_write_requires_reconciliation_and_is_not_retried(
     assert classification["write_may_have_been_submitted"] is True
     assert classification["reconciliation_required"] is True
     assert events[-1]["failure_classification"] == classification
+
+
+def test_send_jsonl_ambiguous_write_has_machine_reconciliation_flags(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_OUTCOME_UNKNOWN,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    error = BrowserOwnedWriteRuntimeError(
+        "provider failed after delegation",
+        failure_kind=WRITE_OUTCOME_UNKNOWN,
+        automatic_retry_allowed=False,
+        manual_retry_safe_after_repair=False,
+        write_may_have_been_submitted=True,
+        reconciliation_required=True,
+        request_stage="browser_owned_write",
+        status_code=429,
+    )
+
+    class AmbiguousClient(FakeGpttyClient):
+        def send_to_conversation(
+            self,
+            conversation_ref: str,
+            prompt: str,
+            **options: Any,
+        ) -> Response:
+            self.calls.append(
+                ("send_to_conversation", (conversation_ref, prompt), options)
+            )
+            raise error
+
+    stdout = StringIO()
+    code = run_send(
+        make_args(tmp_path, to="explicit-ref", format="jsonl"),
+        client_factory=AmbiguousClient,
+        stdout=stdout,
+        stderr=StringIO(),
+    )
+
+    rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    failure = rows[-1]
+    assert code == 1
+    assert failure["contract"] == "gptty.turn.result"
+    assert failure["error"]["class"] == "turn_unconfirmed"
+    assert failure["error"]["code"] == WRITE_OUTCOME_UNKNOWN
+    assert failure["error"]["status_code"] == 429
+    assert failure["error"]["request_stage"] == "browser_owned_write"
+    assert failure["error"]["write_may_have_been_submitted"] is True
+    assert failure["error"]["reconciliation_required"] is True

@@ -9,6 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from .automation import (
+    AUTOMATION_SCHEMA,
+    RUN_SUMMARY_CONTRACT,
+    normalize_provider_event,
+    run_event_envelope,
+)
 from .local_store import DB_FILENAME, LocalEventStore, local_store_root
 
 
@@ -26,10 +32,12 @@ class RunRecorder:
         paths: RunPaths,
         summary: dict[str, Any],
         store: LocalEventStore,
+        initial_event: dict[str, Any],
     ) -> None:
         self.paths = paths
         self.summary = summary
         self.store = store
+        self.initial_event = initial_event
 
     @property
     def run_id(self) -> str:
@@ -47,12 +55,13 @@ class RunRecorder:
     def store_file(self) -> Path:
         return self.paths.store_file
 
-    def event(self, event_type: str, **data: Any) -> None:
-        event = {
-            "type": event_type,
-            "timestamp": utc_now(),
-            **data,
-        }
+    def event(self, event_type: str, **data: Any) -> dict[str, Any]:
+        event = run_event_envelope(
+            run_id=self.run_id,
+            event_type=event_type,
+            timestamp=utc_now(),
+            data=data,
+        )
         self.summary["last_event"] = event_type
         self.summary["updated_at"] = event["timestamp"]
         self.store.append_run_event(
@@ -61,11 +70,26 @@ class RunRecorder:
             event=event,
         )
         self._project(event)
+        return event
 
-    def complete(self) -> None:
+    def provider_event(self, event: Any) -> dict[str, Any] | None:
+        normalized = normalize_provider_event(event)
+        if normalized is None:
+            return None
+        return self.event("provider_event", **normalized)
+
+    def bind_conversation(self, conversation_ref: str) -> dict[str, Any]:
+        self.summary["conversation_ref"] = conversation_ref
+        return self.event("conversation_bound", conversation_ref=conversation_ref)
+
+    def complete(self, *, turn_result: dict[str, Any] | None = None) -> dict[str, Any]:
         self.summary["status"] = "completed"
         self.summary["completed_at"] = utc_now()
-        self.event("completed")
+        event_data: dict[str, Any] = {}
+        if isinstance(turn_result, dict):
+            self.summary["turn_result"] = dict(turn_result)
+            event_data["turn_result"] = dict(turn_result)
+        return self.event("completed", **event_data)
 
     def fail(
         self,
@@ -73,20 +97,25 @@ class RunRecorder:
         *,
         traceback_text: str | None = None,
         failure_classification: dict[str, Any] | None = None,
-    ) -> None:
+        turn_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.summary["status"] = "failed"
         self.summary["error"] = message
         if isinstance(failure_classification, dict):
             self.summary["failure_classification"] = dict(failure_classification)
         if isinstance(traceback_text, str) and traceback_text.strip():
             self.summary["traceback"] = traceback_text
+        if isinstance(turn_result, dict):
+            self.summary["turn_result"] = dict(turn_result)
         self.summary["completed_at"] = utc_now()
         event_data: dict[str, Any] = {"message": message}
         if isinstance(failure_classification, dict):
             event_data["failure_classification"] = dict(failure_classification)
+        if isinstance(turn_result, dict):
+            event_data["turn_result"] = dict(turn_result)
         if isinstance(traceback_text, str) and traceback_text.strip():
             event_data["traceback"] = traceback_text
-        self.event("failed", **event_data)
+        return self.event("failed", **event_data)
 
     def _project(self, event: dict[str, Any]) -> None:
         try:
@@ -119,7 +148,7 @@ def start_run(
     profile: str | None,
     state_path: str | Path,
     command: str,
-    conversation_ref: str,
+    conversation_ref: str | None,
 ) -> RunRecorder:
     root = run_dir(profile=profile, state_path=state_path)
     run_id = uuid.uuid4().hex
@@ -130,11 +159,14 @@ def start_run(
         store_file=root / DB_FILENAME,
     )
     started_at = utc_now()
-    first_event = {
-        "type": "run_started",
-        "timestamp": started_at,
-    }
+    first_event = run_event_envelope(
+        run_id=run_id,
+        event_type="run_started",
+        timestamp=started_at,
+    )
     summary: dict[str, Any] = {
+        "schema": AUTOMATION_SCHEMA,
+        "contract": RUN_SUMMARY_CONTRACT,
         "run_id": run_id,
         "profile": profile,
         "command": command,
@@ -152,7 +184,7 @@ def start_run(
         summary=summary,
         first_event=first_event,
     )
-    recorder = RunRecorder(paths, summary, store)
+    recorder = RunRecorder(paths, summary, store, first_event)
     recorder._project(first_event)
     return recorder
 

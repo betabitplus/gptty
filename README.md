@@ -28,7 +28,7 @@ gptty auth status
 gptty auth refresh --mode wait
 gptty ask "explain this error"
 gptty ask --image screenshot.png "describe this UI"
-git diff | gptty ask "review this patch"
+{ printf 'Review this patch:\n\n'; git diff; } | gptty ask
 gptty attach https://chatgpt.com/c/...
 gptty send "continue from here"
 gptty messages --last 5 --format markdown
@@ -48,11 +48,11 @@ gptty export --format markdown --output conversation.md
 - SDK-backed image prompts through `gptty ask --image` and `gptty send --image`
 - inspect attached or explicit conversations through `gptty messages` and `gptty status`
 - export attached or explicit conversations through `gptty export`
-- output modes for `messages`, `status`, `send`, and `export`: `plain`, `json`, `markdown`
+- output modes for `messages`, `status`, `send`, and `export`: `plain`, `json`, `markdown`; `ask` and `send` also provide versioned `jsonl` automation streams
 - legacy interactive chat fallback through `gptty chat --legacy`
 - one-shot SDK-backed prompts through `gptty ask`
-- centralized stdin policy for pipe-friendly prompts
-- pipe-friendly prompts, for example `git diff | gptty ask "review this patch"`
+- bounded text stdin for scripting (4 MiB by default, configurable with `--stdin-max-bytes`), with NUL/binary-looking input rejected before a write
+- transparent pipe-friendly prompts: stdin and positional prompt text are never silently rewritten or combined
 - streaming replies in the terminal
 - transactional local session state in `local-state.sqlite3` (SQLite/WAL), shared with local run/TUI/delivery evidence
 - independent interactive runtime sessions by default; use `--session NAME` (or `GPTTY_SESSION_ID`) only when you intentionally want several commands/processes to reuse one local conversation/model selection
@@ -158,13 +158,15 @@ Send a prompt to the attached conversation:
 gptty send "continue from here"
 ```
 
-Pipe stdin into the attached conversation:
+Pipe an exact prompt into the attached conversation:
 
 ```bash
-git diff | gptty send "review this patch"
+{ printf 'Review this patch:\n\n'; git diff; } | gptty send
 ```
 
-Send to an explicit conversation without changing first through `attach`:
+stdin and positional prompt text are mutually exclusive. If a pipe is present but should be ignored, use `--no-stdin`; if a custom safety bound is needed, use `--stdin-max-bytes BYTES`.
+
+Send to an explicit conversation without changing the currently attached local session:
 
 ```bash
 gptty send --to https://chatgpt.com/c/... "continue there"
@@ -194,18 +196,20 @@ gptty messages --last 5
 gptty status
 ```
 
-Use JSON or Markdown output for scripts and exports:
+Use JSON or Markdown output for scripts and exports, or versioned JSONL for streaming automation:
 
 ```bash
 gptty messages --last 5 --format json
 gptty messages --last 5 --format markdown
 gptty status --format json
 gptty send --format json "summarize the current thread"
+gptty send --format jsonl "summarize the current thread"
+gptty ask --format jsonl "explain this error"
 gptty export --format markdown --output conversation.md
 gptty export --format json --output conversation.json
 ```
 
-When `gptty send` uses `--format json` or `--format markdown`, streaming is disabled internally so the output stays complete and parseable.
+`gptty send --format json` returns a rich versioned final record with conversation/message identity, model and effort provenance, finality and observations. `--format jsonl` emits one JSON object per event and ends with the same `gptty.turn.result` contract. Markdown remains a human-readable final-text surface and is non-streaming.
 
 You can also inspect or export an explicit conversation without attaching it:
 
@@ -264,18 +268,18 @@ One-shot SDK-backed prompt:
 gptty ask "explain this error"
 ```
 
-Pipe stdin into the prompt:
+Pipe an exact prompt through stdin:
 
 ```bash
-git diff | gptty ask "review this patch"
+{ printf 'Review this patch:\n\n'; git diff; } | gptty ask
 ```
 
-When stdin and a prompt are both present, `gptty ask` and `gptty send` send stdin as context, followed by the prompt under `User prompt:`.
+stdin and positional prompt text cannot be combined implicitly; gptty never inserts its own framing into user input. Use stdin alone, or use `--no-stdin` when a positional prompt should ignore a pipe. stdin is capped at 4 MiB by default, rejects NUL/binary-looking input, and can be bounded differently with `--stdin-max-bytes BYTES`.
 
-Force reading stdin:
+Force reading stdin even when it looks interactive:
 
 ```bash
-gptty ask --stdin "summarize this input"
+gptty ask --stdin
 ```
 
 Ignore piped stdin:

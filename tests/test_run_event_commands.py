@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from io import StringIO
 from pathlib import Path
@@ -32,6 +33,42 @@ class FakeGpttyClient:
         on_token = options.get("on_token")
         if on_token is not None:
             on_token("hello")
+        return Response()
+
+
+class FakeProviderEventClient(FakeGpttyClient):
+    def send_to_conversation(
+        self,
+        conversation_ref: str,
+        prompt: str,
+        **options: Any,
+    ) -> Response:
+        self.calls.append(("send_to_conversation", (conversation_ref, prompt), options))
+        on_event = options.get("on_event")
+        if on_event is not None:
+            on_event(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_kind": "tool_call",
+                    "message_id": "tool-call-message",
+                    "tool_call_id": "tool-call-message",
+                    "tool_name": "api_tool.call_tool",
+                    "turn_exchange_id": "turn-1",
+                    "text": "{\"path\":\"bash\"}",
+                }
+            )
+            on_event(
+                {
+                    "type": "product_source_observed",
+                    "observation_schema": 1,
+                    "observation_id": "source-observation:1",
+                    "source_id": "source-1",
+                    "url": "https://example.com/source",
+                    "title": "Source",
+                    "domain": "example.com",
+                    "source_origin": "canonical_content_references",
+                }
+            )
         return Response()
 
 
@@ -97,6 +134,37 @@ def test_send_writes_run_events_for_attached_conversation(tmp_path: Path) -> Non
     assert events[3]["text"] == "hello"
 
 
+def test_send_records_versioned_typed_provider_events(tmp_path: Path) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(state_path, ChatState(current_conversation="conv-1"))
+
+    code = run_send(
+        make_args(tmp_path),
+        client_factory=FakeProviderEventClient,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    run_file = next((tmp_path / ".gptty_runs").glob("*.json"))
+    summary = read_run_summary(run_file)
+    events = read_run_events(summary["events_file"], from_start=True)
+    provider_events = [event for event in events if event["type"] == "provider_event"]
+
+    assert [event["kind"] for event in provider_events] == ["tool", "source"]
+    tool_event, source_event = provider_events
+    assert tool_event["schema"] == 1
+    assert tool_event["contract"] == "gptty.run.event"
+    assert tool_event["provenance"] == {
+        "producer": "chatgpt-web-adapter",
+        "source": "provider-event",
+    }
+    assert tool_event["tool_call_id"] == "tool-call-message"
+    assert tool_event["turn_exchange_id"] == "turn-1"
+    assert source_event["source_id"] == "source-1"
+    assert source_event["url"] == "https://example.com/source"
+
+
 def test_send_marks_required_action_run_as_failed(tmp_path: Path) -> None:
     state_path = tmp_path / "gptty_state.json"
     save_chat_state(state_path, ChatState(current_conversation="conv-1"))
@@ -124,3 +192,36 @@ def test_send_marks_required_action_run_as_failed(tmp_path: Path) -> None:
         "failed",
     ]
     assert "requires a web UI action" in stderr.getvalue()
+
+
+def test_send_jsonl_represents_required_action_and_final_failure(tmp_path: Path) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(state_path, ChatState(current_conversation="conv-1"))
+    stdout = StringIO()
+    stderr = StringIO()
+
+    code = run_send(
+        make_args(tmp_path, format="jsonl"),
+        client_factory=FakeRequiredActionClient,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    action = next(row for row in rows if row["type"] == "required_action")
+    failure = rows[-1]
+    assert code == 1
+    assert action["kind"] == "action"
+    assert action["action_type"] == "connector_oauth"
+    assert action["reason"] == "Connect Gmail"
+    assert action["actions"] == ["connect", "not_now"]
+    assert action["conversation"] == "conv-1"
+    assert failure["contract"] == "gptty.turn.result"
+    assert failure["error"]["class"] == "required_action"
+    assert failure["error"]["code"] == "required_action"
+    assert failure["conversation"] == "conv-1"
+    assert "requires a web UI action" in stderr.getvalue()
+
+    run_file = next((tmp_path / ".gptty_runs").glob("*.json"))
+    summary = read_run_summary(run_file)
+    assert summary["turn_result"]["error"]["class"] == "required_action"

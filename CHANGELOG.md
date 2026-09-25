@@ -6,6 +6,8 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- automation: add a versioned `jsonl` contract for `ask`/`send`, rich final JSON with conversation/message/model/effort/finality provenance, typed tool/action/source/citation observations, machine-readable required-action and ambiguous-write failures, and durable pre-write run journals for new chats; one-off `send --to` no longer mutates the attached local session
+- scripting: make stdin explicit and bounded — stdin and positional prompts are no longer silently combined, text stdin is capped at 4 MiB by default with `--stdin-max-bytes` override, and NUL/binary-looking or oversized input fails before any ChatGPT write with stable JSONL error classes
 - recovery: supersede stale local chat-level terminal evidence only from stronger typed proof, use explicit CWA canonical-read provenance for resume/follow reconciliation, keep resolution append-only and race-safe, and preserve recurring terminal states after resolution without leaking reconciliation bookkeeping into the human transcript
 - stop/recovery: normalize provider Stop proof and verified conversation identity, allow Stop to supersede stale chat-level evidence only for the exact proven conversation, and refuse to rebind an attached chat from an unverified drifted Stop route
 - goal/recovery: centralize Goal terminal disposition for result and failure paths so ambiguous writes, dead chats, blocking states, service backoff and truncated recovery cannot diverge between entry points

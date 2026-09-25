@@ -2751,6 +2751,8 @@ def _send_chat_prompt(
                     "final_text_seen": turn_health.answer_progress_seen,
                     "last_tool_error": turn_health.last_tool_error or None,
                 }
+        if recorder is not None:
+            recorder.provider_event(event)
         if (
             recorder is not None
             and isinstance(event_type, str)

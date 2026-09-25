@@ -12,6 +12,13 @@ DEFAULT_TURN_TIMEOUT_SECONDS = 7200
 BROWSER_BACKEND_CHOICES = ("chrome-native", "wkwebview")
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _add_backend_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
@@ -109,6 +116,16 @@ def _add_stdin_options(parser: argparse.ArgumentParser) -> None:
         const="never",
         help="Ignore stdin, even when input is piped.",
     )
+    parser.add_argument(
+        "--stdin-max-bytes",
+        type=_positive_int,
+        default=None,
+        metavar="BYTES",
+        help=(
+            "Override the stdin safety limit in bytes. "
+            "The default is 4 MiB."
+        ),
+    )
 
 
 def _add_image_options(parser: argparse.ArgumentParser) -> None:
@@ -121,10 +138,16 @@ def _add_image_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_output_format_option(parser: argparse.ArgumentParser, *, default: str = "plain") -> None:
+def _add_output_format_option(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str = "plain",
+    jsonl: bool = False,
+) -> None:
+    choices = ("plain", "json", "jsonl", "markdown") if jsonl else ("plain", "json", "markdown")
     parser.add_argument(
         "--format",
-        choices=("plain", "json", "markdown"),
+        choices=choices,
         default=default,
         help="Output format.",
     )
@@ -237,6 +260,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print plain response text. Currently this is the default output mode.",
     )
+    _add_output_format_option(ask_parser, jsonl=True)
     ask_parser.add_argument(
         "--timeout",
         type=int,
@@ -268,7 +292,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_image_options(send_parser)
     _add_session_options(send_parser)
     send_parser.set_defaults(timeout=DEFAULT_TURN_TIMEOUT_SECONDS)
-    _add_output_format_option(send_parser)
+    _add_output_format_option(send_parser, jsonl=True)
     _add_lock_options(send_parser)
     send_parser.add_argument(
         "--model",
@@ -461,6 +485,36 @@ def _apply_session_paths(args: argparse.Namespace, *, state_filename: str = "gpt
     return True
 
 
+def _read_command_stdin(args: argparse.Namespace) -> str | None:
+    mode = getattr(args, "stdin_mode", "auto")
+    max_bytes = getattr(args, "stdin_max_bytes", None)
+    if max_bytes is None:
+        return read_stdin_text(mode)
+    return read_stdin_text(mode, max_bytes=max_bytes)
+
+
+def _report_stdin_error(args: argparse.Namespace, exc: StdinReadError) -> int:
+    exit_code = int(getattr(exc, "exit_code", 1))
+    if getattr(args, "format", None) == "jsonl":
+        from .output import normalize_turn_failure, render_jsonl_event
+
+        print(
+            render_jsonl_event(
+                normalize_turn_failure(
+                    {
+                        "status": "usage-error" if exit_code == 2 else "failed",
+                        "message": str(exc),
+                        "source": "stdin",
+                    },
+                    exit_code=exit_code,
+                    error_class=getattr(exc, "error_class", "stdin_read"),
+                )
+            )
+        )
+    print(f"gptty: {exc}", file=sys.stderr)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -490,10 +544,9 @@ def main(argv: list[str] | None = None) -> int:
         if not _apply_auth_path(args):
             return 2
         try:
-            stdin_text = read_stdin_text(getattr(args, "stdin_mode", "auto"))
+            stdin_text = _read_command_stdin(args)
         except StdinReadError as exc:
-            print(f"gptty: {exc}", file=sys.stderr)
-            return 1
+            return _report_stdin_error(args, exc)
         return run_ask(args, stdin_text=stdin_text)
 
     if args.command == "send":
@@ -502,10 +555,9 @@ def main(argv: list[str] | None = None) -> int:
         if not _apply_session_paths(args):
             return 2
         try:
-            stdin_text = read_stdin_text(getattr(args, "stdin_mode", "auto"))
+            stdin_text = _read_command_stdin(args)
         except StdinReadError as exc:
-            print(f"gptty: {exc}", file=sys.stderr)
-            return 1
+            return _report_stdin_error(args, exc)
         return run_send(args, stdin_text=stdin_text)
 
     if args.command == "attach":

@@ -30,6 +30,12 @@ def test_start_run_writes_summary_and_events(tmp_path) -> None:
         "token_delta",
         "completed",
     ]
+    assert summary["schema"] == 1
+    assert summary["contract"] == "gptty.run.summary"
+    assert all(event["schema"] == 1 for event in events)
+    assert all(event["contract"] == "gptty.run.event" for event in events)
+    assert all(event["run_id"] == recorder.run_id for event in events)
+    assert all(isinstance(event["event_id"], str) and event["event_id"] for event in events)
 
 
 def test_fail_persists_traceback_in_summary_and_event(tmp_path) -> None:

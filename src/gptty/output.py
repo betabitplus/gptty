@@ -4,7 +4,13 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-OutputFormat = Literal["plain", "json", "markdown"]
+from .automation import (
+    AUTOMATION_SCHEMA,
+    TURN_RESULT_CONTRACT,
+    summarize_observations,
+)
+
+OutputFormat = Literal["plain", "json", "jsonl", "markdown"]
 
 CONVERSATION_FIELDS = (
     "conversation_url",
@@ -121,14 +127,157 @@ def normalize_response(response: Any, *, conversation: str | None = None) -> dic
     return data
 
 
+def normalize_turn_result(
+    response: Any,
+    *,
+    conversation: str | None = None,
+    exit_code: int = 0,
+    observations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    base = normalize_response(response, conversation=conversation)
+    request = _field(response, "request")
+    conversation_value = _field(response, "conversation")
+    metrics = _mapping_value(_field(response, "metrics"))
+
+    requested_model = _field(request, "requested_model")
+    sent_model = _field(request, "sent_model")
+    observed_model = _field(request, "observed_model")
+    requested_effort = _field(request, "requested_reasoning_effort")
+    sent_effort = _field(request, "sent_reasoning_effort")
+    observed_effort = _field(request, "observed_reasoning_effort")
+    terminal_observed = _field(request, "terminal_observed")
+    terminal_source = _field(request, "terminal_source")
+    terminal_error_code = _field(request, "terminal_error_code")
+    terminal_error = _field(request, "terminal_error")
+    turn_exchange_id = _field(request, "turn_exchange_id")
+
+    conversation_id = (
+        _field(conversation_value, "conversation_id")
+        or _field(response, "conversation_id")
+        or base.get("conversation")
+    )
+    message_id = (
+        _field(conversation_value, "message_id")
+        or _field(response, "message_id")
+        or _field(request, "message_id")
+    )
+    finish_reason = (
+        _field(conversation_value, "finish_reason")
+        or _field(response, "finish_reason")
+        or _field(request, "finish_reason")
+    )
+
+    result: dict[str, Any] = {
+        "schema": AUTOMATION_SCHEMA,
+        "contract": TURN_RESULT_CONTRACT,
+        "type": "turn_result",
+        "status": "completed",
+        "exit_code": int(exit_code),
+        **base,
+        "title": _field(response, "title"),
+        "identity": {
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "finish_reason": finish_reason,
+        },
+        "model": {
+            "requested": requested_model,
+            "sent": sent_model,
+            "observed": observed_model,
+        },
+        "reasoning_effort": {
+            "requested": requested_effort,
+            "sent": sent_effort,
+            "observed": observed_effort,
+        },
+        "finality": {
+            "terminal_observed": (
+                bool(terminal_observed) if isinstance(terminal_observed, bool) else None
+            ),
+            "source": terminal_source,
+            "error_code": terminal_error_code,
+            "error": terminal_error,
+        },
+        "provenance": {
+            "producer": "chatgpt-web-adapter",
+            "source": "response",
+            "turn_exchange_id": turn_exchange_id,
+        },
+        "observations": summarize_observations(observations),
+    }
+    if metrics:
+        result["metrics"] = metrics
+    return result
+
+
+def normalize_turn_failure(
+    failure: Any,
+    *,
+    conversation: str | None = None,
+    exit_code: int = 1,
+    raw_error: str | None = None,
+    error_class: str | None = None,
+) -> dict[str, Any]:
+    payload = _mapping_value(failure)
+    status = _optional_string(payload.get("status")) or "failed"
+    stable_class = _optional_string(error_class) or (
+        "turn_" + status.lower().replace("-", "_").replace(" ", "_")
+    )
+    result: dict[str, Any] = {
+        "schema": AUTOMATION_SCHEMA,
+        "contract": TURN_RESULT_CONTRACT,
+        "type": "turn_result",
+        "status": status,
+        "exit_code": int(exit_code),
+        "text": "",
+        "error": {
+            "class": stable_class,
+            "label": payload.get("label"),
+            "code": payload.get("code"),
+            "status_code": payload.get("status_code"),
+            "request_stage": payload.get("request_stage"),
+            "message": payload.get("message") or raw_error or "request failed",
+            "source": payload.get("source"),
+            "write_may_have_been_submitted": payload.get(
+                "write_may_have_been_submitted"
+            ),
+            "reconciliation_required": payload.get("reconciliation_required"),
+            "automatic_retry_allowed": payload.get("automatic_retry_allowed"),
+            "manual_retry_safe_after_repair": payload.get(
+                "manual_retry_safe_after_repair"
+            ),
+        },
+        "provenance": {
+            "producer": "gptty",
+            "source": "command-boundary",
+        },
+    }
+    if conversation:
+        result["conversation"] = conversation
+    if raw_error:
+        result["diagnostic_error"] = raw_error
+    return result
+
+
 def render_response(response: dict[str, Any], output_format: OutputFormat = "plain") -> str:
     if output_format == "plain":
         return str(response.get("text", ""))
     if output_format == "json":
         return _json_dump(response)
+    if output_format == "jsonl":
+        return render_jsonl_event(response)
     if output_format == "markdown":
         return str(response.get("text", ""))
     raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def render_jsonl_event(event: Any) -> str:
+    return json.dumps(
+        _to_jsonable(event),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def render_live_event(event: Any) -> str | None:
@@ -349,6 +498,29 @@ def _field(value: Any, field: str) -> Any:
     if isinstance(value, dict):
         return value.get(field)
     return getattr(value, field, None)
+
+
+def _mapping_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            payload = to_dict()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            return dict(payload)
+    if hasattr(value, "__dict__"):
+        return dict(vars(value))
+    return {}
+
+
+def _optional_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 def _object_fields(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:

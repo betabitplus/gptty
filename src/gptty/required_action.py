@@ -12,6 +12,36 @@ CONVERSATION_FIELDS = (
 )
 
 
+def required_action_state(
+    client: Any,
+    response: Any,
+    *,
+    fallback_conversation: Any = None,
+) -> tuple[Any, Any] | None:
+    """Return a required action and its conversation when the SDK exposes one.
+
+    The helper is deliberately compatible with older chatgpt-web-adapter
+    releases where get_required_action does not exist yet.
+    """
+
+    get_required_action = getattr(client, "get_required_action", None)
+    if not callable(get_required_action):
+        return None
+
+    conversation = _conversation_from_response(response) or fallback_conversation
+    if not conversation:
+        return None
+
+    try:
+        action = get_required_action(conversation)
+    except Exception:
+        return None
+
+    if action is None:
+        return None
+    return action, conversation
+
+
 def maybe_render_required_action(
     client: Any,
     response: Any,
@@ -19,29 +49,16 @@ def maybe_render_required_action(
     stderr: TextIO,
     fallback_conversation: Any = None,
 ) -> bool:
-    """Render SDK required-action state when available.
+    """Render SDK required-action state when available."""
 
-    Returns True when a required action was found and printed. The helper is
-    deliberately compatible with older chatgpt-web-adapter releases where
-    get_required_action does not exist yet.
-    """
-
-    get_required_action = getattr(client, "get_required_action", None)
-    if not callable(get_required_action):
+    state = required_action_state(
+        client,
+        response,
+        fallback_conversation=fallback_conversation,
+    )
+    if state is None:
         return False
-
-    conversation = _conversation_from_response(response) or fallback_conversation
-    if not conversation:
-        return False
-
-    try:
-        action = get_required_action(conversation)
-    except Exception:
-        return False
-
-    if action is None:
-        return False
-
+    action, conversation = state
     print(render_required_action(action, conversation=conversation), file=stderr)
     return True
 
