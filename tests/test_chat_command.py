@@ -1189,6 +1189,219 @@ def test_ctrl_c_stops_active_turn_and_keeps_new_chat_attached(
     assert notified == []
 
 
+def test_ctrl_c_verified_stop_supersedes_stale_chat_terminal_state(
+    tmp_path,
+) -> None:
+    controls = TurnControlSignals()
+    conversation_ref = "conv-verified-stop"
+    release = threading.Event()
+
+    class StopClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send_to_conversation(self, ref, prompt, **options):
+            self.calls.append(("send_to_conversation", ref))
+            options["on_event"](
+                {
+                    "type": "browser_native_write_completed",
+                    "conversation_id": ref,
+                }
+            )
+            controls.request_stop()
+            assert release.wait(timeout=2.0)
+            return Response(
+                text="partial answer",
+                conversation_id=ref,
+                title="Stopped Chat",
+            )
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            release.set()
+            return {
+                "ok": True,
+                "stopped": True,
+                "conversationId": ref,
+                "provider": "wkwebview",
+                "proof": "canonical_client_stopped",
+                "conversationIdentityVerified": True,
+            }
+
+    archive = TUIArchive(tmp_path / "archive")
+    archive.record_observed_terminal(
+        conversation_ref=conversation_ref,
+        label="chat",
+        status="limit-reached",
+        text="This conversation previously reached its maximum length.",
+        source="stream",
+    )
+    class FakeRenderer:
+        def answer(self, text):
+            return None
+
+        def chat_link(self, ref):
+            return None
+
+        def turn_abort(self):
+            return None
+
+        def info(self, text):
+            return None
+
+        def warning(self, text):
+            return None
+
+        def live_event(self, event):
+            return None
+
+    state_path = tmp_path / "state.json"
+    state = ChatState(current_conversation=conversation_ref)
+    save_chat_state(state_path, state)
+    client = StopClient()
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=state_path,
+        profile=None,
+        prompt="continue briefly",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=FakeRenderer(),
+        turn_controls=controls,
+        tui_archive=archive,
+    )
+
+    assert code == 0
+    assert client.calls == [
+        ("send_to_conversation", conversation_ref),
+        ("stop_generation", conversation_ref),
+    ]
+    assert archive.conversation_terminal_marker(conversation_ref) is None
+    events = archive.store.tui_events(conversation_ref)
+    assert events[-1]["terminal_resolution"] is True
+    assert events[-1]["resolved_status"] == "limit-reached"
+    assert (
+        events[-1]["terminal_source"]
+        == "stop:wkwebview:canonical_client_stopped"
+    )
+
+
+def test_ctrl_c_unverified_mismatched_stop_keeps_attached_conversation_and_marker(
+    tmp_path,
+) -> None:
+    controls = TurnControlSignals()
+    conversation_ref = "conv-attached-stop"
+    drifted_ref = "conv-drifted-stop"
+    release = threading.Event()
+
+    class StopClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def send_to_conversation(self, ref, prompt, **options):
+            self.calls.append(("send_to_conversation", ref))
+            options["on_event"](
+                {
+                    "type": "browser_native_write_completed",
+                    "conversation_id": ref,
+                }
+            )
+            controls.request_stop()
+            assert release.wait(timeout=2.0)
+            return Response(
+                text="partial answer",
+                conversation_id=ref,
+                title="Stopped Chat",
+            )
+
+        def stop_generation(self, ref=None, **options):
+            self.calls.append(("stop_generation", ref))
+            release.set()
+            return {
+                "ok": True,
+                "stopped": True,
+                "conversationId": drifted_ref,
+                "provider": "browser-native",
+                "proof": "browser_stop_control",
+                "conversationIdentityVerified": False,
+            }
+
+    archive = TUIArchive(tmp_path / "archive")
+    archive.record_observed_terminal(
+        conversation_ref=conversation_ref,
+        label="chat",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+        source="stream",
+    )
+
+    class FakeRenderer:
+        def answer(self, text):
+            return None
+
+        def chat_link(self, ref):
+            return None
+
+        def turn_abort(self):
+            return None
+
+        def info(self, text):
+            return None
+
+        def warning(self, text):
+            return None
+
+        def live_event(self, event):
+            return None
+
+        def turn_marker(self, *marker):
+            return None
+
+    state_path = tmp_path / "state.json"
+    state = ChatState(current_conversation=conversation_ref)
+    save_chat_state(state_path, state)
+    client = StopClient()
+
+    code = _send_chat_prompt(
+        client,
+        state=state,
+        state_path=state_path,
+        profile=None,
+        prompt="continue briefly",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=FakeRenderer(),
+        turn_controls=controls,
+        tui_archive=archive,
+    )
+
+    assert code == 0
+    assert client.calls == [
+        ("send_to_conversation", conversation_ref),
+        ("stop_generation", conversation_ref),
+    ]
+    assert state.current_conversation == conversation_ref
+    assert load_chat_state(state_path).current_conversation == conversation_ref
+    assert archive.conversation_terminal_marker(conversation_ref) == (
+        "chat",
+        "unavailable",
+        "This conversation was previously unavailable.",
+        "stream",
+    )
+    assert not any(
+        event.get("terminal_resolution") is True
+        for event in archive.store.tui_events(conversation_ref)
+    )
+
+
 def test_ctrl_c_new_chat_uses_browser_write_conversation_identity(tmp_path) -> None:
     controls = TurnControlSignals()
 

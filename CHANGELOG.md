@@ -7,6 +7,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 ## Unreleased
 
 - recovery: supersede stale local chat-level terminal evidence only from stronger typed proof, use explicit CWA canonical-read provenance for resume/follow reconciliation, keep resolution append-only and race-safe, and preserve recurring terminal states after resolution without leaking reconciliation bookkeeping into the human transcript
+- stop/recovery: normalize provider Stop proof and verified conversation identity, allow Stop to supersede stale chat-level evidence only for the exact proven conversation, and refuse to rebind an attached chat from an unverified drifted Stop route
 - recovery: classify CWA turn failures from structured provider evidence before compatibility text fallbacks, and block Goal after ambiguous post-submit writes instead of automatically resending or rolling over
 - sessions: replace terminal-hash JSON session authority with a revisioned SQLite session registry, add intentional `--session NAME` reuse, atomically claim one-time legacy imports, retain legacy Goal payload as crash-recovery input, and fail closed on stale local writers without age-evicting unleased live sessions or making an already-completed ChatGPT turn retryable
 - durability: make one SQLite/WAL local event store authoritative for run events and normal TUI observations, with bounded recent queries, transactional dedupe, private storage, incremental portable projections, and projection repair after crashes

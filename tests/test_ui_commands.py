@@ -824,6 +824,90 @@ def test_stop_command_stops_current_chat_without_detaching(tmp_path) -> None:
     assert ("info", "Stop requested.") in renderer.events
 
 
+def test_verified_stop_supersedes_stale_terminal_marker(tmp_path) -> None:
+    class VerifiedStopClient(FakeClient):
+        def stop_generation(self, ref, **options):
+            self.calls.append(("stop_generation", (ref, options)))
+            return {
+                "ok": True,
+                "stopped": True,
+                "conversationId": ref,
+                "provider": "browser-native",
+                "proof": "browser_stop_control",
+                "conversationIdentityVerified": True,
+            }
+
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-12345678",
+        status="limit-reached",
+        text="This conversation previously reached its maximum length.",
+    )
+    state = ChatState(current_conversation="conv-12345678")
+    commands, renderer, client, _ = make_commands(
+        tmp_path,
+        state=state,
+        client=VerifiedStopClient(),
+        tui_archive=archive,
+    )
+
+    commands.handle("/stop")
+
+    assert ("stop_generation", ("conv-12345678", {"timeout": 2.0})) in client.calls
+    assert archive.conversation_terminal_marker("conv-12345678") is None
+    events = archive.store.tui_events("conv-12345678")
+    assert events[-1]["terminal_resolution"] is True
+    assert events[-1]["resolved_status"] == "limit-reached"
+    assert (
+        events[-1]["terminal_source"]
+        == "stop:browser-native:browser_stop_control"
+    )
+    assert ("info", "Stop requested.") in renderer.events
+
+
+def test_stop_without_verified_identity_keeps_stale_terminal_marker(tmp_path) -> None:
+    class UnverifiedStopClient(FakeClient):
+        def stop_generation(self, ref, **options):
+            self.calls.append(("stop_generation", (ref, options)))
+            return {
+                "ok": True,
+                "stopped": True,
+                "conversationId": ref,
+                "provider": "browser-native",
+                "proof": "browser_stop_control",
+                "conversationIdentityVerified": False,
+            }
+
+    archive = TUIArchive(tmp_path / "archive")
+    _seed_chat_terminal(
+        archive,
+        "conv-12345678",
+        status="unavailable",
+        text="This conversation was previously unavailable.",
+    )
+    state = ChatState(current_conversation="conv-12345678")
+    commands, _renderer, _client, _ = make_commands(
+        tmp_path,
+        state=state,
+        client=UnverifiedStopClient(),
+        tui_archive=archive,
+    )
+
+    commands.handle("/stop")
+
+    assert archive.conversation_terminal_marker("conv-12345678") == (
+        "chat",
+        "unavailable",
+        "This conversation was previously unavailable.",
+        "stream",
+    )
+    assert not any(
+        event.get("terminal_resolution") is True
+        for event in archive.store.tui_events("conv-12345678")
+    )
+
+
 def test_temporary_command_clears_persistent_attachment_without_persisting_temp_id(
     tmp_path,
 ) -> None:

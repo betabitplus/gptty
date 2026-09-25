@@ -42,7 +42,11 @@ from ..goal_lock import (
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
-from ..reconciliation import ChatTerminalEvidence, chat_terminal_resolution
+from ..reconciliation import (
+    ChatTerminalEvidence,
+    chat_terminal_resolution,
+    stop_terminal_evidence,
+)
 from ..state import ChatState, GoalAcceptanceCriterion, GoalState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from ..turn_control import StopOutcome, request_stop_generation
@@ -1892,6 +1896,37 @@ class InteractiveCommands:
             "Detached locally. The ChatGPT conversation was not changed."
         )
 
+    def _reconcile_stop_terminal_marker(
+        self,
+        ref: str,
+        outcome: StopOutcome,
+    ) -> bool:
+        if self.tui_archive is None or not outcome.stopped:
+            return False
+        try:
+            marker = self.tui_archive.conversation_terminal_marker(ref)
+        except Exception:
+            return False
+        evidence = stop_terminal_evidence(
+            expected_conversation_ref=ref,
+            stopped=outcome.stopped,
+            stopped_conversation_ref=outcome.conversation_ref,
+            provider=outcome.provider,
+            proof=outcome.proof,
+            identity_verified=outcome.identity_verified,
+        )
+        resolution = chat_terminal_resolution(marker, evidence)
+        if resolution is None:
+            return False
+        try:
+            return self.tui_archive.record_chat_terminal_resolution(
+                conversation_ref=ref,
+                resolved_status=resolution.status,
+                source=resolution.source,
+            )
+        except Exception:
+            return False
+
     def _cmd_stop(self, argv: list[str]) -> None:
         if self._reject_remote_goal_mutation("stopping the active response"):
             return
@@ -1905,6 +1940,7 @@ class InteractiveCommands:
         client = self.get_client()
         outcome = self._request_stop_generation(client, ref)
         if outcome is not None and outcome.stopped:
+            self._reconcile_stop_terminal_marker(ref, outcome)
             self.renderer.turn_abort()
             self.renderer.info("Stop requested.")
 

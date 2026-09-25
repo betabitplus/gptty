@@ -37,13 +37,14 @@ from ..reconciliation import (
     ChatTerminalEvidence,
     chat_terminal_resolution,
     same_conversation_ref,
+    stop_terminal_evidence,
 )
 from ..runs import RunRecorder, start_run
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError, session_handle_for_args
 from ..state import ChatState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
-from ..turn_control import request_stop_generation
+from ..turn_control import StopOutcome, request_stop_generation
 from ..turn_failure import classify_turn_failure
 from ..ui.commands import (
     UNFINISHED_STATUSES,
@@ -2707,6 +2708,7 @@ def _send_chat_prompt(
     recorder: RunRecorder | None = None
     completed_successfully = False
     stopped_by_user = False
+    confirmed_stop_outcome: StopOutcome | None = None
     local_quit_requested = False
     incomplete_turn = False
     write_committed = threading.Event()
@@ -2972,8 +2974,16 @@ def _send_chat_prompt(
 
                 stop_pending = False
                 stopped_by_user = True
+                confirmed_stop_outcome = stop_outcome
                 stop_ref = stop_outcome.conversation_ref
-                if stop_ref and not stop_ref.startswith("WEB:"):
+                if (
+                    stop_ref
+                    and not stop_ref.startswith("WEB:")
+                    and (
+                        not active_ref
+                        or same_conversation_ref(active_ref, stop_ref)
+                    )
+                ):
                     active_ref = stop_ref
                     if not is_temporary and not state.current_conversation:
                         state.current_conversation = active_ref
@@ -3105,12 +3115,7 @@ def _send_chat_prompt(
             stopped_by_user=stopped_by_user,
         )
         persistent_marker: tuple[str, str, str, str | None] | None = None
-        if (
-            not stopped_by_user
-            and not is_temporary
-            and tui_archive is not None
-            and active_ref
-        ):
+        if not is_temporary and tui_archive is not None and active_ref:
             try:
                 persistent_marker = tui_archive.conversation_terminal_marker(active_ref)
             except Exception:
@@ -3121,9 +3126,18 @@ def _send_chat_prompt(
                 if terminal_marker is not None and terminal_marker[0] == "chat"
                 else None
             )
-            resolution = chat_terminal_resolution(
-                persistent_marker,
-                ChatTerminalEvidence(
+            evidence: ChatTerminalEvidence | None = None
+            if stopped_by_user and confirmed_stop_outcome is not None:
+                evidence = stop_terminal_evidence(
+                    expected_conversation_ref=active_ref,
+                    stopped=confirmed_stop_outcome.stopped,
+                    stopped_conversation_ref=confirmed_stop_outcome.conversation_ref,
+                    provider=confirmed_stop_outcome.provider,
+                    proof=confirmed_stop_outcome.proof,
+                    identity_verified=confirmed_stop_outcome.identity_verified,
+                )
+            elif not stopped_by_user:
+                evidence = ChatTerminalEvidence(
                     kind="terminal-turn",
                     source=terminal_source or "terminal-turn",
                     terminal_observed=terminal_observed,
@@ -3136,7 +3150,12 @@ def _send_chat_prompt(
                         response_conversation_ref,
                     ),
                     current_chat_status=current_chat_status,
-                ),
+                )
+
+            resolution = (
+                chat_terminal_resolution(persistent_marker, evidence)
+                if evidence is not None
+                else None
             )
             if resolution is not None:
                 try:

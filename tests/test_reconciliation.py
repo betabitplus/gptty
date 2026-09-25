@@ -6,6 +6,7 @@ from gptty.reconciliation import (
     ChatTerminalEvidence,
     chat_terminal_resolution,
     same_conversation_ref,
+    stop_terminal_evidence,
 )
 
 
@@ -161,3 +162,50 @@ def test_chat_terminal_resolution_rejects_non_chat_marker() -> None:
         ),
     )
     assert resolution is None
+
+
+def test_stop_terminal_evidence_requires_verified_same_conversation_identity() -> None:
+    evidence = stop_terminal_evidence(
+        expected_conversation_ref="conv-1",
+        stopped=True,
+        stopped_conversation_ref="https://chatgpt.com/c/conv-1",
+        provider="browser-native",
+        proof="browser_stop_control",
+        identity_verified=True,
+    )
+
+    assert evidence.kind == "stop"
+    assert evidence.source == "stop:browser-native:browser_stop_control"
+    assert evidence.stop_confirmed is True
+    assert evidence.proof_present is True
+    assert evidence.identity_verified is True
+    assert evidence.same_conversation is True
+    assert chat_terminal_resolution(LIMIT_REACHED, evidence) is not None
+
+
+@pytest.mark.parametrize(
+    ("stopped", "proof", "identity_verified", "stopped_ref"),
+    [
+        (False, "browser_stop_control", True, "conv-1"),
+        (True, None, True, "conv-1"),
+        (True, "browser_stop_control", False, "conv-1"),
+        (True, "browser_stop_control", True, "conv-other"),
+    ],
+)
+def test_stop_terminal_evidence_fails_closed_without_complete_proof(
+    stopped,
+    proof,
+    identity_verified,
+    stopped_ref,
+) -> None:
+    evidence = stop_terminal_evidence(
+        expected_conversation_ref="conv-1",
+        stopped=stopped,
+        stopped_conversation_ref=stopped_ref,
+        provider="browser-native",
+        proof=proof,
+        identity_verified=identity_verified,
+    )
+
+    assert chat_terminal_resolution(UNAVAILABLE, evidence) is None
+    assert chat_terminal_resolution(LIMIT_REACHED, evidence) is None

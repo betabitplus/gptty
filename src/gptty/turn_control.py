@@ -13,6 +13,7 @@ class StopOutcome:
     provider: str | None = None
     proof: str | None = None
     stream_status: str | None = None
+    identity_verified: bool = False
 
 
 def request_stop_generation(
@@ -45,6 +46,14 @@ def normalize_stop_outcome(
         provider=_optional_text(_field(raw, "provider")),
         proof=_optional_text(_field(raw, "proof")),
         stream_status=_optional_text(_field(raw, "streamStatus", "stream_status")),
+        identity_verified=(
+            _field(
+                raw,
+                "conversationIdentityVerified",
+                "conversation_identity_verified",
+            )
+            is True
+        ),
     )
 
 

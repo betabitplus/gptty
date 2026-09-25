@@ -17,6 +17,7 @@ def test_normalize_stop_outcome_preserves_cwa_proof_metadata() -> None:
             "provider": "wkwebview",
             "proof": "canonical_client_stopped",
             "streamStatus": "IS_STOP_REQUESTED",
+            "conversationIdentityVerified": True,
         }
     )
 
@@ -26,6 +27,7 @@ def test_normalize_stop_outcome_preserves_cwa_proof_metadata() -> None:
         provider="wkwebview",
         proof="canonical_client_stopped",
         stream_status="IS_STOP_REQUESTED",
+        identity_verified=True,
     )
 
 
@@ -37,6 +39,7 @@ def test_normalize_stop_outcome_accepts_snake_case_object_contract() -> None:
             provider="browser-native",
             proof="browser_stop_control",
             stream_status="COMPLETE",
+            conversation_identity_verified=True,
         )
     )
 
@@ -44,6 +47,7 @@ def test_normalize_stop_outcome_accepts_snake_case_object_contract() -> None:
     assert outcome.provider == "browser-native"
     assert outcome.proof == "browser_stop_control"
     assert outcome.stream_status == "COMPLETE"
+    assert outcome.identity_verified is True
 
 
 def test_normalize_stop_outcome_uses_fallback_only_after_confirmed_stop() -> None:
@@ -68,6 +72,7 @@ def test_normalize_stop_outcome_does_not_promote_truthy_non_boolean_to_proof() -
 
     assert outcome.stopped is False
     assert outcome.conversation_ref == "conv-untrusted"
+    assert outcome.identity_verified is False
 
 
 def test_request_stop_generation_forwards_one_request_and_normalizes() -> None:
