@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,8 +8,6 @@ from typing import Any
 from chatgpt_web_adapter import get_auth_status
 
 from .privacy import redact_diagnostic_text
-
-TOKEN_FIELDS = ("accessToken", "access_token", "api_key")
 
 
 def inspect_auth_file(path: str | Path) -> dict[str, Any]:
@@ -33,93 +30,57 @@ def inspect_auth_file(path: str | Path) -> dict[str, Any]:
         "has_proof_token": False,
         "has_turnstile_token": False,
         "credential_backend": "file",
+        "credential_metadata_present": False,
         "keyring_available": False,
         "keyring_backend": None,
     }
 
-    if not status["exists"]:
-        status["error"] = "auth file does not exist"
-        return status
-
     try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        status["status"] = "invalid"
-        status["error"] = f"failed to read auth file: {exc}"
-        return status
-    except json.JSONDecodeError as exc:
-        status["status"] = "invalid"
-        status["error"] = f"failed to parse auth file: {exc}"
+        authority = get_auth_status(auth_path)
+    except Exception as exc:  # noqa: BLE001 - diagnostic boundary must stay secret-safe.
+        status["exists"] = auth_path.exists()
+        status["status"] = "invalid" if status["exists"] else "missing"
+        status["error"] = redact_diagnostic_text(str(exc))
         return status
 
-    status["readable"] = True
-    if not isinstance(data, dict):
-        status["status"] = "invalid"
-        status["error"] = "auth file must contain a JSON object"
-        return status
+    status["exists"] = authority.file_exists
+    status["readable"] = bool(
+        authority.file_exists
+        or authority.access_token_present
+        or authority.session_cookie_present
+        or authority.credential_backend == "keyring"
+    )
+    status["timestamp"] = authority.captured_at
+    status["token_source"] = (
+        authority.credential_backend if authority.access_token_present else None
+    )
+    status["has_token"] = authority.access_token_present
+    status["has_cookies"] = bool(
+        authority.cookies_present
+        or authority.session_cookie_present
+        or authority.browser_cookie_count
+    )
+    status["has_headers"] = authority.headers_present
+    status["has_proof_token"] = authority.proof_token_present
+    status["has_turnstile_token"] = authority.turnstile_token_present
+    status["credential_backend"] = authority.credential_backend
+    status["credential_metadata_present"] = authority.credential_metadata_present
+    status["keyring_available"] = authority.keyring_available
+    status["keyring_backend"] = authority.keyring_backend
 
-    marker = data.get("credentialStore")
-    if isinstance(marker, dict) and marker.get("backend") == "keyring":
-        try:
-            authority = get_auth_status(auth_path)
-        except Exception as exc:  # noqa: BLE001 - status is a diagnostic boundary.
-            status["status"] = "invalid"
-            status["error"] = (
-                "failed to load OS credential store: "
-                + redact_diagnostic_text(str(exc))
-            )
-            status["credential_backend"] = "keyring"
-            return status
-        status["timestamp"] = _optional_str(data.get("timestamp"))
-        status["token_source"] = "keyring" if authority.access_token_present else None
-        status["has_token"] = authority.access_token_present
-        status["has_cookies"] = bool(
-            authority.session_cookie_present or authority.browser_cookie_count
-        )
-        status["credential_backend"] = authority.credential_backend
-        status["keyring_available"] = authority.keyring_available
-        status["keyring_backend"] = authority.keyring_backend
-        expiry = authority.access_token_expires_at
-        if not authority.access_token_present:
+    if not authority.access_token_present:
+        if not authority.file_exists and not authority.session_cookie_present:
+            status["status"] = "missing"
+            status["error"] = "no reusable authorization material found"
+        else:
             status["status"] = "missing-token"
-            status["error"] = "no reusable access token found in OS credential store"
-            return status
-        if expiry is None:
-            status["status"] = "unknown-expiry"
-            status["ok"] = True
-            status["expired"] = None
-            return status
-        now = datetime.now(timezone.utc)
-        expires_in = int((expiry - now).total_seconds())
-        expired = expires_in <= 0
-        status["expires_at"] = expiry.isoformat().replace("+00:00", "Z")
-        status["expires_in_seconds"] = expires_in
-        status["expired"] = expired
-        status["ok"] = not expired
-        status["status"] = "expired" if expired else "ok"
-        if expired:
-            status["error"] = "access token is expired"
+            status["error"] = "no reusable access token found"
         return status
 
-    status["timestamp"] = _optional_str(data.get("timestamp"))
-    token_source, token = _find_token(data)
-    status["token_source"] = token_source
-    status["has_token"] = bool(token)
-    status["has_cookies"] = _has_mapping_values(data.get("cookies"))
-    status["has_headers"] = _has_mapping_values(data.get("headers"))
-    status["has_proof_token"] = data.get("proof_token") is not None
-    status["has_turnstile_token"] = bool(_optional_str(data.get("turnstile_token")))
-
-    if not token:
-        status["status"] = "missing-token"
-        status["error"] = "no accessToken or api_key found"
-        return status
-
-    expiry = decode_jwt_expiry(token)
+    expiry = authority.access_token_expires_at
     if expiry is None:
         status["status"] = "unknown-expiry"
         status["ok"] = True
-        status["expired"] = None
         return status
 
     now = datetime.now(timezone.utc)
@@ -133,21 +94,6 @@ def inspect_auth_file(path: str | Path) -> dict[str, Any]:
     if expired:
         status["error"] = "access token is expired"
     return status
-
-
-def decode_jwt_expiry(token: str | None) -> datetime | None:
-    if not token or token.count(".") < 2:
-        return None
-    try:
-        payload = token.split(".", 2)[1]
-        payload += "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-        exp = data.get("exp")
-        if exp is None:
-            return None
-        return datetime.fromtimestamp(int(exp), tz=timezone.utc)
-    except Exception:
-        return None
 
 
 def render_auth_status(status: dict[str, Any], output_format: str = "plain") -> str:
@@ -188,25 +134,6 @@ def _render_plain_status(status: dict[str, Any]) -> str:
     if not status.get("ok"):
         lines.append("next step: run `gptty auth refresh --mode wait`")
     return "\n".join(lines)
-
-
-def _find_token(data: dict[str, Any]) -> tuple[str | None, str | None]:
-    for field in TOKEN_FIELDS:
-        token = _optional_str(data.get(field))
-        if token:
-            return field, token
-    return None, None
-
-
-def _optional_str(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    return value or None
-
-
-def _has_mapping_values(value: Any) -> bool:
-    return isinstance(value, dict) and any(bool(item) for item in value.values())
 
 
 def _present(value: Any) -> str:

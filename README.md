@@ -150,7 +150,7 @@ venv\Scripts\python.exe auth_fetcher.py --mode wait
 venv\Scripts\python.exe auth_fetcher_wait.py
 ```
 
-With `gptty-web[auth]`, reusable authorization is persisted through CWA's credential-store authority. A working OS `keyring` backend is preferred; `auth_data.json` then contains only non-secret backend metadata/expiry hints. If the OS store is unavailable, CWA retains the hardened owner-only file fallback. Use `gptty auth migrate --backend keyring` or `--backend file` to change an existing backend explicitly, and `gptty auth logout` to remove reusable local authorization. See [docs/auth.md](docs/auth.md) for lifecycle and failure semantics.
+With `gptty-web[auth]`, reusable authorization is persisted through CWA's credential-store authority. A recognized OS-backed secure `keyring` provider is preferred; plaintext/null keyring fallbacks are rejected. `auth_data.json` then contains only non-secret backend metadata/expiry hints. If no secure OS store is available, CWA retains the hardened owner-only file fallback. Use `gptty auth migrate --backend keyring` or `--backend file` to change an existing backend explicitly, and `gptty auth logout` to remove reusable local authorization. See [docs/auth.md](docs/auth.md) for lifecycle and failure semantics.
 
 ## Run the CLI
 

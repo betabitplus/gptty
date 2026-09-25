@@ -12,7 +12,7 @@ Install the auth extra for browser capture plus OS credential-store support:
 python -m pip install "gptty-web[auth]"
 ```
 
-The auth extra includes `keyring`. When a usable OS backend is available, CWA stores the reusable credential blob there (macOS Keychain, Windows Credential Manager, or a supported Linux Secret Service backend). The companion `auth_data.json` then contains only non-secret backend/account metadata and expiry/timestamp hints.
+The auth extra includes `keyring`. CWA only accepts recognized OS-backed secure providers (macOS Keychain, Windows Credential Manager, and supported Linux Secret Service/KWallet-style backends); plaintext/null alternatives such as `keyrings.alt` are treated as unavailable. When a usable OS backend is available, CWA stores the reusable credential blob there. The companion `auth_data.json` then contains only non-secret backend/account metadata and expiry/timestamp hints.
 
 If no usable OS credential store exists, CWA uses its hardened file fallback. The fallback file contains bearer-equivalent session material and is restricted to the owner (`0600` on POSIX). Do not commit or share it.
 
@@ -67,7 +67,7 @@ Create the explicit portable/headless file fallback instead:
 gptty auth migrate --backend file
 ```
 
-Migration is ordered to avoid credential loss. File-to-keyring writes and verifies the OS-store item before replacing the secret-bearing file with metadata. Keyring-to-file writes the private fallback first and only then removes the OS-store item. If the final removal fails, the command reports an error and leaves both usable copies rather than deleting the last good credential set.
+Migration is ordered to avoid credential loss. File-to-keyring writes and verifies the OS-store item before replacing the secret-bearing file with metadata. Keyring-to-file writes the private fallback first and only then removes the OS-store item. If the final removal fails, the command reports an error and leaves both usable copies rather than deleting the last good credential set. If the OS-store write exists but the non-secret metadata pointer was lost, status/login can still recover the deterministic keyring entry and `gptty auth migrate --backend keyring` recreates the metadata without writing the secret back to plaintext.
 
 Once a profile is marked keyring-backed, a temporary keyring outage fails closed. CWA does not silently repopulate plaintext credentials. Use `auth migrate --backend file` while the OS store is available if a deliberate downgrade is required.
 
