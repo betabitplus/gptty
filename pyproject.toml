@@ -40,6 +40,7 @@ auth = [
   "g4f==7.3.0",
   "platformdirs==4.9.4",
   "zendriver==0.15.3",
+  "keyring>=25,<26",
 ]
 test = ["pytest>=8"]
 

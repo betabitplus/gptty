@@ -6,6 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from chatgpt_web_adapter import get_auth_status
+
+from .privacy import redact_diagnostic_text
+
 TOKEN_FIELDS = ("accessToken", "access_token", "api_key")
 
 
@@ -28,6 +32,9 @@ def inspect_auth_file(path: str | Path) -> dict[str, Any]:
         "has_headers": False,
         "has_proof_token": False,
         "has_turnstile_token": False,
+        "credential_backend": "file",
+        "keyring_available": False,
+        "keyring_backend": None,
     }
 
     if not status["exists"]:
@@ -49,6 +56,49 @@ def inspect_auth_file(path: str | Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         status["status"] = "invalid"
         status["error"] = "auth file must contain a JSON object"
+        return status
+
+    marker = data.get("credentialStore")
+    if isinstance(marker, dict) and marker.get("backend") == "keyring":
+        try:
+            authority = get_auth_status(auth_path)
+        except Exception as exc:  # noqa: BLE001 - status is a diagnostic boundary.
+            status["status"] = "invalid"
+            status["error"] = (
+                "failed to load OS credential store: "
+                + redact_diagnostic_text(str(exc))
+            )
+            status["credential_backend"] = "keyring"
+            return status
+        status["timestamp"] = _optional_str(data.get("timestamp"))
+        status["token_source"] = "keyring" if authority.access_token_present else None
+        status["has_token"] = authority.access_token_present
+        status["has_cookies"] = bool(
+            authority.session_cookie_present or authority.browser_cookie_count
+        )
+        status["credential_backend"] = authority.credential_backend
+        status["keyring_available"] = authority.keyring_available
+        status["keyring_backend"] = authority.keyring_backend
+        expiry = authority.access_token_expires_at
+        if not authority.access_token_present:
+            status["status"] = "missing-token"
+            status["error"] = "no reusable access token found in OS credential store"
+            return status
+        if expiry is None:
+            status["status"] = "unknown-expiry"
+            status["ok"] = True
+            status["expired"] = None
+            return status
+        now = datetime.now(timezone.utc)
+        expires_in = int((expiry - now).total_seconds())
+        expired = expires_in <= 0
+        status["expires_at"] = expiry.isoformat().replace("+00:00", "Z")
+        status["expires_in_seconds"] = expires_in
+        status["expired"] = expired
+        status["ok"] = not expired
+        status["status"] = "expired" if expired else "ok"
+        if expired:
+            status["error"] = "access token is expired"
         return status
 
     status["timestamp"] = _optional_str(data.get("timestamp"))
@@ -113,6 +163,7 @@ def _render_plain_status(status: dict[str, Any]) -> str:
         f"auth file: {status['auth_file']}",
         f"status: {status['status']}",
         f"token: {_present(status['has_token'])}",
+        f"credential store: {status.get('credential_backend', 'file')}",
     ]
     if status.get("token_source"):
         lines.append(f"token source: {status['token_source']}")

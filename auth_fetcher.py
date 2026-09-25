@@ -3,10 +3,10 @@ import asyncio
 import base64
 import json
 import re
-import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
+
+from chatgpt_web_adapter import AuthData, AuthError, load_auth_data, persist_auth_data
 
 DEFAULT_AUTH_PATH = Path("auth_data.json")
 DEFAULT_AUTH_TIMEOUT = 120.0
@@ -31,58 +31,43 @@ class AuthResult:
 
     @classmethod
     def from_json(cls, path: str | Path):
-        """Load AuthResult from a JSON file."""
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"File {path} not found")
-
-        with path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        token = data.get("accessToken") or data.get("access_token") or data.get("api_key")
+        """Load reusable auth through CWA's credential-store authority."""
+        target = Path(path)
+        try:
+            auth = load_auth_data(target, allow_expired_session_refresh=True)
+        except AuthError as error:
+            if not target.exists():
+                raise FileNotFoundError(f"File {target} not found") from error
+            raise
         return cls(
-            api_key=token,
-            cookies=data.get("cookies"),
-            headers=data.get("headers"),
-            expires=data.get("expires"),
-            proof_token=data.get("proof_token"),
-            turnstile_token=data.get("turnstile_token"),
+            api_key=auth.accessToken,
+            cookies=auth.cookies,
+            headers=auth.headers,
+            expires=auth.expires,
+            proof_token=None,
+            turnstile_token=None,
         )
 
-    def to_json(self, path: str | Path):
-        """Save AuthResult into a JSON file."""
-        path = Path(path)
-        data = {
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "accessToken": self.api_key,
-            "api_key": self.api_key,
-            "cookies": self.cookies,
-            "headers": self.headers,
-            "expires": self.expires,
-            "proof_token": self.proof_token,
-            "turnstile_token": self.turnstile_token,
-        }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                delete=False,
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-            ) as file:
-                json.dump(data, file, indent=2, ensure_ascii=False)
-                temp_path = Path(file.name)
-            temp_path.replace(path)
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        return path
+    def to_json(
+        self,
+        path: str | Path,
+        *,
+        credential_store: str | None = None,
+    ):
+        """Persist reusable auth through CWA's credential-store authority."""
+        target = Path(path)
+        persist_auth_data(
+            AuthData(
+                accessToken=self.api_key,
+                cookies=self.cookies or {},
+                headers=self.headers or {},
+                expires=self.expires,
+            ),
+            target,
+            credential_store=credential_store,
+        )
+        return target
+
 
 
 def _unwrap_page_value(value):
@@ -282,6 +267,7 @@ async def _collect_auth_tokens(
     mode: str = "auto",
     ready_timeout: float | None = None,
     probe_prompt: str = DEFAULT_AUTH_PROMPT,
+    credential_store: str | None = None,
 ):
     try:
         from g4f.Provider.needs_auth.OpenaiChat import get_cookies
@@ -423,8 +409,9 @@ async def run_auth_and_save(
     mode: str = "auto",
     ready_timeout: float | None = DEFAULT_READY_TIMEOUT,
     probe_prompt: str = DEFAULT_AUTH_PROMPT,
+    credential_store: str | None = None,
 ):
-    """Run auth via NoDriver and save collected tokens into JSON."""
+    """Run auth via NoDriver and persist reusable state through CWA."""
     normalized_probe_prompt = _normalize_probe_prompt(probe_prompt)
     print(f"Start authorization via NoDriver (mode={mode})...")
     if mode == "wait":
@@ -464,7 +451,10 @@ async def run_auth_and_save(
         turnstile_token=getattr(OpenaiChat.request_config, "turnstile_token", None),
     )
 
-    path = auth_result.to_json(output_file)
+    path = auth_result.to_json(
+        output_file,
+        credential_store=credential_store,
+    )
     print(f"Authorization complete. Data saved to {path}")
     return auth_result
 
@@ -511,6 +501,12 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_AUTH_PROMPT,
         help="Prompt text to send once in auto mode to trigger auth capture.",
     )
+    parser.add_argument(
+        "--credential-store",
+        choices=("auto", "keyring", "file"),
+        default="auto",
+        help="Reusable auth backend; auto prefers the OS credential store.",
+    )
     return parser.parse_args()
 
 
@@ -524,6 +520,7 @@ if __name__ == "__main__":
                 mode=args.mode,
                 ready_timeout=args.ready_timeout,
                 probe_prompt=args.probe_prompt,
+                credential_store=args.credential_store,
             )
         )
     except KeyboardInterrupt:

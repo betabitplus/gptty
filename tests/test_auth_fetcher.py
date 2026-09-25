@@ -9,22 +9,17 @@ from datetime import datetime, timezone
 import auth_fetcher
 
 
-class FakeDateTime:
-    @classmethod
-    def now(cls, tz=None):
-        if tz is None:
-            return datetime(2026, 1, 1, 15, 0, 0)
-        return datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
 
-
-def test_auth_result_timestamp_is_saved_in_utc(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(auth_fetcher, "datetime", FakeDateTime)
-
+def test_auth_result_timestamp_is_owned_by_cwa_and_is_utc(tmp_path) -> None:
     target = tmp_path / "auth_data.json"
     auth_fetcher.AuthResult("token", {}, {}, 0, None, None).to_json(target)
 
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["timestamp"] == "2026-01-01T09:00:00Z"
+    assert payload["timestamp"].endswith("Z")
+    parsed = datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+
 
 
 def test_submit_probe_prompt_uses_custom_prompt_and_fallback_enter(
@@ -113,6 +108,7 @@ def test_parse_args_accepts_probe_prompt(monkeypatch) -> None:
 
     assert args.mode == "wait"
     assert args.probe_prompt == "Ping"
+    assert args.credential_store == "auto"
     assert args.timeout == 120.0
 
 

@@ -4,7 +4,9 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+import gptty.auth_inspect as auth_inspect
 from gptty.auth_inspect import inspect_auth_file, render_auth_status
 
 
@@ -108,3 +110,43 @@ def test_render_auth_status_json(tmp_path: Path) -> None:
     rendered = render_auth_status(status, "json")
 
     assert json.loads(rendered)["status"] == "missing"
+
+
+def test_inspect_auth_file_delegates_keyring_metadata_to_cwa(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "auth_data.json"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-09-25T00:00:00Z",
+                "credentialStore": {"backend": "keyring"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    expiry = datetime.now(timezone.utc) + timedelta(hours=2)
+    monkeypatch.setattr(
+        auth_inspect,
+        "get_auth_status",
+        lambda _path: SimpleNamespace(
+            access_token_present=True,
+            session_cookie_present=True,
+            browser_cookie_count=2,
+            credential_backend="keyring",
+            keyring_available=True,
+            keyring_backend="tests.FakeKeyring",
+            access_token_expires_at=expiry,
+        ),
+    )
+
+    status = inspect_auth_file(path)
+
+    assert status["status"] == "ok"
+    assert status["ok"] is True
+    assert status["token_source"] == "keyring"
+    assert status["credential_backend"] == "keyring"
+    assert status["keyring_available"] is True
+    assert status["has_cookies"] is True
+    assert "credential store: keyring" in render_auth_status(status)

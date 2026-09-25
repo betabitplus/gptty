@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- auth privacy: delegate reusable auth persistence/loading/migration/logout to CWA, prefer the OS credential store through the auth extra's `keyring` dependency, retain an explicit owner-only file fallback, stop persisting transient proof/turnstile material, expose backend provenance in `auth status`, and add `auth migrate`, `auth logout`, plus `--credential-store` on refresh
 - privacy/notifications: use generic completion notifications by default, make response/title preview explicit opt-in and always suppress it for Temporary Chat, allow notifications and sound to be disabled, and dispatch through a bounded non-blocking worker
 - privacy: make interactive prompt history owner-only and bounded, keep Temporary Chat prompts memory-only and remove them from normal in-process history when Temporary mode ends, and add `/history clear` plus configurable `history_limit`
 - automation: add a versioned `jsonl` contract for `ask`/`send`, rich final JSON with conversation/message/model/effort/finality provenance, typed tool/action/source/citation observations, machine-readable required-action and ambiguous-write failures, and durable pre-write run journals for new chats; one-off `send --to` no longer mutates the attached local session

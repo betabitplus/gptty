@@ -24,7 +24,9 @@ This project may use local session data such as:
 - `accessToken` / `api_key`
 - `.env`
 
-Do not include any secrets, tokens, cookies, or personal session files in bug reports, screenshots, logs, or public issues.
+Do not include any secrets, tokens, cookies, OS credential-store entries, secret-bearing auth fallback files, or personal session files in bug reports, screenshots, logs, or public issues.
+
+Reusable auth persistence is owned by `chatgpt-web-adapter`: a working OS `keyring` backend is preferred, while a `0600` POSIX file remains the explicit portable fallback. A keyring-backed profile fails closed if that store is unavailable rather than silently recreating plaintext credentials. Use `gptty auth migrate --backend file` for a deliberate fallback and `gptty auth logout` to remove reusable local auth. Neither command is a claim of server-side session revocation.
 
 If needed, redact sensitive values before sharing anything.
 

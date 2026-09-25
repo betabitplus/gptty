@@ -274,6 +274,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default="Hello",
         help="Prompt text to send once in auto mode to trigger auth capture.",
     )
+    auth_refresh_parser.add_argument(
+        "--credential-store",
+        choices=("auto", "keyring", "file"),
+        default="auto",
+        help="Reusable auth backend; auto prefers the OS credential store.",
+    )
+
+    auth_migrate_parser = auth_subparsers.add_parser(
+        "migrate",
+        help="Migrate reusable auth between the OS credential store and secure file.",
+    )
+    _add_auth_file_option(auth_migrate_parser)
+    auth_migrate_parser.add_argument(
+        "--backend",
+        choices=("keyring", "file"),
+        default="keyring",
+        help="Target credential backend; keyring uses the OS credential store.",
+    )
+
+    auth_logout_parser = auth_subparsers.add_parser(
+        "logout",
+        help="Remove reusable local ChatGPT authorization material.",
+    )
+    _add_auth_file_option(auth_logout_parser)
 
     ask_parser = subparsers.add_parser(
         "ask",
@@ -578,7 +602,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_privacy(args)
 
     if args.command == "auth":
-        from .commands.auth import run_auth_refresh, run_auth_status
+        from .commands.auth import (
+            run_auth_logout,
+            run_auth_migrate,
+            run_auth_refresh,
+            run_auth_status,
+        )
 
         if args.auth_command == "status":
             if not _apply_auth_path(args):
@@ -588,6 +617,14 @@ def main(argv: list[str] | None = None) -> int:
             if not _apply_auth_path(args):
                 return 2
             return run_auth_refresh(args)
+        if args.auth_command == "migrate":
+            if not _apply_auth_path(args):
+                return 2
+            return run_auth_migrate(args)
+        if args.auth_command == "logout":
+            if not _apply_auth_path(args):
+                return 2
+            return run_auth_logout(args)
         parser.print_help()
         return 2
 

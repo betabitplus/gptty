@@ -6,7 +6,10 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any, TextIO
 
+from chatgpt_web_adapter import clear_auth_data, get_auth_status, migrate_auth_data
+
 from ..auth_inspect import inspect_auth_file, render_auth_status
+from ..privacy import redact_diagnostic_text
 
 AUTH_EXTRA_HINT = (
     "gptty: auth refresh dependencies are not installed.\n"
@@ -64,22 +67,69 @@ def run_auth_refresh(
                 mode=getattr(args, "mode", "auto"),
                 ready_timeout=getattr(args, "ready_timeout", 0.0),
                 probe_prompt=getattr(args, "probe_prompt", "Hello"),
+                credential_store=getattr(args, "credential_store", "auto"),
             )
         )
     except KeyboardInterrupt:
         print("gptty: auth refresh interrupted by user", file=stderr)
         return 130
     except RuntimeError as exc:
-        message = str(exc)
+        message = redact_diagnostic_text(str(exc))
         print(f"gptty: auth refresh failed: {message}", file=stderr)
         if _looks_like_missing_auth_dependency(message):
             print(AUTH_EXTRA_HINT, file=stderr)
         return 1
     except Exception as exc:  # noqa: BLE001 - command boundary converts auth capture failures to exit codes.
-        print(f"gptty: auth refresh failed: {exc}", file=stderr)
+        print(
+            f"gptty: auth refresh failed: {redact_diagnostic_text(str(exc))}",
+            file=stderr,
+        )
         return 1
 
     print(f"gptty: auth data refreshed at {output_file}", file=stdout)
+    return 0
+
+
+def run_auth_migrate(
+    args: Any,
+    *,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    auth_file = Path(getattr(args, "auth", "auth_data.json"))
+    backend = str(getattr(args, "backend", "keyring"))
+    try:
+        migrate_auth_data(auth_file, backend=backend)
+        status = get_auth_status(auth_file)
+    except Exception as exc:  # noqa: BLE001 - command boundary maps auth failures.
+        print(
+            f"gptty: auth migration failed: {redact_diagnostic_text(str(exc))}",
+            file=stderr,
+        )
+        return 1
+    print(f"gptty: auth credential store: {status.credential_backend}", file=stdout)
+    return 0
+
+
+def run_auth_logout(
+    args: Any,
+    *,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    auth_file = Path(getattr(args, "auth", "auth_data.json"))
+    try:
+        removed = clear_auth_data(auth_file)
+    except Exception as exc:  # noqa: BLE001 - command boundary maps auth failures.
+        print(
+            f"gptty: auth logout failed: {redact_diagnostic_text(str(exc))}",
+            file=stderr,
+        )
+        return 1
+    if removed:
+        print("gptty: reusable auth removed", file=stdout)
+    else:
+        print("gptty: no reusable auth was present", file=stdout)
     return 0
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from auth_fetcher import AuthResult
 
 
-def test_auth_result_writes_access_token_and_api_key(tmp_path: Path) -> None:
+def test_auth_result_delegates_to_cwa_reusable_auth_format(tmp_path: Path) -> None:
     path = tmp_path / "auth_data.json"
     result = AuthResult(
         api_key="token",
@@ -21,9 +21,11 @@ def test_auth_result_writes_access_token_and_api_key(tmp_path: Path) -> None:
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["accessToken"] == "token"
-    assert data["api_key"] == "token"
+    assert "api_key" not in data
     assert data["cookies"] == {"session": "yes"}
     assert data["headers"] == {"user-agent": "test"}
+    assert "proof_token" not in data
+    assert "turnstile_token" not in data
 
 
 def test_auth_result_reads_access_token_first(tmp_path: Path) -> None:
@@ -37,3 +39,14 @@ def test_auth_result_reads_access_token_first(tmp_path: Path) -> None:
 
     assert result.api_key == "new-token"
     assert result.accessToken == "new-token"
+
+
+def test_auth_result_missing_file_preserves_legacy_bootstrap_signal(tmp_path: Path) -> None:
+    path = tmp_path / "missing.json"
+
+    try:
+        AuthResult.from_json(path)
+    except FileNotFoundError as error:
+        assert str(path) in str(error)
+    else:
+        raise AssertionError("missing reusable auth must preserve FileNotFoundError")

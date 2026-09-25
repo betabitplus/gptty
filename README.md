@@ -101,9 +101,9 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[auth,test]"
 ```
 
-## Get `auth_data.json`
+## Reusable ChatGPT authorization
 
-Check the current auth file without opening a browser:
+Check the current reusable auth state without opening a browser:
 
 ```bash
 gptty auth status
@@ -119,6 +119,14 @@ Refresh auth data through the CLI wrapper:
 
 ```bash
 gptty auth refresh --mode wait
+```
+
+Migrate or remove reusable local authorization explicitly:
+
+```bash
+gptty auth migrate --backend keyring
+gptty auth migrate --backend file
+gptty auth logout
 ```
 
 Fast mode for an already logged-in browser session:
@@ -142,7 +150,7 @@ venv\Scripts\python.exe auth_fetcher.py --mode wait
 venv\Scripts\python.exe auth_fetcher_wait.py
 ```
 
-After a successful capture, `auth_data.json` will appear in the project directory. See [docs/auth.md](docs/auth.md) for lifecycle details and troubleshooting notes.
+With `gptty-web[auth]`, reusable authorization is persisted through CWA's credential-store authority. A working OS `keyring` backend is preferred; `auth_data.json` then contains only non-secret backend metadata/expiry hints. If the OS store is unavailable, CWA retains the hardened owner-only file fallback. Use `gptty auth migrate --backend keyring` or `--backend file` to change an existing backend explicitly, and `gptty auth logout` to remove reusable local authorization. See [docs/auth.md](docs/auth.md) for lifecycle and failure semantics.
 
 ## Run the CLI
 
