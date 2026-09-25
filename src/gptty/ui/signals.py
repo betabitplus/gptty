@@ -12,10 +12,12 @@ class TurnControlSignals:
     """Signal-backed local control state for one enhanced TUI turn."""
 
     stop_requested: threading.Event = field(default_factory=threading.Event)
+    stop_intent: threading.Event = field(default_factory=threading.Event)
     quit_requested: threading.Event = field(default_factory=threading.Event)
     wake: threading.Event = field(default_factory=threading.Event)
 
     def request_stop(self) -> None:
+        self.stop_intent.set()
         self.stop_requested.set()
         self.wake.set()
 

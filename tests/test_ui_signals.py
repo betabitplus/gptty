@@ -21,9 +21,11 @@ def test_turn_control_signals_map_ctrl_keys_and_restore_handlers() -> None:
     with turn_control_signals(enabled=True) as controls:
         signal.raise_signal(signal.SIGINT)
         assert controls.stop_requested.is_set()
+        assert controls.stop_intent.is_set()
         assert controls.wake.is_set()
         assert controls.consume_stop() is True
         assert not controls.stop_requested.is_set()
+        assert controls.stop_intent.is_set()
 
         signal.raise_signal(sigquit)
         assert controls.quit_requested.is_set()
@@ -41,6 +43,7 @@ def test_routed_turn_control_signals_routes_real_sigint_to_active_turn() -> None
     with routed_turn_control_signals(enabled=True, controls=lambda: active):
         signal.raise_signal(signal.SIGINT)
         assert controls.stop_requested.is_set()
+        assert controls.stop_intent.is_set()
         assert controls.wake.is_set()
 
     assert signal.getsignal(signal.SIGINT) == previous_sigint

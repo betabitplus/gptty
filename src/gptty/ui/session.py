@@ -68,6 +68,16 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("reload", "Refresh the currently attached conversation"),
     CommandSpec("stop", "Stop the active ChatGPT response"),
     CommandSpec(
+        "queue",
+        "Inspect or manage queued turns",
+        "send | remove <index|id> | clear",
+        (
+            CommandOptionSpec("send", "Release held turns into the current context"),
+            CommandOptionSpec("remove", "Remove one queued turn by position or id prefix"),
+            CommandOptionSpec("clear", "Discard all queued turns"),
+        ),
+    ),
+    CommandSpec(
         "history",
         "Manage local prompt history",
         "clear",

@@ -823,7 +823,7 @@ def test_goal_pause_during_work_finishes_current_turn_and_cancels_auto_continue(
     ) in renderer.events
 
 
-def test_stop_command_while_working_preserves_and_sends_queued_prompt(
+def test_stop_command_while_working_holds_queued_prompt_until_explicit_send(
     tmp_path, monkeypatch
 ) -> None:
     class StopClient:
@@ -864,6 +864,16 @@ def test_stop_command_while_working_preserves_and_sends_queued_prompt(
     StopClient.started.clear()
     StopClient.release.clear()
     _FakeRenderer.instances.clear()
+    def stopped_and_held() -> bool:
+        if not _FakeRenderer.instances:
+            return False
+        events = _FakeRenderer.instances[0].events
+        if ("info", "Stopped by user.") not in events:
+            return False
+        client = StopClient.instances[0]
+        assert not any(call[0] == "send_to_conversation" for call in client.calls)
+        return True
+
     _FakeSession.script = iter(
         [
             "Produce a long response",
@@ -873,6 +883,7 @@ def test_stop_command_while_working_preserves_and_sends_queued_prompt(
                 and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
                 "/stop",
             ),
+            (stopped_and_held, "/queue send"),
             (
                 lambda: bool(_FakeRenderer.instances)
                 and ("answer", "Queued follow-up sent")
@@ -907,11 +918,18 @@ def test_stop_command_while_working_preserves_and_sends_queued_prompt(
     assert ("info", "Stopping ChatGPT…") in renderer.events
     assert ("info", "ChatGPT stopped; finalizing local readback…") in renderer.events
     assert ("info", "Stopped by user.") in renderer.events
-    assert ("info", "Queued · 1 · will send next") in renderer.events
+    assert (
+        "info",
+        "Queue held · 1 · stopped by user · use /queue send or /queue clear",
+    ) in renderer.events
+    assert (
+        "info",
+        "Queue released · 1 turn rebound to current context.",
+    ) in renderer.events
     assert ("answer", "Queued follow-up sent") in renderer.events
 
 
-def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
+def test_incomplete_turn_holds_queued_followup_without_sending(
     tmp_path, monkeypatch
 ) -> None:
     class IncompleteClient:
@@ -940,7 +958,7 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
 
         def send_to_conversation(self, ref: str, prompt: str, **options):
             raise AssertionError(
-                "queued follow-up must be cleared after incomplete turn"
+                "held queued follow-up must not auto-send after incomplete turn"
             )
 
     IncompleteClient.instances.clear()
@@ -1007,7 +1025,10 @@ def test_incomplete_turn_returns_prompt_and_clears_queued_followup(
             "message": "ChatGPT stream ended before a final assistant completion.",
         },
     ) in renderer.events
-    assert ("info", "Cleared 1 queued prompt after abnormal turn.") in renderer.events
+    assert (
+        "info",
+        "Queue held · 1 · abnormal turn; drafts preserved · use /queue send or /queue clear",
+    ) in renderer.events
     assert notifications == []
 
 
@@ -1748,7 +1769,7 @@ def test_terminal_follow_releases_multiple_queued_prompts_in_order(
     )
 
 
-def test_stop_command_during_follow_stops_then_sends_queued_prompt(
+def test_stop_command_during_follow_holds_then_explicitly_sends_queued_prompt(
     tmp_path, monkeypatch
 ) -> None:
     class FollowStopClient:
@@ -1844,6 +1865,18 @@ def test_stop_command_during_follow_stops_then_sends_queued_prompt(
             in _FakeRenderer.instances[0].events
         )
 
+    def stopped_and_held() -> bool:
+        if not FollowStopClient.instances or not _FakeRenderer.instances:
+            return False
+        client = FollowStopClient.instances[0]
+        if ("stop_generation", "conv-follow-stop") not in client.calls:
+            return False
+        assert (
+            "send_to_conversation",
+            "queued after stop",
+        ) not in client.calls
+        return True
+
     def queued_sent() -> bool:
         return (
             bool(FollowStopClient.instances)
@@ -1859,6 +1892,7 @@ def test_stop_command_during_follow_stops_then_sends_queued_prompt(
             "/resume conv-follow-stop",
             (stream_started, "queued after stop"),
             (queued_visible, "/stop"),
+            (stopped_and_held, "/queue send"),
             (queued_sent, "/exit"),
         ]
     )
@@ -3287,3 +3321,103 @@ def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidenc
     assert recovered.status == "paused"
     assert recovered.conversation_ref is None
     assert _load_session_state(state_path).current_conversation is None
+
+
+def test_busy_queue_binds_pending_media_to_the_prompt_accepted_with_it(
+    tmp_path, monkeypatch
+) -> None:
+    image = tmp_path / "queued-b.png"
+    image.write_bytes(b"image")
+
+    class MediaQueueClient:
+        instances: list["MediaQueueClient"] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+            self.__class__.instances.append(self)
+
+        def send(self, prompt: str, **options):
+            self.calls.append(("send", prompt, tuple(options.get("media") or ())))
+            self.__class__.started.set()
+            assert self.__class__.release.wait(timeout=2)
+            return SimpleNamespace(
+                text="first complete",
+                conversation_id="conv-media-queue",
+                title="Media queue",
+            )
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(
+                ("send_to_conversation", prompt, tuple(options.get("media") or ()))
+            )
+            return SimpleNamespace(
+                text=f"reply:{prompt}",
+                conversation_id=ref,
+                title="Media queue",
+            )
+
+    MediaQueueClient.instances.clear()
+    MediaQueueClient.started.clear()
+    MediaQueueClient.release.clear()
+    _FakeRenderer.instances.clear()
+
+    def queued_two() -> bool:
+        if not _FakeRenderer.instances:
+            return False
+        if ("info", "Queued · 2") not in _FakeRenderer.instances[0].events:
+            return False
+        MediaQueueClient.release.set()
+        return True
+
+    def all_sent() -> bool:
+        if not MediaQueueClient.instances:
+            return False
+        return len(MediaQueueClient.instances[0].calls) == 3
+
+    _FakeSession.script = iter(
+        [
+            "first turn",
+            (MediaQueueClient.started.is_set, "queued A"),
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
+                f"/image {image}",
+            ),
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    event[0] == "info"
+                    and "Attached for next prompt:" in str(event[1])
+                    for event in _FakeRenderer.instances[0].events
+                ),
+                "queued B",
+            ),
+            (queued_two, ""),
+            (all_sent, "/exit"),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=MediaQueueClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    assert MediaQueueClient.instances[0].calls == [
+        ("send", "first turn", ()),
+        ("send_to_conversation", "queued A", ()),
+        ("send_to_conversation", "queued B", (str(image),)),
+    ]

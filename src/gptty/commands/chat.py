@@ -9,7 +9,6 @@ import threading
 import time
 import traceback
 import uuid
-from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -33,6 +32,7 @@ from ..goal_lock import try_acquire_goal_lock
 from ..local_store import local_store_path
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
+from ..queued_turns import QueueBinding, QueueLimitError, QueuedTurn, QueuedTurnQueue
 from ..reconciliation import (
     ChatTerminalEvidence,
     chat_terminal_resolution,
@@ -97,6 +97,146 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 ANSWER_FINALITY_PENDING_SECONDS = 5.0
 CODEXPRO_RECENT_ACTIVITY_MAX_AGE_SECONDS = 5 * 60.0
+
+
+def _current_queue_binding(
+    state: ChatState,
+    commands: InteractiveCommands,
+) -> QueueBinding:
+    goal = state.goal if commands.goal_active else None
+    return QueueBinding(
+        conversation_ref=commands.conversation_ref,
+        conversation_mode=commands.conversation_mode,
+        model=state.model,
+        reasoning_effort=getattr(state, "reasoning_effort", None),
+        goal_id=goal.goal_id if goal is not None else None,
+        goal_generation=goal.generation if goal is not None else None,
+    )
+
+
+def _enqueue_queued_turn(
+    prompt: str,
+    *,
+    state: ChatState,
+    commands: InteractiveCommands,
+    renderer: PrettyRenderer,
+    queued_turns: QueuedTurnQueue,
+    origin: str,
+    binding: QueueBinding | None = None,
+) -> bool:
+    media = commands.pending_media
+    try:
+        queued_turns.enqueue(
+            prompt,
+            media=media,
+            binding=binding or _current_queue_binding(state, commands),
+            origin=origin,
+        )
+    except (QueueLimitError, ValueError) as exc:
+        renderer.warning(f"Queue rejected prompt: {exc}")
+        return False
+    if media:
+        commands.take_pending_media()
+    renderer.info(f"Queued · {len(queued_turns)}")
+    if queued_turns.held:
+        renderer.info(
+            f"Queue remains held · {queued_turns.held_reason} · use /queue send or /queue clear"
+        )
+    return True
+
+
+def _release_queued_media(
+    commands: InteractiveCommands,
+    turns: tuple[QueuedTurn, ...] | list[QueuedTurn],
+) -> None:
+    for turn in turns:
+        if turn.media:
+            commands.release_media(list(turn.media))
+
+
+def _hold_queued_turns(
+    queued_turns: QueuedTurnQueue,
+    renderer: PrettyRenderer,
+    reason: str,
+) -> bool:
+    if not queued_turns.hold(reason):
+        return False
+    renderer.info(
+        f"Queue held · {len(queued_turns)} · {reason} · use /queue send or /queue clear"
+    )
+    return True
+
+
+def _render_queue_status(
+    queued_turns: QueuedTurnQueue,
+    renderer: PrettyRenderer,
+) -> None:
+    if not queued_turns:
+        renderer.info("Queue: empty · memory-only.")
+        return
+    state = f"held: {queued_turns.held_reason}" if queued_turns.held else "ready"
+    renderer.info(
+        "Queue: "
+        f"{len(queued_turns)} turn{'s' if len(queued_turns) != 1 else ''} · "
+        f"{queued_turns.media_items} media · {state} · memory-only."
+    )
+    for index, turn in enumerate(queued_turns.items(), start=1):
+        binding = turn.binding
+        ref = (binding.conversation_ref or "new")[:8]
+        model = binding.model or "default"
+        renderer.info(
+            f"Queue {index}: {turn.turn_id[:8]} · {len(turn.text)} chars · "
+            f"media {turn.media_count} · chat {ref} · model {model}"
+        )
+
+
+def _handle_queue_command(
+    raw: str,
+    *,
+    state: ChatState,
+    commands: InteractiveCommands,
+    renderer: PrettyRenderer,
+    queued_turns: QueuedTurnQueue,
+) -> bool:
+    try:
+        parts = shlex.split(raw)
+    except ValueError as exc:
+        renderer.warning(f"Invalid queue command: {exc}")
+        return True
+    if not parts or parts[0].lstrip("/").lower() != "queue":
+        return False
+    argv = parts[1:]
+    if not argv:
+        _render_queue_status(queued_turns, renderer)
+        return True
+    action = argv[0].lower()
+    if action == "clear" and len(argv) == 1:
+        removed = queued_turns.clear()
+        _release_queued_media(commands, removed)
+        renderer.info(
+            f"Cleared {len(removed)} queued turn{'s' if len(removed) != 1 else ''}."
+        )
+        return True
+    if action == "remove" and len(argv) == 2:
+        removed = queued_turns.remove(argv[1])
+        if removed is None:
+            renderer.warning("Queue item not found; use /queue to inspect ids/positions.")
+        else:
+            _release_queued_media(commands, [removed])
+            renderer.info(f"Removed queued turn {removed.turn_id[:8]}.")
+        return True
+    if action == "send" and len(argv) == 1:
+        if not queued_turns:
+            renderer.info("Queue: empty · nothing to send.")
+            return True
+        binding = _current_queue_binding(state, commands)
+        count = queued_turns.release(binding=binding)
+        renderer.info(
+            f"Queue released · {count} turn{'s' if count != 1 else ''} rebound to current context."
+        )
+        return True
+    renderer.warning("Usage: /queue [send | remove <index|id> | clear]")
+    return True
 
 
 @dataclass
@@ -865,7 +1005,7 @@ def run_chat(
             renderer.info(
                 f"Goal · active in another gptty process · owner pid {state.goal.runner_pid}"
             )
-        queued_prompts: deque[str] = deque()
+        queued_turns = QueuedTurnQueue()
         while True:
             outcome = _run_enhanced_loop(
                 args=args,
@@ -875,7 +1015,7 @@ def run_chat(
                 ui=ui,
                 renderer=renderer,
                 commands=interactive_commands,
-                queued_prompts=queued_prompts,
+                queued_turns=queued_turns,
                 stdout=renderer_stdout,
                 stderr=renderer_stderr,
                 patch_stdout_enabled=prompt_patch_enabled,
@@ -892,7 +1032,22 @@ def run_chat(
                     continue
                 prompt = selected
             if not prompt.startswith("/"):
-                queued_prompts.append(prompt)
+                _enqueue_queued_turn(
+                    prompt,
+                    state=state,
+                    commands=interactive_commands,
+                    renderer=renderer,
+                    queued_turns=queued_turns,
+                    origin="outer-loop",
+                )
+                continue
+            if _handle_queue_command(
+                prompt,
+                state=state,
+                commands=interactive_commands,
+                renderer=renderer,
+                queued_turns=queued_turns,
+            ):
                 continue
             result = interactive_commands.handle(prompt)
             if result is not None:
@@ -1093,7 +1248,7 @@ def _run_enhanced_loop(
     ui: InteractiveSession,
     renderer: PrettyRenderer,
     commands: InteractiveCommands,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
     stdout: TextIO,
     stderr: TextIO,
     patch_stdout_enabled: bool,
@@ -1111,7 +1266,7 @@ def _run_enhanced_loop(
                 ui=ui,
                 renderer=renderer,
                 commands=commands,
-                queued_prompts=queued_prompts,
+                queued_turns=queued_turns,
                 stdout=stdout,
                 stderr=stderr,
                 patch_stdout_enabled=patch_stdout_enabled,
@@ -1128,7 +1283,7 @@ async def _run_enhanced_loop_async(
     ui: InteractiveSession,
     renderer: PrettyRenderer,
     commands: InteractiveCommands,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
     stdout: TextIO,
     stderr: TextIO,
     patch_stdout_enabled: bool,
@@ -1148,7 +1303,7 @@ async def _run_enhanced_loop_async(
                 ui=ui,
                 renderer=renderer,
                 commands=commands,
-                queued_prompts=queued_prompts,
+                queued_turns=queued_turns,
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -1166,7 +1321,7 @@ async def _enhanced_loop_core(
     ui: InteractiveSession,
     renderer: PrettyRenderer,
     commands: InteractiveCommands,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
     stdout: TextIO,
     stderr: TextIO,
 ) -> _EnhancedLoopOutcome:
@@ -1246,13 +1401,25 @@ async def _enhanced_loop_core(
 
         if active is None and active_resume is None and active_follow is None:
             next_prompt: str | None = None
+            queued_turn: QueuedTurn | None = None
             automatic_turn = False
             if commands.goal_bootstrap_pending:
                 next_prompt = commands.pop_automatic_prompt()
                 automatic_turn = next_prompt is not None
-            elif queued_prompts:
-                commands.clear_automatic_prompts()
-                next_prompt = queued_prompts.popleft()
+            elif queued_turns:
+                if not queued_turns.held:
+                    current_binding = _current_queue_binding(state, commands)
+                    if not queued_turns.binding_matches(current_binding):
+                        _hold_queued_turns(
+                            queued_turns,
+                            renderer,
+                            "chat/model/Goal context changed",
+                        )
+                    else:
+                        commands.clear_automatic_prompts()
+                        queued_turn = queued_turns.peek()
+                        if queued_turn is not None:
+                            next_prompt = queued_turn.text
             else:
                 next_prompt = commands.pop_automatic_prompt()
                 automatic_turn = next_prompt is not None
@@ -1267,12 +1434,21 @@ async def _enhanced_loop_core(
                     ui=ui,
                     renderer=renderer,
                     commands=commands,
-                    queued_prompts=queued_prompts,
+                    queued_turns=queued_turns,
                     stdout=stdout,
                     stderr=stderr,
                     prompt=next_prompt,
                     automatic_turn=automatic_turn,
+                    queued_turn=queued_turn,
                 )
+                if active is not None and queued_turn is not None:
+                    queued_turns.popleft()
+                elif queued_turn is not None:
+                    _hold_queued_turns(
+                        queued_turns,
+                        renderer,
+                        "dispatch preparation failed; draft preserved",
+                    )
 
         if prompt_task is None and accepting_input:
             prompt_task = asyncio.create_task(
@@ -1305,12 +1481,14 @@ async def _enhanced_loop_core(
                 raw = finished_prompt.result()
             except KeyboardInterrupt:
                 if active is not None:
+                    _hold_queued_turns(queued_turns, renderer, "stopped by user")
                     active.controls.request_stop()
                 elif active_resume is not None:
                     renderer.info(
                         "Conversation is still loading; use Ctrl-\\ or /exit to exit gptty."
                     )
                 elif active_follow is not None:
+                    _hold_queued_turns(queued_turns, renderer, "stopped by user")
                     pending_follow_command = "/stop"
                     active_follow.stop_requested = True
                     _cancel_enhanced_follow_timer(active_follow)
@@ -1335,12 +1513,18 @@ async def _enhanced_loop_core(
                         and active_resume is None
                     ):
                         if not prompt.startswith("/"):
-                            queued_prompts.append(prompt)
-                            renderer.info(f"Queued · {len(queued_prompts)}")
+                            _enqueue_queued_turn(
+                                prompt,
+                                state=state,
+                                commands=commands,
+                                renderer=renderer,
+                                queued_turns=queued_turns,
+                                origin="follow",
+                            )
                             _refresh_active_follow_ui(
                                 ui,
                                 active_follow,
-                                queued_prompts,
+                                queued_turns,
                             )
                         elif prompt.split(maxsplit=1)[0].lower() in {"/exit", "/quit"}:
                             result = commands.handle(prompt)
@@ -1349,27 +1533,57 @@ async def _enhanced_loop_core(
                             )
                         elif prompt == "/":
                             renderer.info(
-                                "While following: text queues · /stop · /exit · other commands run between follow reads"
+                                "While following: text queues · /queue · /stop · /exit · other commands run between follow reads"
                             )
+                        elif _handle_queue_command(
+                            prompt,
+                            state=state,
+                            commands=commands,
+                            renderer=renderer,
+                            queued_turns=queued_turns,
+                        ):
+                            _refresh_active_follow_ui(ui, active_follow, queued_turns)
                         else:
+                            if prompt.split(maxsplit=1)[0].lower() == "/stop":
+                                _hold_queued_turns(
+                                    queued_turns,
+                                    renderer,
+                                    "stopped by user",
+                                )
                             pending_follow_command = prompt
                             active_follow.stop_requested = True
                             _cancel_enhanced_follow_timer(active_follow)
                     elif active is None and active_resume is None:
                         if prompt == "/":
                             ui.reopen_command_completion()
+                        elif prompt.startswith("/") and _handle_queue_command(
+                            prompt,
+                            state=state,
+                            commands=commands,
+                            renderer=renderer,
+                            queued_turns=queued_turns,
+                        ):
+                            pass
                         elif prompt.startswith("/"):
                             result = await commands.handle_async(prompt)
                             if result is not None:
                                 return _EnhancedLoopOutcome(exit_code=result)
                         else:
-                            queued_prompts.append(prompt)
+                            _enqueue_queued_turn(
+                                prompt,
+                                state=state,
+                                commands=commands,
+                                renderer=renderer,
+                                queued_turns=queued_turns,
+                                origin="idle",
+                            )
                     elif active_resume is not None and active is None:
                         outcome = _handle_resume_loading_input(
                             prompt,
+                            request=active_resume.request,
                             commands=commands,
                             renderer=renderer,
-                            queued_prompts=queued_prompts,
+                            queued_turns=queued_turns,
                         )
                         if outcome is not None:
                             return outcome
@@ -1379,9 +1593,9 @@ async def _enhanced_loop_core(
                             active=active,
                             commands=commands,
                             renderer=renderer,
-                            queued_prompts=queued_prompts,
+                            queued_turns=queued_turns,
                         )
-                        _refresh_active_turn_ui(ui, active, queued_prompts)
+                        _refresh_active_turn_ui(ui, active, queued_turns)
 
         if active_resume is not None and active_resume.future in done:
             finished_resume = active_resume
@@ -1400,17 +1614,16 @@ async def _enhanced_loop_core(
                         tui_archive=getattr(commands, "tui_archive", None),
                     )
                     if active_follow is not None:
-                        _refresh_active_follow_ui(ui, active_follow, queued_prompts)
+                        _refresh_active_follow_ui(ui, active_follow, queued_turns)
             else:
                 commands.fail_resume(finished_resume.request, payload)
             if not resumed:
-                queued_count = len(queued_prompts)
-                queued_prompts.clear()
                 commands.clear_automatic_prompts()
-                if queued_count:
-                    renderer.info(
-                        f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after failed resume."
-                    )
+                _hold_queued_turns(
+                    queued_turns,
+                    renderer,
+                    "resume failed; drafts preserved",
+                )
             accepting_input = True
 
         if (
@@ -1521,7 +1734,7 @@ async def _enhanced_loop_core(
                 renderer=renderer,
                 stderr=stderr,
                 prompt_task=prompt_task,
-                queued_prompts=queued_prompts,
+                queued_turns=queued_turns,
             )
             if outcome is not None:
                 return outcome
@@ -2144,13 +2357,34 @@ def _backoff_enhanced_follow_after_error(
 def _handle_resume_loading_input(
     prompt: str,
     *,
+    request: ResumeRequest,
     commands: InteractiveCommands,
     renderer: PrettyRenderer,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
 ) -> _EnhancedLoopOutcome | None:
     if not prompt.startswith("/"):
-        queued_prompts.append(prompt)
-        renderer.info(f"Queued · {len(queued_prompts)}")
+        _enqueue_queued_turn(
+            prompt,
+            state=commands.state,
+            commands=commands,
+            renderer=renderer,
+            queued_turns=queued_turns,
+            origin="resume-loading",
+            binding=QueueBinding(
+                conversation_ref=request.conversation_ref,
+                conversation_mode="normal",
+                model=commands.state.model,
+                reasoning_effort=getattr(commands.state, "reasoning_effort", None),
+            ),
+        )
+        return None
+    if _handle_queue_command(
+        prompt,
+        state=commands.state,
+        commands=commands,
+        renderer=renderer,
+        queued_turns=queued_turns,
+    ):
         return None
 
     try:
@@ -2186,8 +2420,14 @@ async def _finish_enhanced_turn(
     renderer: PrettyRenderer,
     stderr: TextIO,
     prompt_task: asyncio.Task[str] | None,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
 ) -> _EnhancedLoopOutcome | None:
+    if turn.controls.stop_intent.is_set():
+        _hold_queued_turns(
+            queued_turns,
+            renderer,
+            "stop requested by user",
+        )
     try:
         code = turn.task.result()
     except BaseException as exc:  # noqa: BLE001 - async orchestration boundary.
@@ -2244,8 +2484,7 @@ async def _finish_enhanced_turn(
         renderer.turn_marker(*terminal_marker)
     if stopped_by_user:
         renderer.info("Stopped by user.")
-        if queued_prompts:
-            renderer.info(f"Queued · {len(queued_prompts)} · will send next")
+        _hold_queued_turns(queued_turns, renderer, "stopped by user")
     conversation_ref = turn.result.get("conversation_ref")
     if (
         not turn.result.get("is_temporary")
@@ -2263,13 +2502,12 @@ async def _finish_enhanced_turn(
         if turn.pause_goal_after_turn and commands.goal_active:
             commands.handle("/goal pause")
     elif abnormal_turn:
-        queued_count = len(queued_prompts)
-        queued_prompts.clear()
         commands.clear_automatic_prompts()
-        if queued_count:
-            renderer.info(
-                f"Cleared {queued_count} queued prompt{'s' if queued_count != 1 else ''} after abnormal turn."
-            )
+        _hold_queued_turns(
+            queued_turns,
+            renderer,
+            "abnormal turn; drafts preserved",
+        )
 
     if turn.exit_after_turn or turn.controls.quit_requested.is_set():
         if turn.goal_turn and commands.goal_active:
@@ -2300,11 +2538,12 @@ def _start_enhanced_turn(
     ui: InteractiveSession,
     renderer: PrettyRenderer,
     commands: InteractiveCommands,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
     stdout: TextIO,
     stderr: TextIO,
     prompt: str,
     automatic_turn: bool,
+    queued_turn: QueuedTurn | None,
 ) -> _EnhancedTurn | None:
     if commands.goal_owned_elsewhere:
         renderer.warning(
@@ -2318,7 +2557,11 @@ def _start_enhanced_turn(
         if prepared is None:
             return None
         prompt = prepared
-        media = commands.take_pending_media()
+        media = (
+            list(queued_turn.media)
+            if queued_turn is not None
+            else commands.take_pending_media()
+        )
 
     prepared = commands.mark_goal_turn_started(prompt, automatic=automatic_turn)
     if prepared is None:
@@ -2409,20 +2652,20 @@ def _start_enhanced_turn(
         health=health,
         archive_turn_id=archive_turn_id,
     )
-    _refresh_active_turn_ui(ui, active, queued_prompts)
+    _refresh_active_turn_ui(ui, active, queued_turns)
     return active
 
 
 def _refresh_active_turn_ui(
     ui: InteractiveSession,
     active: _EnhancedTurn,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
 ) -> None:
     ui.set_active_turn(
         active.controls,
         working_status=lambda: _working_status(
             active.started_at,
-            len(queued_prompts),
+            len(queued_turns),
             health=active.health,
         ),
     )
@@ -2431,13 +2674,13 @@ def _refresh_active_turn_ui(
 def _refresh_active_follow_ui(
     ui: InteractiveSession,
     follow: _EnhancedFollow,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
 ) -> None:
     ui.set_active_turn(
         None,
         working_status=lambda: _working_status(
             follow.started_at,
-            len(queued_prompts),
+            len(queued_turns),
             health=follow.health,
         ),
     )
@@ -2564,17 +2807,31 @@ def _handle_working_input(
     active: _EnhancedTurn,
     commands: InteractiveCommands,
     renderer: PrettyRenderer,
-    queued_prompts: deque[str],
+    queued_turns: QueuedTurnQueue,
 ) -> bool:
     if not prompt.startswith("/"):
-        queued_prompts.append(prompt)
-        renderer.info(f"Queued · {len(queued_prompts)}")
+        _enqueue_queued_turn(
+            prompt,
+            state=commands.state,
+            commands=commands,
+            renderer=renderer,
+            queued_turns=queued_turns,
+            origin="working",
+        )
         return True
 
     if prompt == "/":
         renderer.info(
-            "While working: /stop · /exit · /goal pause · /goal status · /goal list · /image PATH · /paste"
+            "While working: /queue · /stop · /exit · /goal pause · /goal status · /goal list · /image PATH · /paste"
         )
+        return True
+    if _handle_queue_command(
+        prompt,
+        state=commands.state,
+        commands=commands,
+        renderer=renderer,
+        queued_turns=queued_turns,
+    ):
         return True
 
     try:
@@ -2591,6 +2848,7 @@ def _handle_working_input(
         if argv:
             renderer.warning("/stop takes no arguments.")
             return True
+        _hold_queued_turns(queued_turns, renderer, "stopped by user")
         active.controls.request_stop()
         return True
 
