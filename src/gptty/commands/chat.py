@@ -46,6 +46,7 @@ from ..state import ChatState, StateError, save_chat_state
 from ..tui_archive import TUIArchive
 from ..turn_control import StopOutcome, request_stop_generation
 from ..turn_failure import classify_turn_failure
+from ..ui.command_registry import command_allowed, command_context_tokens, resolve_command
 from ..ui.commands import (
     UNFINISHED_STATUSES,
     InteractiveCommands,
@@ -1526,7 +1527,12 @@ async def _enhanced_loop_core(
                                 active_follow,
                                 queued_turns,
                             )
-                        elif prompt.split(maxsplit=1)[0].lower() in {"/exit", "/quit"}:
+                        elif (
+                            (follow_spec := resolve_command(prompt.split(maxsplit=1)[0]))
+                            is not None
+                            and follow_spec.name == "exit"
+                            and command_allowed(follow_spec.name, "follow")
+                        ):
                             result = commands.handle(prompt)
                             return _EnhancedLoopOutcome(
                                 exit_code=0 if result is None else result
@@ -1544,15 +1550,24 @@ async def _enhanced_loop_core(
                         ):
                             _refresh_active_follow_ui(ui, active_follow, queued_turns)
                         else:
-                            if prompt.split(maxsplit=1)[0].lower() == "/stop":
-                                _hold_queued_turns(
-                                    queued_turns,
-                                    renderer,
-                                    "stopped by user",
+                            requested = prompt.split(maxsplit=1)[0]
+                            follow_spec = resolve_command(requested)
+                            if follow_spec is None or not command_allowed(
+                                follow_spec.name, "follow"
+                            ):
+                                renderer.warning(
+                                    f"Unknown or unavailable command while following: {requested}."
                                 )
-                            pending_follow_command = prompt
-                            active_follow.stop_requested = True
-                            _cancel_enhanced_follow_timer(active_follow)
+                            else:
+                                if follow_spec.name == "stop":
+                                    _hold_queued_turns(
+                                        queued_turns,
+                                        renderer,
+                                        "stopped by user",
+                                    )
+                                pending_follow_command = prompt
+                                active_follow.stop_requested = True
+                                _cancel_enhanced_follow_timer(active_follow)
                     elif active is None and active_resume is None:
                         if prompt == "/":
                             ui.reopen_command_completion()
@@ -2362,6 +2377,13 @@ def _handle_resume_loading_input(
     renderer: PrettyRenderer,
     queued_turns: QueuedTurnQueue,
 ) -> _EnhancedLoopOutcome | None:
+    if prompt.strip() == "/":
+        renderer.info(
+            "While loading a conversation: "
+            + " · ".join(command_context_tokens("resume_loading"))
+            + " · Ctrl-\\ quit"
+        )
+        return None
     if not prompt.startswith("/"):
         _enqueue_queued_turn(
             prompt,
@@ -2395,20 +2417,19 @@ def _handle_resume_loading_input(
     if not parts:
         return None
 
-    name = parts[0].lstrip("/").lower()
+    requested = parts[0].lstrip("/").lower()
     argv = parts[1:]
-    if name in {"exit", "quit"}:
-        if argv:
-            renderer.warning(f"/{name} takes no arguments.")
-            return None
-        result = commands.handle("/exit")
-        return _EnhancedLoopOutcome(exit_code=0 if result is None else result)
-    if name == "":
-        renderer.info("While loading a conversation: /exit · Ctrl-\\ quit")
-        return None
+    spec = resolve_command(requested)
+    if spec is not None and command_allowed(spec.name, "resume_loading"):
+        if spec.name == "exit":
+            if argv:
+                renderer.warning(f"/{requested} takes no arguments.")
+                return None
+            result = commands.handle(f"/{requested}")
+            return _EnhancedLoopOutcome(exit_code=0 if result is None else result)
 
     renderer.warning(
-        f"/{name} is unavailable while the conversation is loading; wait for resume to finish."
+        f"/{requested} is unavailable while the conversation is loading; wait for resume to finish."
     )
     return None
 
@@ -2822,7 +2843,7 @@ def _handle_working_input(
 
     if prompt == "/":
         renderer.info(
-            "While working: /queue · /stop · /exit · /goal pause · /goal status · /goal list · /image PATH · /paste"
+            "While working: " + " · ".join(command_context_tokens("working"))
         )
         return True
     if _handle_queue_command(
@@ -2841,8 +2862,15 @@ def _handle_working_input(
         return True
     if not parts:
         return True
-    name = parts[0].lstrip("/").lower()
+    requested = parts[0].lstrip("/").lower()
     argv = parts[1:]
+    spec = resolve_command(requested)
+    if spec is None or not command_allowed(spec.name, "working"):
+        renderer.warning(
+            f"/{requested} is unavailable while working; stop the current response first."
+        )
+        return True
+    name = spec.name
 
     if name == "stop":
         if argv:
@@ -2852,9 +2880,9 @@ def _handle_working_input(
         active.controls.request_stop()
         return True
 
-    if name in {"exit", "quit"}:
+    if name == "exit":
         if argv:
-            renderer.warning(f"/{name} takes no arguments.")
+            renderer.warning(f"/{requested} takes no arguments.")
             return True
         active.exit_after_turn = True
         active.controls.request_quit()
@@ -2893,7 +2921,7 @@ def _handle_working_input(
         return True
 
     renderer.warning(
-        f"/{name} is unavailable while working; stop the current response first."
+        f"/{requested} is unavailable while working; stop the current response first."
     )
     return True
 

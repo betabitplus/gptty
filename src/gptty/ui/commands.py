@@ -53,6 +53,7 @@ from ..state import ChatState, GoalAcceptanceCriterion, GoalState, StateError, s
 from ..tui_archive import TUIArchive
 from ..turn_control import StopOutcome, request_stop_generation
 from .clipboard import ClipboardImageError, capture_clipboard_image
+from .command_registry import resolve_command
 from .notifications import notify_response_complete
 from .renderer import PrettyRenderer
 from .session import InteractiveSession
@@ -127,10 +128,14 @@ class InteractiveCommands:
             return None
         if not parts:
             return None
-        name = parts[0].lstrip("/").lower()
-        method = getattr(self, f"_cmd_{name}", None)
+        requested = parts[0].lstrip("/").lower()
+        spec = resolve_command(requested)
+        if spec is None or spec.owner != "commands":
+            self.renderer.warning(f"Unknown command: /{requested}. Press / for actions.")
+            return None
+        method = getattr(self, f"_cmd_{spec.name}", None)
         if not callable(method):
-            self.renderer.warning(f"Unknown command: /{name}. Press / for actions.")
+            self.renderer.warning(f"Command unavailable: /{spec.name}.")
             return None
         return method(parts[1:])
 
@@ -142,17 +147,19 @@ class InteractiveCommands:
             return None
         if not parts:
             return None
-        name = parts[0].lstrip("/").lower()
+        requested = parts[0].lstrip("/").lower()
         argv = parts[1:]
-        if name == "resume" and not argv:
-            return await self._cmd_resume_async()
-        if name == "model" and not argv:
-            return await self._cmd_model_async()
-        if name == "image" and not argv:
-            return await self._cmd_image_async()
-        method = getattr(self, f"_cmd_{name}", None)
+        spec = resolve_command(requested)
+        if spec is None or spec.owner != "commands":
+            self.renderer.warning(f"Unknown command: /{requested}. Press / for actions.")
+            return None
+        if spec.async_picker and not argv:
+            async_method = getattr(self, f"_cmd_{spec.name}_async", None)
+            if callable(async_method):
+                return await async_method()
+        method = getattr(self, f"_cmd_{spec.name}", None)
         if not callable(method):
-            self.renderer.warning(f"Unknown command: /{name}. Press / for actions.")
+            self.renderer.warning(f"Command unavailable: /{spec.name}.")
             return None
         return method(argv)
 
@@ -1907,9 +1914,6 @@ class InteractiveCommands:
             model=self.state.model or "latest frontier · High", temporary=True
         )
         self.renderer.info("Started a new Temporary ChatGPT conversation.")
-
-    def _cmd_temp(self, argv: list[str]) -> None:
-        self._cmd_temporary(argv)
 
     def _cmd_detach(self, argv: list[str]) -> None:
         self._pause_active_goal("conversation detached")

@@ -3421,3 +3421,24 @@ def test_busy_queue_binds_pending_media_to_the_prompt_accepted_with_it(
         ("send_to_conversation", "queued A", ()),
         ("send_to_conversation", "queued B", (str(image),)),
     ]
+
+
+def test_resume_loading_bare_slash_uses_registry_help() -> None:
+    messages: list[str] = []
+    renderer = SimpleNamespace(
+        info=lambda message: messages.append(message),
+        warning=lambda message: messages.append(f"WARN:{message}"),
+    )
+
+    outcome = chat_module._handle_resume_loading_input(
+        "/",
+        request=None,
+        commands=None,
+        renderer=renderer,
+        queued_turns=None,
+    )
+
+    assert outcome is None
+    assert messages == [
+        "While loading a conversation: /queue · /exit · Ctrl-\\ quit"
+    ]

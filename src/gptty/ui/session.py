@@ -39,6 +39,7 @@ from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 from rich.markdown import Markdown
 
+from .command_registry import COMMANDS, CommandSpec
 from .history import PrivatePromptHistory
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
@@ -49,87 +50,12 @@ from .terminal_safety import sanitize_terminal_text
 ACTIVE_STATUS_REFRESH_SECONDS = 1.0
 
 
-@dataclass(frozen=True)
-class CommandOptionSpec:
-    value: str
-    description: str
-
-
-@dataclass(frozen=True)
-class CommandSpec:
-    name: str
-    description: str
-    usage: str | None = None
-    options: tuple[CommandOptionSpec, ...] = ()
-
-
 @dataclass
 class _PersistentPromptRuntime:
     app: Application[str]
     default_buffer: Buffer
     search_buffer: Buffer
     mouse_support: bool = False
-
-
-COMMANDS: tuple[CommandSpec, ...] = (
-    CommandSpec("new", "Start a new ChatGPT conversation"),
-    CommandSpec("temporary", "Start a new Temporary ChatGPT conversation"),
-    CommandSpec(
-        "resume",
-        "Resume a real ChatGPT conversation",
-        "Enter: choose chat · or <conversation-id>",
-    ),
-    CommandSpec("detach", "Detach locally from the current conversation"),
-    CommandSpec("reload", "Refresh the currently attached conversation"),
-    CommandSpec("stop", "Stop the active ChatGPT response"),
-    CommandSpec(
-        "queue",
-        "Inspect or manage queued turns",
-        "send | remove <index|id> | clear",
-        (
-            CommandOptionSpec("send", "Release held turns into the current context"),
-            CommandOptionSpec("remove", "Remove one queued turn by position or id prefix"),
-            CommandOptionSpec("clear", "Discard all queued turns"),
-        ),
-    ),
-    CommandSpec(
-        "history",
-        "Manage local prompt history",
-        "clear",
-        (CommandOptionSpec("clear", "Delete persisted and in-memory prompt history"),),
-    ),
-    CommandSpec(
-        "goal",
-        "Run the current task until complete or blocked",
-        "<objective> | list [all] | open <id> | pause | resume | status | doctor | trace [N] | criteria | clear",
-        (
-            CommandOptionSpec("list", "List unfinished goals (add 'all' for terminal)"),
-            CommandOptionSpec("open", "Switch to a goal by id prefix"),
-            CommandOptionSpec("pause", "Pause the attached goal"),
-            CommandOptionSpec("resume", "Resume the attached paused or blocked goal"),
-            CommandOptionSpec("status", "Show attached goal state and turn count"),
-            CommandOptionSpec("doctor", "Verify Goal durability and recovery invariants"),
-            CommandOptionSpec("trace", "Show recent typed Goal journal events"),
-            CommandOptionSpec("criteria", "Show or attest Goal acceptance criteria"),
-            CommandOptionSpec("clear", "Unbind the attached goal; retain history"),
-        ),
-    ),
-    CommandSpec("export", "Export the attached conversation to Markdown"),
-    CommandSpec(
-        "image",
-        "Attach an image to the next prompt",
-        "Enter: choose path · or clear",
-        (CommandOptionSpec("clear", "Remove pending images"),),
-    ),
-    CommandSpec("paste", "Attach the clipboard image to the next prompt"),
-    CommandSpec(
-        "model",
-        "Choose a real ChatGPT model",
-        "Enter: choose model · or default | <slug>",
-        (CommandOptionSpec("default", "Use latest frontier · High"),),
-    ),
-    CommandSpec("exit", "Exit gptty chat"),
-)
 
 
 def _command_meta(spec: CommandSpec) -> str:
