@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from io import StringIO
 
 import gptty.runs as runs
@@ -36,6 +37,27 @@ def test_start_run_writes_summary_and_events(tmp_path) -> None:
     assert all(event["contract"] == "gptty.run.event" for event in events)
     assert all(event["run_id"] == recorder.run_id for event in events)
     assert all(isinstance(event["event_id"], str) and event["event_id"] for event in events)
+    if os.name != "nt":
+        assert recorder.run_file.parent.stat().st_mode & 0o777 == 0o700
+        assert recorder.run_file.stat().st_mode & 0o777 == 0o600
+        assert recorder.events_file.stat().st_mode & 0o777 == 0o600
+        assert recorder.store_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_run_summary_update_hardens_preexisting_permissive_projection(tmp_path) -> None:
+    recorder = start_run(
+        profile=None,
+        state_path=tmp_path / "gptty_state.json",
+        command="send",
+        conversation_ref="conv-1",
+    )
+    if os.name != "nt":
+        recorder.run_file.chmod(0o666)
+
+    recorder.event("token_delta", text="private")
+
+    if os.name != "nt":
+        assert recorder.run_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_fail_persists_traceback_in_summary_and_event(tmp_path) -> None:

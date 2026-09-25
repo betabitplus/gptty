@@ -16,6 +16,7 @@ from .automation import (
     run_event_envelope,
 )
 from .local_store import DB_FILENAME, LocalEventStore, local_store_root
+from .private_fs import atomic_write_private_text
 
 
 @dataclass(frozen=True)
@@ -190,24 +191,10 @@ def start_run(
 
 
 def write_run_summary(path: str | Path, summary: dict[str, Any]) -> None:
-    run_path = Path(path)
-    run_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = run_path.with_name(
-        f".{run_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
     payload = (
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     )
-    try:
-        tmp_path.write_text(payload, encoding="utf-8")
-        if os.name != "nt":
-            tmp_path.chmod(0o600)
-        os.replace(tmp_path, run_path)
-    finally:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    atomic_write_private_text(path, payload)
 
 
 def read_run_summary(path: str | Path) -> dict[str, Any]:

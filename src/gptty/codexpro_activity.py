@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .private_fs import atomic_write_private_text
+
 DEFAULT_MATCH_WINDOW_MS = 10_000
 DEFAULT_REFRESH_SECONDS = 0.5
 DEFAULT_MAX_RECORDS = 20_000
@@ -164,21 +166,13 @@ class CodexProActivityTracker:
                 for conversation_id, session in sorted(self._mapping.items())
             },
         }
-        tmp = self.mapping_path.with_name(f".{self.mapping_path.name}.tmp")
         try:
-            self.mapping_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(
+            atomic_write_private_text(
+                self.mapping_path,
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
             )
-            os.chmod(tmp, 0o600)
-            tmp.replace(self.mapping_path)
-            os.chmod(self.mapping_path, 0o600)
         except OSError:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+            pass
 
     @staticmethod
     def _session_fingerprint(record: dict[str, Any]) -> str | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from argparse import Namespace
 from datetime import datetime, timezone
 from io import StringIO
@@ -134,6 +135,8 @@ def test_export_writes_markdown_to_file(tmp_path: Path) -> None:
 
     assert result == 0
     assert output_path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
+    if os.name != "nt":
+        assert output_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_export_refuses_to_overwrite_existing_file_by_default(tmp_path: Path) -> None:
@@ -155,6 +158,8 @@ def test_export_refuses_to_overwrite_existing_file_by_default(tmp_path: Path) ->
 def test_export_allows_overwrite(tmp_path: Path) -> None:
     output_path = tmp_path / "conversation.md"
     output_path.write_text("existing\n", encoding="utf-8")
+    if os.name != "nt":
+        output_path.chmod(0o666)
 
     result = run_export(
         make_args(
@@ -169,6 +174,8 @@ def test_export_allows_overwrite(tmp_path: Path) -> None:
 
     assert result == 0
     assert output_path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
+    if os.name != "nt":
+        assert output_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_export_returns_1_on_sdk_error(tmp_path: Path) -> None:
@@ -248,6 +255,24 @@ def test_save_markdown_export_creates_timestamped_readable_file(tmp_path: Path) 
 
     assert path == (tmp_path / "2026-09-05_19-20-30 - My - unsafe- chat.md").resolve()
     assert path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_default_markdown_export_directory_is_owner_only(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "default-exports"
+    monkeypatch.setattr(export_command, "DEFAULT_EXPORT_DIRECTORY", root)
+
+    path = save_markdown_export(
+        [OutputMessage(role="user", text="private")],
+        title="Private chat",
+        now=datetime(2026, 9, 5, 19, 20, 30, tzinfo=timezone.utc),
+    )
+
+    assert path.parent == root.resolve()
+    if os.name != "nt":
+        assert root.stat().st_mode & 0o777 == 0o700
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_save_markdown_export_never_overwrites_previous_export(tmp_path: Path) -> None:

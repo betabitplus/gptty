@@ -99,6 +99,20 @@ def test_harden_private_file_clamps_existing_mode(tmp_path: Path) -> None:
     assert _mode(path) == PRIVATE_FILE_MODE
 
 
+def test_atomic_write_private_text_sync_flushes_file_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(private_fs.os, "fsync", calls.append)
+
+    path = tmp_path / "sync.txt"
+    atomic_write_private_text(path, "durable\n", sync=True)
+
+    assert path.read_text(encoding="utf-8") == "durable\n"
+    assert len(calls) == 1
+
+
 def test_mode_operations_are_skipped_when_platform_does_not_support_them(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

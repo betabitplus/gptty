@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from ..output import OutputFormat, OutputMessage, normalize_messages, render_messages
+from ..private_fs import atomic_write_private_text, create_private_text, ensure_private_dir
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError
 from ._client import build_client
@@ -79,12 +80,16 @@ def resolve_conversation_ref(
 
 def write_export(output_path: str | Path, content: str, *, overwrite: bool, stderr: TextIO) -> int:
     path = Path(output_path)
-    if path.exists() and not overwrite:
-        print(f"gptty: output file already exists: {path}. Use --overwrite to replace it.", file=stderr)
-        return 1
+    payload = content + "\n"
 
     try:
-        path.write_text(content + "\n", encoding="utf-8")
+        if overwrite:
+            atomic_write_private_text(path, payload)
+        else:
+            create_private_text(path, payload)
+    except FileExistsError:
+        print(f"gptty: output file already exists: {path}. Use --overwrite to replace it.", file=stderr)
+        return 1
     except OSError as exc:
         print(f"gptty: failed to write export to {path}: {exc}", file=stderr)
         return 1
@@ -99,17 +104,24 @@ def save_markdown_export(
     title: str | None = None,
     now: datetime | None = None,
 ) -> Path:
-    root = Path(directory).expanduser() if directory is not None else DEFAULT_EXPORT_DIRECTORY
-    root.mkdir(parents=True, exist_ok=True)
+    if directory is None:
+        root = ensure_private_dir(DEFAULT_EXPORT_DIRECTORY)
+    else:
+        root = Path(directory).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
     timestamp = (now or datetime.now().astimezone()).strftime("%Y-%m-%d_%H-%M-%S")
     stem = _export_filename_stem(title)
-    candidate = root / f"{timestamp} - {stem}.md"
-    suffix = 2
-    while candidate.exists():
-        candidate = root / f"{timestamp} - {stem} ({suffix}).md"
-        suffix += 1
-    candidate.write_text(render_messages(messages, "markdown") + "\n", encoding="utf-8")
-    return candidate.resolve()
+    payload = render_messages(messages, "markdown") + "\n"
+    suffix = 1
+    while True:
+        label = "" if suffix == 1 else f" ({suffix})"
+        candidate = root / f"{timestamp} - {stem}{label}.md"
+        try:
+            create_private_text(candidate, payload)
+        except FileExistsError:
+            suffix += 1
+            continue
+        return candidate.resolve()
 
 
 def _export_filename_stem(title: str | None) -> str:

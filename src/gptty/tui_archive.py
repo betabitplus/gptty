@@ -11,6 +11,7 @@ from typing import Any
 
 from .file_lock import KernelFileLock
 from .local_store import DB_FILENAME, LocalEventStore
+from .private_fs import PRIVATE_FILE_MODE, PRIVATE_MODES_SUPPORTED, atomic_write_private_text
 from .profiles import data_dir
 
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,128}$")
@@ -390,22 +391,28 @@ class TUIArchive:
         if not path.exists():
             return
         temporary = self._temporary_path(path)
+        fd: int | None = None
         try:
-            with path.open("r", encoding="utf-8") as source, temporary.open(
-                "w",
-                encoding="utf-8",
-                newline="\n",
-            ) as target:
-                source.readline()
-                target.write(f"# {title}\n")
-                for line in source:
-                    target.write(line)
-                target.flush()
-                os.fsync(target.fileno())
-            if os.name != "nt":
-                temporary.chmod(0o600)
+            with path.open("r", encoding="utf-8") as source:
+                fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    PRIVATE_FILE_MODE,
+                )
+                if PRIVATE_MODES_SUPPORTED:
+                    os.fchmod(fd, PRIVATE_FILE_MODE)
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
+                    fd = None
+                    source.readline()
+                    target.write(f"# {title}\n")
+                    for line in source:
+                        target.write(line)
+                    target.flush()
+                    os.fsync(target.fileno())
             os.replace(temporary, path)
         finally:
+            if fd is not None:
+                os.close(fd)
             self._remove_projection(temporary)
 
     @staticmethod
@@ -508,17 +515,7 @@ class TUIArchive:
     @staticmethod
     def _write_text_atomic(path: Path, text: str) -> None:
         TUIArchive._ensure_directory(path.parent)
-        temporary = TUIArchive._temporary_path(path)
-        try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            if os.name != "nt":
-                temporary.chmod(0o600)
-            os.replace(temporary, path)
-        finally:
-            TUIArchive._remove_projection(temporary)
+        atomic_write_private_text(path, text, sync=True)
 
     @staticmethod
     def _temporary_path(path: Path) -> Path:

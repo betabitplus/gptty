@@ -25,6 +25,7 @@ def atomic_write_private_text(
     text: str,
     *,
     encoding: str = "utf-8",
+    sync: bool = False,
 ) -> Path:
     """Atomically replace a text file and clamp it to owner-only permissions."""
 
@@ -46,6 +47,8 @@ def atomic_write_private_text(
             fd = None
             handle.write(text)
             handle.flush()
+            if sync:
+                os.fsync(handle.fileno())
         os.replace(temporary, target)
         harden_private_file(target)
         return target

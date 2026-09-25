@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from gptty.goal_store import GoalStore
@@ -50,6 +51,17 @@ def test_goal_store_writes_portable_json_checkpoint_and_multi_goal_index(tmp_pat
     assert index["goals"][0]["goal_id"] == "goal-123"
     assert store.load_for_conversation("conv-2") == goal
     assert set(store.bindings_for_goal(goal)) == {"conv-1", "conv-2"}
+    if os.name != "nt":
+        assert store.root.stat().st_mode & 0o777 == 0o700
+        assert store.goal_dir(goal).stat().st_mode & 0o777 == 0o700
+        assert store.db_path.stat().st_mode & 0o777 == 0o600
+        assert store.goal_path(goal).stat().st_mode & 0o777 == 0o600
+        assert store.checkpoint_path(goal).stat().st_mode & 0o777 == 0o600
+        assert (store.goal_dir(goal) / "events.jsonl").stat().st_mode & 0o777 == 0o600
+        assert store.index_path().stat().st_mode & 0o777 == 0o600
+        for sidecar in (Path(f"{store.db_path}-wal"), Path(f"{store.db_path}-shm")):
+            if sidecar.exists():
+                assert sidecar.stat().st_mode & 0o777 == 0o600
 
 
 def test_goal_store_clear_current_preserves_backupable_goal_directory(tmp_path) -> None:

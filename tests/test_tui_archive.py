@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 
 from gptty.local_store import LocalEventStore, local_store_path
@@ -75,6 +76,14 @@ def test_completed_turn_materializes_append_only_events_and_markdown(tmp_path) -
     assert meta["conversation_id"] == "conv-12345678"
     assert meta["web_url"] == "https://chatgpt.com/c/conv-12345678"
     assert meta["scope"] == "tui-observed"
+    if os.name != "nt":
+        assert archive.root.stat().st_mode & 0o777 == 0o700
+        assert archive.pending_dir.stat().st_mode & 0o777 == 0o700
+        assert archive.conversations_dir.stat().st_mode & 0o777 == 0o700
+        assert paths["directory"].stat().st_mode & 0o777 == 0o700
+        assert paths["events"].stat().st_mode & 0o777 == 0o600
+        assert paths["transcript"].stat().st_mode & 0o777 == 0o600
+        assert paths["meta"].stat().st_mode & 0o777 == 0o600
 
 
 def test_repeated_bind_does_not_duplicate_user_event(tmp_path) -> None:

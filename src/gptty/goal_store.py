@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import uuid
 from dataclasses import asdict
@@ -10,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .private_fs import atomic_write_private_text, ensure_private_dir, harden_private_file
 from .state import (
     CURRENT_GOAL_PROTOCOL_VERSION,
     CURRENT_GOAL_RUNTIME_VERSION,
@@ -90,7 +90,7 @@ class GoalStore:
         goal_id = ensure_goal_id(goal)
         old_revision = goal.revision
         old_generation = goal.generation
-        self.root.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.root)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -1373,8 +1373,9 @@ class GoalStore:
         return goal_state_from_dict(raw)
 
     def _connect(self) -> sqlite3.Connection:
-        self.root.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.root)
         db = sqlite3.connect(self.db_path, timeout=5.0)
+        harden_private_file(self.db_path)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA fullfsync=ON")
@@ -1431,6 +1432,9 @@ class GoalStore:
         if schema_version < self.SCHEMA_VERSION:
             db.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
         db.commit()
+        for path in (self.db_path, Path(f"{self.db_path}-wal"), Path(f"{self.db_path}-shm")):
+            if path.exists():
+                harden_private_file(path)
         return db
 
     def _bind_conversation_tx(
@@ -1575,8 +1579,7 @@ class GoalStore:
 
     def _write_portable_projection(self, goal: GoalState) -> None:
         goal_id = ensure_goal_id(goal)
-        directory = self.goal_dir(goal_id)
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = ensure_private_dir(self.goal_dir(goal_id))
         payload = {
             "schema": self.SCHEMA_VERSION,
             "goal_id": goal_id,
@@ -1617,8 +1620,7 @@ class GoalStore:
 
     def _write_portable_events(self, goal: GoalState | str) -> None:
         goal_id = goal if isinstance(goal, str) else ensure_goal_id(goal)
-        directory = self.goal_dir(goal_id)
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = ensure_private_dir(self.goal_dir(goal_id))
         journal = "".join(
             json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
             for event in self.events(goal_id)
@@ -1714,7 +1716,5 @@ class GoalStore:
 
     @staticmethod
     def _write_text_atomic(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, path)
+        ensure_private_dir(path.parent)
+        atomic_write_private_text(path, text)
