@@ -57,7 +57,7 @@ from ..ui.commands import (
     _snapshot_status,
 )
 from ._client import build_client
-from ..ui.notifications import notify_response_complete
+from ..ui.notifications import configure_notifications, notify_response_complete
 from ..ui.renderer import PrettyRenderer
 from ..ui.session import InteractiveSession, should_use_enhanced_ui
 from ..ui.signals import (
@@ -800,6 +800,7 @@ def run_chat(
         state_path=state_path,
         force_plain=bool(getattr(args, "plain", False)),
     )
+    configure_notifications(ui_settings)
 
     def get_client() -> Any:
         nonlocal client
@@ -3333,11 +3334,20 @@ def _send_chat_prompt(
             and not abnormal_turn
             and notify_completion
         ):
-            notify_response_complete(
-                chat_title=response_title(response)
-                or ("Temporary Chat" if is_temporary else None),
-                final_response=rendered_text,
+            notification_title = response_title(response) or (
+                "Temporary Chat" if is_temporary else None
             )
+            if is_temporary:
+                notify_response_complete(
+                    chat_title=notification_title,
+                    final_response=rendered_text,
+                    private=True,
+                )
+            else:
+                notify_response_complete(
+                    chat_title=notification_title,
+                    final_response=rendered_text,
+                )
 
 
 def _stopped_snapshot_response(

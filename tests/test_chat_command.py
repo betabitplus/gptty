@@ -1022,6 +1022,48 @@ def test_temporary_turn_uses_session_scoped_send_and_never_persists_temp_id(
     ]
 
 
+def test_temporary_turn_marks_completion_notification_private(tmp_path, monkeypatch) -> None:
+    class FakeRenderer:
+        def answer(self, _text: str) -> None:
+            pass
+
+        def turn_abort(self) -> None:
+            pass
+
+    notified: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "gptty.commands.chat.notify_response_complete",
+        lambda **kwargs: notified.append(kwargs),
+    )
+    state_path = tmp_path / "gptty_state.json"
+    save_chat_state(state_path, ChatState())
+
+    code = _send_chat_prompt(
+        FakeGpttyClient(),
+        state=ChatState(),
+        state_path=state_path,
+        profile=None,
+        prompt="ephemeral",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=FakeRenderer(),
+        conversation_mode="temporary",
+        attached_ref=None,
+    )
+
+    assert code == 0
+    assert notified == [
+        {
+            "chat_title": "Temporary Chat",
+            "final_response": "temporary reply",
+            "private": True,
+        }
+    ]
+
+
 def test_new_command_clears_conversation_without_sdk_init(tmp_path) -> None:
     FakeGpttyClient.instances.clear()
     save_chat_state(

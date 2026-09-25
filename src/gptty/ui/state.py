@@ -18,6 +18,9 @@ class UISettings:
     tools: str = "compact"
     editor: str = "emacs"
     history_limit: int = 2_000
+    notifications: bool = True
+    notification_preview: bool = False
+    notification_sound: bool = True
 
 
 def ui_settings_path(state_path: str | Path) -> Path:
@@ -46,6 +49,15 @@ def load_ui_settings(path: str | Path) -> UISettings:
     if isinstance(history_limit, bool) or not isinstance(history_limit, int):
         history_limit = 2_000
     history_limit = min(100_000, max(0, history_limit))
+    notifications = data.get("notifications", True)
+    if not isinstance(notifications, bool):
+        notifications = True
+    notification_preview = data.get("notification_preview", False)
+    if not isinstance(notification_preview, bool):
+        notification_preview = False
+    notification_sound = data.get("notification_sound", True)
+    if not isinstance(notification_sound, bool):
+        notification_sound = True
     return UISettings(
         pretty=pretty,
         markdown=bool(data.get("markdown", True)),
@@ -53,6 +65,9 @@ def load_ui_settings(path: str | Path) -> UISettings:
         tools=tools,
         editor=editor,
         history_limit=history_limit,
+        notifications=notifications,
+        notification_preview=notification_preview,
+        notification_sound=notification_sound,
     )
 
 
