@@ -9,6 +9,7 @@ from .automation import (
     TURN_RESULT_CONTRACT,
     summarize_observations,
 )
+from .privacy import redact_diagnostic_text, redact_diagnostic_value
 
 OutputFormat = Literal["plain", "json", "jsonl", "markdown"]
 
@@ -218,7 +219,8 @@ def normalize_turn_failure(
     raw_error: str | None = None,
     error_class: str | None = None,
 ) -> dict[str, Any]:
-    payload = _mapping_value(failure)
+    payload = redact_diagnostic_value(_mapping_value(failure))
+    safe_raw_error = redact_diagnostic_text(raw_error) if raw_error else None
     status = _optional_string(payload.get("status")) or "failed"
     stable_class = _optional_string(error_class) or (
         "turn_" + status.lower().replace("-", "_").replace(" ", "_")
@@ -236,7 +238,7 @@ def normalize_turn_failure(
             "code": payload.get("code"),
             "status_code": payload.get("status_code"),
             "request_stage": payload.get("request_stage"),
-            "message": payload.get("message") or raw_error or "request failed",
+            "message": payload.get("message") or safe_raw_error or "request failed",
             "source": payload.get("source"),
             "write_may_have_been_submitted": payload.get(
                 "write_may_have_been_submitted"
@@ -254,8 +256,8 @@ def normalize_turn_failure(
     }
     if conversation:
         result["conversation"] = conversation
-    if raw_error:
-        result["diagnostic_error"] = raw_error
+    if safe_raw_error:
+        result["diagnostic_error"] = safe_raw_error
     return result
 
 

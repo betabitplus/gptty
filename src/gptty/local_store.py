@@ -149,6 +149,40 @@ class LocalEventStore:
             ).fetchone()
         return self._decode_dict(row[0]) if row is not None else None
 
+    def run_ids_before(self, cutoff: str) -> list[str]:
+        """Return non-running local run ids older than an ISO-8601 cutoff."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT run_id, summary_json FROM local_runs WHERE updated_at < ?",
+                (cutoff,),
+            ).fetchall()
+        result: list[str] = []
+        for run_id, summary_json in rows:
+            summary = self._decode_dict(summary_json)
+            if summary is not None and str(summary.get("status") or "") == "running":
+                continue
+            result.append(str(run_id))
+        return result
+
+    def delete_runs(self, run_ids: list[str]) -> int:
+        normalized = list(dict.fromkeys(str(run_id) for run_id in run_ids if str(run_id)))
+        if not normalized:
+            return 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            deleted = 0
+            for run_id in normalized:
+                cursor = db.execute("DELETE FROM local_runs WHERE run_id = ?", (run_id,))
+                deleted += max(0, int(cursor.rowcount))
+            db.commit()
+        return deleted
+
+    def prune_runs_before(self, cutoff: str) -> list[str]:
+        run_ids = self.run_ids_before(cutoff)
+        self.delete_runs(run_ids)
+        return run_ids
+
     def run_events(
         self,
         run_id: str,
@@ -581,6 +615,24 @@ class LocalEventStore:
             )
             db.commit()
 
+    def prune_pending_tui_before(self, cutoff: str) -> list[str]:
+        """Delete orphan pending TUI prompts older than an ISO-8601 cutoff."""
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT turn_id FROM tui_pending WHERE created_at <> '' AND created_at < ?",
+                (cutoff,),
+            ).fetchall()
+            turn_ids = [str(row[0]) for row in rows]
+            if turn_ids:
+                db.executemany(
+                    "DELETE FROM tui_pending WHERE turn_id = ?",
+                    ((turn_id,) for turn_id in turn_ids),
+                )
+            db.commit()
+        return turn_ids
+
     def pop_pending_tui_event(self, turn_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -848,6 +900,75 @@ class LocalEventStore:
                 (conversation_id,),
             ).fetchone()
         return self._decode_dict(row[0]) if row is not None else None
+
+    def tui_conversation_ids_before(self, cutoff: str) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT conversation_id FROM tui_conversations WHERE updated_at < ?",
+                (cutoff,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def delete_tui_conversations(self, conversation_ids: list[str]) -> int:
+        normalized = list(
+            dict.fromkeys(
+                str(conversation_id)
+                for conversation_id in conversation_ids
+                if str(conversation_id)
+            )
+        )
+        if not normalized:
+            return 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            deleted = 0
+            for conversation_id in normalized:
+                db.execute(
+                    "DELETE FROM tui_events WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                db.execute(
+                    "DELETE FROM tui_imports WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                cursor = db.execute(
+                    "DELETE FROM tui_conversations WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                deleted += max(0, int(cursor.rowcount))
+            db.commit()
+        return deleted
+
+    def prune_tui_conversations_before(self, cutoff: str) -> list[str]:
+        conversation_ids = self.tui_conversation_ids_before(cutoff)
+        self.delete_tui_conversations(conversation_ids)
+        return conversation_ids
+
+    def privacy_inventory(self) -> dict[str, int]:
+        """Return content-free counts for local privacy/lifecycle status."""
+
+        with self._connect() as db:
+            return {
+                "runs": int(db.execute("SELECT COUNT(*) FROM local_runs").fetchone()[0]),
+                "pending_prompts": int(db.execute("SELECT COUNT(*) FROM tui_pending").fetchone()[0]),
+                "archived_conversations": int(
+                    db.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM (
+                            SELECT conversation_id FROM tui_conversations
+                            UNION
+                            SELECT conversation_id FROM tui_events
+                            UNION
+                            SELECT conversation_id FROM tui_imports
+                        )
+                        """
+                    ).fetchone()[0]
+                ),
+                "delivery_events": int(
+                    db.execute("SELECT COUNT(*) FROM delivery_events").fetchone()[0]
+                ),
+            }
 
     def set_tui_title(self, conversation_id: str, title: str | None) -> str | None:
         normalized = str(title).strip() if title is not None else ""

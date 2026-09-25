@@ -190,6 +190,49 @@ def _build_parser() -> argparse.ArgumentParser:
     profile_paths_parser = profile_subparsers.add_parser("paths", help="Show profile config/auth/state paths.")
     profile_paths_parser.add_argument("name", nargs="?", help="Optional profile name to inspect.")
 
+    privacy_parser = subparsers.add_parser(
+        "privacy",
+        help="Inspect and prune gptty-owned local sensitive data.",
+    )
+    privacy_subparsers = privacy_parser.add_subparsers(dest="privacy_command")
+    privacy_status_parser = privacy_subparsers.add_parser(
+        "status",
+        help="Show content-free counts for gptty-owned local privacy surfaces.",
+    )
+    _add_profile_option(privacy_status_parser)
+    privacy_status_parser.add_argument(
+        "--state",
+        default=None,
+        help="Path to the local gptty state file used to locate the local store.",
+    )
+    privacy_prune_parser = privacy_subparsers.add_parser(
+        "prune",
+        help="Prune old auto-generated local run data and orphan pending prompts.",
+    )
+    _add_profile_option(privacy_prune_parser)
+    privacy_prune_parser.add_argument(
+        "--state",
+        default=None,
+        help="Path to the local gptty state file used to locate the local store.",
+    )
+    privacy_prune_parser.add_argument(
+        "--older-than-days",
+        type=_positive_int,
+        required=True,
+        metavar="DAYS",
+        help="Remove eligible gptty-owned data older than this many days.",
+    )
+    privacy_prune_parser.add_argument(
+        "--include-archives",
+        action="store_true",
+        help="Also remove old local TUI conversation archive copies.",
+    )
+    privacy_prune_parser.add_argument(
+        "--include-exports",
+        action="store_true",
+        help="Also remove old timestamped files from gptty's default /export directory.",
+    )
+
     auth_parser = subparsers.add_parser(
         "auth",
         help="Inspect or refresh ChatGPT web-session auth data.",
@@ -523,6 +566,16 @@ def main(argv: list[str] | None = None) -> int:
         from .commands.profile import run_profile
 
         return run_profile(args)
+
+    if args.command == "privacy":
+        from .commands.privacy import run_privacy
+
+        if args.privacy_command not in {"status", "prune"}:
+            parser.print_help()
+            return 2
+        if not _apply_session_paths(args):
+            return 2
+        return run_privacy(args)
 
     if args.command == "auth":
         from .commands.auth import run_auth_refresh, run_auth_status

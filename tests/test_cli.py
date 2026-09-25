@@ -12,6 +12,7 @@ import gptty.commands.attach as attach_command
 import gptty.commands.chat as chat_command
 import gptty.commands.export as export_command
 import gptty.commands.messages as messages_command
+import gptty.commands.privacy as privacy_command
 import gptty.commands.send as send_command
 import gptty.commands.status as status_command
 import gptty.profiles as profiles
@@ -437,6 +438,30 @@ def test_export_defaults_to_markdown(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert cli.main(["export"]) == 0
     assert calls == {"format": "markdown"}
+
+
+def test_privacy_status_routes_to_privacy_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
+    calls: dict[str, Any] = {}
+
+    def fake_run_privacy(args: Any) -> int:
+        calls["command"] = args.privacy_command
+        calls["state"] = args.state
+        calls["profile"] = args.profile
+        return 0
+
+    monkeypatch.setattr(privacy_command, "run_privacy", fake_run_privacy)
+    state = tmp_path / "state.json"
+
+    assert cli.main(["privacy", "status", "--state", str(state)]) == 0
+    assert calls == {
+        "command": "status",
+        "state": str(state),
+        "profile": None,
+    }
 
 
 def test_status_routes_to_status_command(monkeypatch: pytest.MonkeyPatch) -> None:

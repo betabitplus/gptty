@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from .private_fs import PRIVATE_FILE_MODE, PRIVATE_MODES_SUPPORTED, atomic_write
 from .profiles import data_dir
 
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,128}$")
+DEFAULT_PENDING_TTL_SECONDS = 24 * 60 * 60
 
 
 def _now_iso() -> str:
@@ -45,6 +47,7 @@ class TUIArchive:
         root: str | Path | None = None,
         *,
         db_path: str | Path | None = None,
+        reconcile_pending: bool = True,
     ) -> None:
         self.root = Path(root).expanduser() if root is not None else archive_root()
         self.pending_dir = self.root / "pending"
@@ -56,6 +59,71 @@ class TUIArchive:
             Path(db_path).expanduser() if db_path is not None else self.root / DB_FILENAME
         )
         self._projection_checked: set[str] = set()
+        if reconcile_pending:
+            try:
+                self.prune_orphan_pending()
+            except Exception:  # noqa: BLE001 - privacy cleanup must not block chat startup.
+                pass
+
+    def prune_orphan_pending(
+        self,
+        *,
+        max_age_seconds: int = DEFAULT_PENDING_TTL_SECONDS,
+        now: datetime | None = None,
+    ) -> int:
+        """Remove crash-orphaned unbound prompts from DB and portable projections."""
+
+        current = now or datetime.now(timezone.utc)
+        cutoff = current - timedelta(seconds=max(0, int(max_age_seconds)))
+        deleted = set(self.store.prune_pending_tui_before(cutoff.isoformat()))
+        for turn_id in tuple(deleted):
+            self._remove_projection(self.pending_dir / f"{turn_id}.json")
+
+        cutoff_epoch = cutoff.timestamp()
+        for path in self.pending_dir.glob("*.json"):
+            try:
+                stale = path.stat().st_mtime <= cutoff_epoch
+            except OSError:
+                continue
+            if not stale:
+                continue
+            turn_id = path.stem
+            self._remove_projection(path)
+            deleted.add(turn_id)
+        return len(deleted)
+
+    def prune_conversations_before(self, cutoff: datetime) -> int:
+        """Remove local TUI archive copies older than the supplied UTC cutoff."""
+
+        normalized = cutoff.astimezone(timezone.utc)
+        candidates = self.store.tui_conversation_ids_before(normalized.isoformat())
+        deleted: set[str] = set()
+        for conversation_id in candidates:
+            directory = self.conversations_dir / conversation_id
+            try:
+                shutil.rmtree(directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue
+            deleted.add(conversation_id)
+            self._projection_checked.discard(conversation_id)
+
+        cutoff_epoch = normalized.timestamp()
+        for directory in self.conversations_dir.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            try:
+                stale = directory.stat().st_mtime <= cutoff_epoch
+            except OSError:
+                continue
+            if not stale:
+                continue
+            shutil.rmtree(directory, ignore_errors=True)
+            deleted.add(directory.name)
+            self._projection_checked.discard(directory.name)
+        self.store.delete_tui_conversations(sorted(deleted))
+        return len(deleted)
 
     def record_user(
         self,

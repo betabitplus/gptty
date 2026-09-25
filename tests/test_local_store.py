@@ -548,3 +548,94 @@ result_path.write_text(
     ]
     store = LocalEventStore(db_path)
     assert store.session_imported_from(source_path) is True
+
+
+def test_retention_run_candidates_skip_running_and_delete_events_transactionally(
+    tmp_path: Path,
+) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    old_completed = {**_summary("old-completed"), "status": "completed"}
+    old_running = {**_summary("old-running"), "status": "running"}
+    new_completed = {**_summary("new-completed"), "status": "completed"}
+    store.create_run(
+        run_id="old-completed",
+        summary=old_completed,
+        first_event={"type": "run_started", "timestamp": "2026-01-01T00:00:00+00:00"},
+    )
+    store.create_run(
+        run_id="old-running",
+        summary=old_running,
+        first_event={"type": "run_started", "timestamp": "2026-01-01T00:00:00+00:00"},
+    )
+    store.create_run(
+        run_id="new-completed",
+        summary=new_completed,
+        first_event={"type": "run_started", "timestamp": "2026-09-25T00:00:00+00:00"},
+    )
+
+    candidates = store.run_ids_before("2026-09-01T00:00:00+00:00")
+
+    assert candidates == ["old-completed"]
+    assert store.delete_runs(candidates) == 1
+    assert store.run_summary("old-completed") is None
+    assert store.run_events("old-completed") == []
+    assert store.run_summary("old-running") is not None
+    assert store.run_summary("new-completed") is not None
+
+
+def test_retention_prunes_only_old_pending_prompts(tmp_path: Path) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    store.put_pending_tui_event(
+        "old-turn",
+        {"event_id": "old-turn:user", "observed_at": "2026-01-01T00:00:00+00:00"},
+    )
+    store.put_pending_tui_event(
+        "new-turn",
+        {"event_id": "new-turn:user", "observed_at": "2026-09-25T00:00:00+00:00"},
+    )
+
+    assert store.prune_pending_tui_before("2026-09-01T00:00:00+00:00") == [
+        "old-turn"
+    ]
+    assert store.pop_pending_tui_event("old-turn") is None
+    assert store.pop_pending_tui_event("new-turn") is not None
+
+
+def test_delete_tui_conversations_removes_events_import_and_metadata(tmp_path: Path) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    event = {
+        "event_id": "turn-1:user",
+        "role": "user",
+        "text": "local copy",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+    }
+    store.import_tui_conversation(
+        "conv-12345678",
+        events=[event],
+        title="Old chat",
+        imported_at="2026-01-01T00:00:00+00:00",
+    )
+
+    assert store.delete_tui_conversations(["conv-12345678"]) == 1
+    assert store.tui_events("conv-12345678") == []
+    assert store.tui_imported("conv-12345678") is False
+    assert store.tui_title("conv-12345678") is None
+
+
+def test_privacy_inventory_counts_event_only_archives(tmp_path: Path) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    assert store.insert_tui_event(
+        "conv-event1234",
+        {
+            "event_id": "turn-1:terminal",
+            "role": "chat",
+            "text": "event-only",
+            "status": "unconfirmed",
+            "terminal_source": "stream",
+            "observed_at": "2026-01-01T00:00:00+00:00",
+        },
+    ) is True
+
+    inventory = store.privacy_inventory()
+
+    assert inventory["archived_conversations"] == 1

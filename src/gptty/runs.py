@@ -17,6 +17,7 @@ from .automation import (
 )
 from .local_store import DB_FILENAME, LocalEventStore, local_store_root
 from .private_fs import atomic_write_private_text
+from .privacy import redact_diagnostic_text, redact_diagnostic_value
 
 
 @dataclass(frozen=True)
@@ -57,11 +58,12 @@ class RunRecorder:
         return self.paths.store_file
 
     def event(self, event_type: str, **data: Any) -> dict[str, Any]:
+        redacted_data = redact_diagnostic_value(data)
         event = run_event_envelope(
             run_id=self.run_id,
             event_type=event_type,
             timestamp=utc_now(),
-            data=data,
+            data=redacted_data,
         )
         self.summary["last_event"] = event_type
         self.summary["updated_at"] = event["timestamp"]
@@ -88,8 +90,9 @@ class RunRecorder:
         self.summary["completed_at"] = utc_now()
         event_data: dict[str, Any] = {}
         if isinstance(turn_result, dict):
-            self.summary["turn_result"] = dict(turn_result)
-            event_data["turn_result"] = dict(turn_result)
+            safe_turn_result = redact_diagnostic_value(turn_result)
+            self.summary["turn_result"] = safe_turn_result
+            event_data["turn_result"] = safe_turn_result
         return self.event("completed", **event_data)
 
     def fail(
@@ -100,22 +103,36 @@ class RunRecorder:
         failure_classification: dict[str, Any] | None = None,
         turn_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        safe_message = redact_diagnostic_text(message)
+        safe_classification = (
+            redact_diagnostic_value(failure_classification)
+            if isinstance(failure_classification, dict)
+            else None
+        )
+        safe_turn_result = (
+            redact_diagnostic_value(turn_result) if isinstance(turn_result, dict) else None
+        )
+        safe_traceback = (
+            redact_diagnostic_text(traceback_text)
+            if isinstance(traceback_text, str) and traceback_text.strip()
+            else None
+        )
         self.summary["status"] = "failed"
-        self.summary["error"] = message
-        if isinstance(failure_classification, dict):
-            self.summary["failure_classification"] = dict(failure_classification)
-        if isinstance(traceback_text, str) and traceback_text.strip():
-            self.summary["traceback"] = traceback_text
-        if isinstance(turn_result, dict):
-            self.summary["turn_result"] = dict(turn_result)
+        self.summary["error"] = safe_message
+        if isinstance(safe_classification, dict):
+            self.summary["failure_classification"] = safe_classification
+        if safe_traceback:
+            self.summary["traceback"] = safe_traceback
+        if isinstance(safe_turn_result, dict):
+            self.summary["turn_result"] = safe_turn_result
         self.summary["completed_at"] = utc_now()
-        event_data: dict[str, Any] = {"message": message}
-        if isinstance(failure_classification, dict):
-            event_data["failure_classification"] = dict(failure_classification)
-        if isinstance(turn_result, dict):
-            event_data["turn_result"] = dict(turn_result)
-        if isinstance(traceback_text, str) and traceback_text.strip():
-            event_data["traceback"] = traceback_text
+        event_data: dict[str, Any] = {"message": safe_message}
+        if isinstance(safe_classification, dict):
+            event_data["failure_classification"] = safe_classification
+        if isinstance(safe_turn_result, dict):
+            event_data["turn_result"] = safe_turn_result
+        if safe_traceback:
+            event_data["traceback"] = safe_traceback
         return self.event("failed", **event_data)
 
     def _project(self, event: dict[str, Any]) -> None:
@@ -125,7 +142,7 @@ class RunRecorder:
         except OSError as exc:
             self.summary.setdefault(
                 "projection_error",
-                f"{type(exc).__name__}: {exc}",
+                redact_diagnostic_text(f"{type(exc).__name__}: {exc}"),
             )
             try:
                 self.store.replace_run_summary(

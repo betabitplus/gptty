@@ -8,6 +8,7 @@ from gptty.output import (
     normalize_messages,
     normalize_response,
     normalize_status,
+    normalize_turn_failure,
     render_live_event,
     render_messages,
     render_response,
@@ -311,3 +312,33 @@ def test_normalize_response_from_shapes() -> None:
         "conversation": "fallback",
     }
     assert normalize_response("reply") == {"text": "reply"}
+
+
+def test_normalize_turn_failure_redacts_diagnostics_and_preserves_typed_flags() -> None:
+    sensitive = "SENSITIVE_" + "VALUE"
+    failure = {
+        "status": "unconfirmed",
+        "status_code": 429,
+        "request_stage": "browser_owned_write",
+        "message": f"provider failed: {'api_' + 'key'}={sensitive}",
+        "write_may_have_been_submitted": True,
+        "reconciliation_required": True,
+        "automatic_retry_allowed": False,
+    }
+
+    result = normalize_turn_failure(
+        failure,
+        conversation="conv-1",
+        raw_error=f"{'Author' + 'ization'}: {'Bear' + 'er'} {sensitive}",
+    )
+
+    assert result["status"] == "unconfirmed"
+    assert result["conversation"] == "conv-1"
+    assert result["error"]["status_code"] == 429
+    assert result["error"]["write_may_have_been_submitted"] is True
+    assert result["error"]["reconciliation_required"] is True
+    assert result["error"]["automatic_retry_allowed"] is False
+    assert sensitive not in result["error"]["message"]
+    assert sensitive not in result["diagnostic_error"]
+    assert "[REDACTED]" in result["error"]["message"]
+    assert "[REDACTED]" in result["diagnostic_error"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from datetime import datetime, timedelta, timezone
 
 from gptty.local_store import LocalEventStore, local_store_path
 from gptty.runs import start_run
@@ -529,3 +530,72 @@ def test_concurrent_archive_writers_keep_projection_order_equal_to_sqlite_order(
     assert [event["event_id"] for event in projected] == [
         event["event_id"] for event in authoritative
     ]
+
+
+def test_startup_reconciles_old_orphan_pending_prompt_but_keeps_recent(tmp_path) -> None:
+    root = tmp_path / "archive"
+    first = TUIArchive(root, reconcile_pending=False)
+    now = datetime.now(timezone.utc)
+    old_at = now - timedelta(days=2)
+    recent_at = now - timedelta(hours=1)
+    first.store.put_pending_tui_event(
+        "old-turn",
+        {
+            "event_id": "old-turn:user",
+            "role": "user",
+            "text": "old pending",
+            "observed_at": old_at.isoformat(),
+        },
+    )
+    first.store.put_pending_tui_event(
+        "recent-turn",
+        {
+            "event_id": "recent-turn:user",
+            "role": "user",
+            "text": "recent pending",
+            "observed_at": recent_at.isoformat(),
+        },
+    )
+    old_projection = first.pending_dir / "old-turn.json"
+    recent_projection = first.pending_dir / "recent-turn.json"
+    old_projection.write_text("{}\n", encoding="utf-8")
+    recent_projection.write_text("{}\n", encoding="utf-8")
+    os.utime(old_projection, (old_at.timestamp(), old_at.timestamp()))
+    os.utime(recent_projection, (recent_at.timestamp(), recent_at.timestamp()))
+
+    restarted = TUIArchive(root, db_path=first.store.db_path)
+
+    assert restarted.store.pop_pending_tui_event("old-turn") is None
+    assert not old_projection.exists()
+    assert restarted.store.pop_pending_tui_event("recent-turn") is not None
+    assert recent_projection.exists()
+
+
+def test_archive_prune_removes_event_only_conversation_from_db_and_projection(
+    tmp_path,
+) -> None:
+    root = tmp_path / "archive"
+    archive = TUIArchive(root, reconcile_pending=False)
+    conversation_id = "conv-12345678"
+    old_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    event = {
+        "event_id": "turn-1:terminal",
+        "role": "chat",
+        "text": "event-only durable copy",
+        "status": "unconfirmed",
+        "terminal_source": "stream",
+        "observed_at": old_at.isoformat(),
+    }
+    assert archive.store.insert_tui_event(conversation_id, event) is True
+    directory = archive.conversation_paths(conversation_id)["directory"]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    os.utime(directory, (old_at.timestamp(), old_at.timestamp()))
+
+    removed = archive.prune_conversations_before(
+        datetime(2026, 9, 1, tzinfo=timezone.utc)
+    )
+
+    assert removed == 1
+    assert not directory.exists()
+    assert archive.store.tui_events(conversation_id) == []
