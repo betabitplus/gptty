@@ -6,6 +6,7 @@ import os
 import signal
 
 import pytest
+from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -1495,3 +1496,17 @@ def test_terminal_private_mode_restores_if_persistent_app_exits_early(tmp_path) 
             await session.stop_async()
 
     asyncio.run(scenario())
+
+
+def test_persistent_runtime_owns_first_class_application_not_prompt_session(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=DummyOutput(),
+    )
+
+    assert not isinstance(session._session, PromptSession)
+    assert session.application is session._session.app
+    assert session.application.full_screen is True
+    assert session.application.renderer.full_screen is True
+    assert session._session.default_buffer.accept_handler == session._persistent_accept
