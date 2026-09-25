@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from gptty.ui.state import UISettings, load_ui_settings, save_ui_settings
 
 
@@ -20,6 +22,21 @@ def test_ui_settings_round_trip(tmp_path) -> None:
     save_ui_settings(path, settings)
 
     assert load_ui_settings(path) == settings
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_ui_settings_save_hardens_preexisting_permissive_file(tmp_path) -> None:
+    path = tmp_path / "ui.json"
+    path.write_text("{}\n", encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o666)
+
+    save_ui_settings(path, UISettings(pretty="on"))
+
+    assert load_ui_settings(path).pretty == "on"
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_ui_settings_history_limit_is_bounded_and_type_checked(tmp_path) -> None:

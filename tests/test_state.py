@@ -28,10 +28,25 @@ def test_save_and_load_state_round_trips(tmp_path) -> None:
     save_chat_state(path, ChatState(current_conversation="abc", model="gpt-4o"))
 
     assert load_chat_state(path) == ChatState(current_conversation="abc", model="gpt-4o")
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "current_conversation": "abc",
         "model": "gpt-4o",
     }
+
+
+def test_save_state_hardens_preexisting_permissive_file(tmp_path) -> None:
+    path = tmp_path / "gptty_state.json"
+    path.write_text("{}\n", encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o666)
+
+    save_chat_state(path, ChatState(current_conversation="private"))
+
+    assert load_chat_state(path).current_conversation == "private"
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_goal_state_round_trips_and_old_state_stays_compatible(tmp_path) -> None:

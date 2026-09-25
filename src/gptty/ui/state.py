@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ..private_fs import atomic_write_private_text
+
 
 class UIStateError(RuntimeError):
     """Raised when interactive UI state cannot be read or written."""
@@ -86,10 +88,10 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_private_text(
+            path,
+            json.dumps(data, indent=2, sort_keys=True) + "\n",
+        )
     except OSError as exc:
         raise UIStateError(f"failed to write UI state to {path}: {exc}") from exc

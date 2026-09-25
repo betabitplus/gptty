@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, TextIO
+
+from .private_fs import atomic_write_private_text
 
 
 CURRENT_GOAL_RUNTIME_VERSION = 2
@@ -156,9 +157,6 @@ def load_chat_state(path: str | Path) -> ChatState:
 
 def save_chat_state(path: str | Path, state: ChatState) -> None:
     state_path = Path(path)
-    tmp_path = state_path.with_name(
-        f".{state_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
     data = asdict(state)
     if data.get("goal_id") is None:
         data.pop("goal_id", None)
@@ -167,9 +165,7 @@ def save_chat_state(path: str | Path, state: ChatState) -> None:
     payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
 
     try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(state_path)
+        atomic_write_private_text(state_path, payload)
     except OSError as exc:
         raise StateError(f"failed to save state to {state_path}: {exc}") from exc
 
