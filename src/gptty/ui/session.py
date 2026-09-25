@@ -39,7 +39,11 @@ from rich.markdown import Markdown
 from .history import PrivatePromptHistory
 from .signals import TurnControlSignals
 from .state import UISettings, UIStateError, load_ui_settings, ui_settings_path
+from .terminal_capabilities import TerminalCapabilities
 from .terminal_safety import sanitize_terminal_text
+
+
+ACTIVE_STATUS_REFRESH_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -535,18 +539,21 @@ class InteractiveSession:
         self._prompt_override: str | None = None
         self._persistent_input_queue: asyncio.Queue[object] | None = None
         self._application_task: asyncio.Task[Any] | None = None
+        self._status_tick_task: asyncio.Task[None] | None = None
         self._default_accept_handler: Callable[[Any], bool] | None = None
         self._persistent_cancel = object()
         self._picker_active = False
         self._picker_previous_prompt: str | None = None
         self._picker_previous_completer: Any | None = None
         self._command_completer: Any | None = None
+        self._terminal_capabilities: TerminalCapabilities | None = None
         self._history = PrivatePromptHistory(
             self.history_file,
             limit=self.settings.history_limit,
         )
         self._session: PromptSession[str]
         self._build_session()
+        self._terminal_capabilities = TerminalCapabilities(self._session.app.output)
 
     def _build_session(self) -> None:
         self.history_file.parent.mkdir(parents=True, exist_ok=True)
@@ -670,7 +677,6 @@ class InteractiveSession:
             "editing_mode": editing_mode,
             "bottom_toolbar": None,
             "mouse_support": False,
-            "refresh_interval": 1.0,
         }
         if self._prompt_input is not None:
             kwargs["input"] = self._prompt_input
@@ -1160,6 +1166,54 @@ class InteractiveSession:
         if queue is not None:
             queue.put_nowait(self._persistent_cancel)
 
+    def _cancel_status_tick(self) -> asyncio.Task[None] | None:
+        task = self._status_tick_task
+        self._status_tick_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        return task
+
+    def _sync_status_tick(self) -> None:
+        app_task = self._application_task
+        if (
+            self._working_status is None
+            or app_task is None
+            or app_task.done()
+        ):
+            self._cancel_status_tick()
+            return
+        task = self._status_tick_task
+        if task is not None and not task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._status_tick_task = asyncio.create_task(self._status_tick_loop())
+
+    async def _status_tick_loop(self) -> None:
+        current = asyncio.current_task()
+        try:
+            while self._working_status is not None:
+                await asyncio.sleep(ACTIVE_STATUS_REFRESH_SECONDS)
+                app_task = self._application_task
+                if app_task is None or app_task.done() or self._working_status is None:
+                    return
+                try:
+                    self._session.app.invalidate()
+                except Exception:
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._status_tick_task is current:
+                self._status_tick_task = None
+
+    def _restore_terminal_capabilities(self) -> None:
+        capabilities = self._terminal_capabilities
+        if capabilities is not None:
+            capabilities.restore()
+
     async def start_async(self) -> None:
         task = self._application_task
         if task is not None and not task.done():
@@ -1169,26 +1223,27 @@ class InteractiveSession:
         self._default_accept_handler = buffer.accept_handler
         buffer.accept_handler = self._persistent_accept
         self._application_task = asyncio.create_task(self._session.app.run_async())
+        self._application_task.add_done_callback(
+            lambda _task: self._restore_terminal_capabilities()
+        )
         await asyncio.sleep(0)
-        output = self._session.app.output
-        try:
-            # Keep native mouse selection. In alternate screen mode Ghostty/xterm
-            # translate wheel scrolling into cursor up/down when DECSET 1007 is on.
-            output.write_raw("\x1b[?1007h")
-            output.flush()
-        except Exception:
-            pass
+        self._sync_status_tick()
+        if (
+            self._application_task is not None
+            and not self._application_task.done()
+            and self._terminal_capabilities is not None
+        ):
+            self._terminal_capabilities.enter_persistent_tui()
 
     async def stop_async(self) -> None:
+        status_tick = self._cancel_status_tick()
+        if status_tick is not None:
+            with suppress(asyncio.CancelledError):
+                await status_tick
+        self._restore_terminal_capabilities()
         task = self._application_task
         if task is None:
             return
-        output = self._session.app.output
-        try:
-            output.write_raw("\x1b[?1007l")
-            output.flush()
-        except Exception:
-            pass
         if not task.done():
             try:
                 self._session.app.exit()
@@ -1323,6 +1378,7 @@ class InteractiveSession:
     ) -> None:
         self._turn_controls = controls
         self._working_status = working_status
+        self._sync_status_tick()
         try:
             self._session.app.invalidate()
         except Exception:

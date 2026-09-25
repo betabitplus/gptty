@@ -1387,3 +1387,111 @@ def test_transcript_ansi_parser_failure_never_falls_back_to_raw_escape_bytes(
     visible = "".join(text for _style, text in session._formatted_transcript())
     assert visible == "beforeredafter"
     assert "\x1b" not in visible
+
+
+def test_persistent_app_is_event_driven_when_idle_and_ticks_only_while_active(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import gptty.ui.session as session_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(session_module, "ACTIVE_STATUS_REFRESH_SECONDS", 0.01)
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(100),
+            )
+            assert session.application.refresh_interval in {0, None}
+            await session.start_async()
+            assert session._status_tick_task is None
+
+            invalidations = 0
+            original_invalidate = session.application.invalidate
+
+            def counted_invalidate() -> None:
+                nonlocal invalidations
+                invalidations += 1
+                original_invalidate()
+
+            monkeypatch.setattr(session.application, "invalidate", counted_invalidate)
+
+            await asyncio.sleep(0.035)
+            assert invalidations == 0
+
+            session.set_active_turn(
+                TurnControlSignals(),
+                working_status=lambda: "elapsed 00:01",
+            )
+            tick_task = session._status_tick_task
+            assert tick_task is not None
+            after_activation = invalidations
+            await asyncio.sleep(0.04)
+            assert invalidations > after_activation
+
+            session.set_active_turn(None)
+            assert session._status_tick_task is None
+            after_idle = invalidations
+            await asyncio.sleep(0.04)
+            assert invalidations == after_idle
+            assert tick_task.done()
+
+            await session.stop_async()
+            assert session._status_tick_task is None
+
+    asyncio.run(scenario())
+
+
+def test_status_tick_started_before_application_is_deferred_until_start(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=DummyOutput(),
+            )
+            session.set_active_turn(
+                None,
+                working_status=lambda: "server quiet 00:01",
+            )
+            assert session._status_tick_task is None
+
+            await session.start_async()
+            task = session._status_tick_task
+            assert task is not None
+            assert not task.done()
+
+            await session.stop_async()
+            assert session._status_tick_task is None
+            assert task.done()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_private_mode_restores_if_persistent_app_exits_early(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            await session.start_async()
+            capabilities = session._terminal_capabilities
+            assert capabilities is not None
+            assert capabilities.alternate_scroll_enabled is True
+
+            session.application.exit()
+            app_task = session._application_task
+            assert app_task is not None
+            await app_task
+            await asyncio.sleep(0)
+            assert capabilities.alternate_scroll_enabled is False
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
