@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from gptty.goal import (
     GoalSignal,
+    GoalTerminalAction,
     activation_prompt,
     continuation_prompt,
+    goal_terminal_decision,
     parse_goal_response,
     rollover_prompt,
     sanitize_goal_history_text,
@@ -20,6 +22,45 @@ def test_parse_goal_response_requires_status_at_start() -> None:
     parsed = parse_goal_response("Progress first.\nGPTTY_GOAL: COMPLETE")
     assert parsed.signal is None
     assert parsed.body == "Progress first.\nGPTTY_GOAL: COMPLETE"
+
+
+
+def test_goal_terminal_decision_centralizes_recovery_policy() -> None:
+    cases = [
+        ({"label": "chat", "status": "limit-reached"}, GoalTerminalAction.ROLLOVER, True),
+        ({"label": "chat", "status": "unavailable"}, GoalTerminalAction.ROLLOVER, True),
+        ({"label": "turn", "status": "blocked"}, GoalTerminalAction.BLOCK, True),
+        ({"label": "turn", "status": "filtered"}, GoalTerminalAction.BLOCK, True),
+        ({"label": "turn", "status": "rate-limited"}, GoalTerminalAction.PAUSE, True),
+        ({"label": "turn", "status": "truncated"}, GoalTerminalAction.RECOVER, False),
+        ({"label": "turn", "status": "unconfirmed"}, GoalTerminalAction.RECOVER, True),
+        ({"label": "turn", "status": "failed"}, GoalTerminalAction.RECOVER, True),
+    ]
+
+    for kwargs, expected_action, expected_rollover in cases:
+        decision = goal_terminal_decision(**kwargs)
+        assert decision.action is expected_action
+        assert decision.allow_rollover is expected_rollover
+
+
+def test_goal_terminal_decision_preserves_final_signal_after_dead_chat() -> None:
+    for signal in (GoalSignal.COMPLETE, GoalSignal.BLOCKED):
+        decision = goal_terminal_decision(
+            label="chat",
+            status="unavailable",
+            final_signal=signal,
+        )
+        assert decision.action is GoalTerminalAction.NONE
+
+
+def test_goal_terminal_decision_provider_ambiguity_dominates_other_statuses() -> None:
+    decision = goal_terminal_decision(
+        label="chat",
+        status="limit-reached",
+        final_signal=GoalSignal.COMPLETE,
+        provider_write_ambiguous=True,
+    )
+    assert decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS
 
 
 def test_parse_goal_response_supports_all_terminal_signals_case_insensitively() -> None:

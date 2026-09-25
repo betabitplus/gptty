@@ -21,11 +21,13 @@ from ..goal import (
     MAX_RECOVERY_ATTEMPTS,
     MAX_ROLLOVERS,
     GoalSignal,
+    GoalTerminalAction,
     abnormal_recovery_prompt,
     acceptance_criteria_error,
     activation_prompt,
     completion_checkpoint_error,
     continuation_prompt,
+    goal_terminal_decision,
     operation_identity_instruction,
     ParsedGoalResponse,
     parse_goal_response,
@@ -715,24 +717,42 @@ class InteractiveCommands:
         if parsed.checkpoint is not None:
             self._update_goal_checkpoint(goal, parsed)
         marker = self._goal_terminal_marker(result)
-        if marker is not None:
-            label, status, detail = marker
-            final_goal_signal_survives_dead_chat = (
-                label == "chat"
-                and status in {"limit-reached", "unavailable"}
-                and parsed.signal in {GoalSignal.COMPLETE, GoalSignal.BLOCKED}
+        provider_write_ambiguous = self._goal_provider_write_ambiguous(result)
+        if marker is not None or provider_write_ambiguous:
+            failure_classification = result.get("failure_classification")
+            if marker is not None:
+                label, status, detail = marker
+            else:
+                label, status = "turn", "unconfirmed"
+                detail = (
+                    str(failure_classification.get("message") or "").strip()
+                    if isinstance(failure_classification, dict)
+                    else ""
+                ) or "ChatGPT may have accepted this turn; reconcile before retrying."
+
+            decision = goal_terminal_decision(
+                label=label,
+                status=status,
+                final_signal=parsed.signal,
+                provider_write_ambiguous=provider_write_ambiguous,
             )
-            if final_goal_signal_survives_dead_chat:
-                marker = None
-            elif label == "chat" and status in {"limit-reached", "unavailable"}:
+            event_payload = self._goal_result_event_payload(result, parsed)
+            if decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS:
+                event_payload["detail"] = detail
+                event_payload["status"] = status
+                self._block_goal_for_ambiguous_operation(
+                    detail,
+                    event_payload=event_payload,
+                )
+                return
+            if decision.action is GoalTerminalAction.ROLLOVER:
                 self._save_state(
                     event_type="turn_abnormal",
-                    event_payload=self._goal_result_event_payload(result, parsed),
+                    event_payload=event_payload,
                 )
                 self._rollover_goal(detail)
                 return
-            if status in {"filtered", "blocked"}:
-                blocked_payload = self._goal_result_event_payload(result, parsed)
+            if decision.action is GoalTerminalAction.BLOCK:
                 goal.status = "blocked"
                 goal.reason = detail
                 goal.runner_id = None
@@ -740,7 +760,7 @@ class InteractiveCommands:
                 self.clear_automatic_prompts()
                 if not self._save_state(
                     event_type="turn_terminal",
-                    event_payload=blocked_payload,
+                    event_payload=event_payload,
                 ):
                     return
                 self._release_goal_run_lock()
@@ -750,26 +770,18 @@ class InteractiveCommands:
                     final_response=f"Goal blocked. {detail}",
                 )
                 return
-            if status == "rate-limited":
+            if decision.action is GoalTerminalAction.PAUSE:
                 self._save_state(
                     event_type="turn_abnormal",
-                    event_payload=self._goal_result_event_payload(result, parsed),
+                    event_payload=event_payload,
                 )
                 self._pause_goal_for_service_condition(detail)
                 return
-            if status in {
-                "abnormal",
-                "delivery-timeout",
-                "failed",
-                "incomplete",
-                "truncated",
-                "unconfirmed",
-                "unresolved",
-            }:
+            if decision.action is GoalTerminalAction.RECOVER:
                 self._recover_goal_same_chat(
                     detail,
-                    allow_rollover=status != "truncated",
-                    event_payload=self._goal_result_event_payload(result, parsed),
+                    allow_rollover=decision.allow_rollover,
+                    event_payload=event_payload,
                 )
                 return
 
@@ -957,23 +969,20 @@ class InteractiveCommands:
         failure_payload = self._goal_result_event_payload(result)
         failure_payload["detail"] = detail
         failure_payload["status"] = status
-        failure_classification = result.get("failure_classification")
-        provider_write_ambiguous = bool(
-            isinstance(failure_classification, dict)
-            and (
-                failure_classification.get("reconciliation_required") is True
-                or failure_classification.get("write_may_have_been_submitted") is True
-            )
+        decision = goal_terminal_decision(
+            label=label,
+            status=status,
+            provider_write_ambiguous=self._goal_provider_write_ambiguous(result),
         )
-        if provider_write_ambiguous:
+        if decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS:
             return self._block_goal_for_ambiguous_operation(
                 detail,
                 event_payload=failure_payload,
             )
-        if label == "chat" and status in {"limit-reached", "unavailable"}:
+        if decision.action is GoalTerminalAction.ROLLOVER:
             self._save_state(event_type="turn_failed", event_payload=failure_payload)
             return self._rollover_goal(detail)
-        if status in {"blocked", "filtered"}:
+        if decision.action is GoalTerminalAction.BLOCK:
             goal.status = "blocked"
             goal.reason = detail
             goal.runner_id = None
@@ -990,21 +999,13 @@ class InteractiveCommands:
                 final_response=f"Goal blocked. {detail}",
             )
             return True
-        if status == "rate-limited":
+        if decision.action is GoalTerminalAction.PAUSE:
             self._save_state(event_type="turn_failed", event_payload=failure_payload)
             return self._pause_goal_for_service_condition(detail)
-        if status in {
-            "abnormal",
-            "delivery-timeout",
-            "failed",
-            "incomplete",
-            "truncated",
-            "unconfirmed",
-            "unresolved",
-        }:
+        if decision.action is GoalTerminalAction.RECOVER:
             return self._recover_goal_same_chat(
                 detail,
-                allow_rollover=status != "truncated",
+                allow_rollover=decision.allow_rollover,
                 event_payload=failure_payload,
             )
         return False
@@ -1017,6 +1018,17 @@ class InteractiveCommands:
         if not isinstance(marker, (tuple, list)) or len(marker) != 3:
             return None
         return (str(marker[0]), str(marker[1]), str(marker[2]))
+
+    @staticmethod
+    def _goal_provider_write_ambiguous(result: dict[str, Any]) -> bool:
+        failure_classification = result.get("failure_classification")
+        return bool(
+            isinstance(failure_classification, dict)
+            and (
+                failure_classification.get("reconciliation_required") is True
+                or failure_classification.get("write_may_have_been_submitted") is True
+            )
+        )
 
     def _bind_goal_conversation(
         self,

@@ -20,6 +20,21 @@ class GoalSignal(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class GoalTerminalAction(str, Enum):
+    NONE = "none"
+    BLOCK_AMBIGUOUS = "block-ambiguous"
+    ROLLOVER = "rollover"
+    BLOCK = "block"
+    PAUSE = "pause"
+    RECOVER = "recover"
+
+
+@dataclass(frozen=True)
+class GoalTerminalDecision:
+    action: GoalTerminalAction
+    allow_rollover: bool = True
+
+
 @dataclass(frozen=True)
 class ParsedGoalResponse:
     signal: GoalSignal | None
@@ -139,6 +154,54 @@ def acceptance_criteria_error(goal: GoalState) -> str | None:
     if not pending:
         return None
     return "required acceptance criteria are not satisfied: " + ", ".join(pending)
+
+
+def goal_terminal_decision(
+    *,
+    label: str,
+    status: str,
+    final_signal: GoalSignal | None = None,
+    provider_write_ambiguous: bool = False,
+) -> GoalTerminalDecision:
+    """Choose recovery policy from typed terminal evidence without performing side effects."""
+
+    if provider_write_ambiguous:
+        return GoalTerminalDecision(GoalTerminalAction.BLOCK_AMBIGUOUS)
+
+    normalized_label = str(label or "").strip().lower()
+    normalized_status = str(status or "").strip().lower()
+
+    if (
+        normalized_label == "chat"
+        and normalized_status in {"limit-reached", "unavailable"}
+    ):
+        if final_signal in {GoalSignal.COMPLETE, GoalSignal.BLOCKED}:
+            return GoalTerminalDecision(GoalTerminalAction.NONE)
+        return GoalTerminalDecision(GoalTerminalAction.ROLLOVER)
+
+    if normalized_status in {"filtered", "blocked"}:
+        return GoalTerminalDecision(GoalTerminalAction.BLOCK)
+
+    if normalized_status == "rate-limited":
+        return GoalTerminalDecision(GoalTerminalAction.PAUSE)
+
+    if normalized_status == "truncated":
+        return GoalTerminalDecision(
+            GoalTerminalAction.RECOVER,
+            allow_rollover=False,
+        )
+
+    if normalized_status in {
+        "abnormal",
+        "delivery-timeout",
+        "failed",
+        "incomplete",
+        "unconfirmed",
+        "unresolved",
+    }:
+        return GoalTerminalDecision(GoalTerminalAction.RECOVER)
+
+    return GoalTerminalDecision(GoalTerminalAction.NONE)
 
 
 def _acceptance_criteria_text(goal: GoalState) -> str:

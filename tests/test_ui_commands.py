@@ -1934,6 +1934,63 @@ def test_goal_complete_with_pending_work_is_rejected(tmp_path) -> None:
     )
 
 
+
+def test_goal_result_path_provider_write_ambiguity_blocks_even_with_complete_signal(
+    tmp_path, monkeypatch
+) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **_kwargs: None,
+    )
+
+    commands.handle('/goal "do one durable action"')
+    activation = commands.pop_automatic_prompt()
+    assert activation is not None
+    outgoing = commands.mark_goal_turn_started(activation, automatic=True)
+    assert outgoing is not None
+    assert state.goal is not None
+    operation_id = state.goal.active_operation_id
+    assert operation_id
+
+    commands.handle_goal_turn_result(
+        {
+            "text": (
+                "GPTTY_GOAL: COMPLETE\n"
+                'GPTTY_CHECKPOINT: {"summary":"done","completed":["write verified"],'
+                '"decisions":[],"pending":[],"next":"none"}\n'
+                "Done."
+            ),
+            "conversation_ref": "conv-1",
+            "failure_classification": {
+                "label": "turn",
+                "status": "unconfirmed",
+                "message": "ChatGPT may have accepted this turn; reconcile before retrying.",
+                "source": "structured",
+                "code": "BROWSER_OWNED_WRITE_OUTCOME_UNKNOWN",
+                "request_stage": "browser_owned_write",
+                "write_may_have_been_submitted": True,
+                "reconciliation_required": True,
+            },
+        }
+    )
+
+    assert state.goal is not None
+    assert state.goal.status == "blocked"
+    assert state.goal.active_operation_id == operation_id
+    assert commands.has_automatic_prompt is False
+    assert "ambiguous" in (state.goal.reason or "").casefold() or "reconcile" in (
+        state.goal.reason or ""
+    ).casefold()
+    assert any(
+        kind == "warning" and "ambiguous external side effect" in str(message)
+        for kind, message in renderer.events
+    )
+    events = commands.goal_store.events(state.goal)
+    assert events[-1]["type"] == "goal_blocked_ambiguous_operation"
+
+
 def test_goal_provider_write_ambiguity_blocks_without_recovery_prompt(
     tmp_path, monkeypatch
 ) -> None:
