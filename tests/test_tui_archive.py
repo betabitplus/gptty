@@ -55,6 +55,7 @@ def test_completed_turn_materializes_append_only_events_and_markdown(tmp_path) -
         title="Archive Test",
         model="gpt-test",
         status="complete",
+        canonical_message_id="assistant-node-123",
     )
 
     paths = archive.conversation_paths("conv-12345678")
@@ -64,6 +65,13 @@ def test_completed_turn_materializes_append_only_events_and_markdown(tmp_path) -
         ("assistant", "answer"),
     ]
     assert events[1]["status"] == "complete"
+    assert events[1]["canonical_message_id"] == "assistant-node-123"
+
+    restarted = TUIArchive(tmp_path / "archive", db_path=archive.store.db_path)
+    assert (
+        _events(restarted, "conv-12345678")[1]["canonical_message_id"]
+        == "assistant-node-123"
+    )
 
     transcript = paths["transcript"].read_text(encoding="utf-8")
     assert "# Archive Test" in transcript

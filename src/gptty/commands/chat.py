@@ -520,6 +520,25 @@ def response_title(response: Any) -> str | None:
     return title or None
 
 
+def response_message_id(response: Any) -> str | None:
+    """Return the product-owned final assistant message identity, when present."""
+
+    conversation = (
+        response.get("conversation")
+        if isinstance(response, dict)
+        else getattr(response, "conversation", None)
+    )
+    value = (
+        conversation.get("message_id")
+        if isinstance(conversation, dict)
+        else getattr(conversation, "message_id", None)
+    )
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def response_finish_reason(response: Any) -> str | None:
     conversation = (
         response.get("conversation")
@@ -3578,6 +3597,7 @@ def _send_chat_prompt(
                     title=response_title(response),
                     model=observed_model or sent_model or model,
                     status=archive_status,
+                    canonical_message_id=response_message_id(response),
                     observations=source_observations,
                 )
                 if terminal_marker is not None:

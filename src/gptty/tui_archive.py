@@ -190,6 +190,7 @@ class TUIArchive:
         title: str | None,
         model: str | None,
         status: str,
+        canonical_message_id: str | None = None,
         observations: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         conversation_id = self.bind_turn(turn_id, conversation_ref)
@@ -206,6 +207,8 @@ class TUIArchive:
             "status": status,
             "conversation_id": conversation_id,
         }
+        if isinstance(canonical_message_id, str) and canonical_message_id.strip():
+            event["canonical_message_id"] = canonical_message_id.strip()
         if isinstance(observations, dict) and (
             observations.get("sources") or observations.get("citations")
         ):

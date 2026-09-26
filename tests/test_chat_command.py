@@ -12,6 +12,7 @@ from gptty.commands.chat import (
     _turn_failure_marker,
     _turn_terminal_marker,
     extract_conversation_ref,
+    response_message_id,
     response_model_diagnostics,
     response_terminal_diagnostics,
     response_terminal_error,
@@ -29,10 +30,12 @@ class Response:
         text: str = "reply",
         conversation_id: str | None = "conv-1",
         title: str | None = "Test Chat",
+        message_id: str | None = None,
     ) -> None:
         self.text = text
         self.conversation_id = conversation_id
         self.title = title
+        self.conversation = SimpleNamespace(message_id=message_id)
 
 
 class FakeGpttyClient:
@@ -2057,6 +2060,17 @@ def test_extract_conversation_ref_reads_dict_attributes_and_nested_conversation(
     assert extract_conversation_ref(object()) is None
 
 
+def test_response_message_id_reads_final_nested_product_identity() -> None:
+    assert response_message_id(Response(message_id="assistant-123")) == "assistant-123"
+    assert (
+        response_message_id(
+            {"conversation": {"message_id": " assistant-dict-456 "}}
+        )
+        == "assistant-dict-456"
+    )
+    assert response_message_id(Response(message_id=None)) is None
+
+
 def test_send_forwards_machine_observed_tool_events_to_goal_journal_callback(tmp_path) -> None:
     observed: list[dict[str, Any]] = []
 
@@ -2214,7 +2228,12 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
                     "connector_id": "calendar",
                 }
             )
-            return Response(text="answer", conversation_id=ref, title="Sources")
+            return Response(
+                text="answer",
+                conversation_id=ref,
+                title="Sources",
+                message_id="assistant-node-source-1",
+            )
 
     class SourceRenderer:
         def __init__(self) -> None:
@@ -2280,6 +2299,11 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
     persisted = archive.source_citation_observations(conversation_ref)
     assert [item["source_id"] for item in persisted["sources"]] == ["source-1"]
     assert [item["citation_id"] for item in persisted["citations"]] == ["citation-1"]
+    archived_events = archive.store.tui_events(conversation_ref)
+    archived_assistant = next(
+        event for event in archived_events if event.get("role") == "assistant"
+    )
+    assert archived_assistant["canonical_message_id"] == "assistant-node-source-1"
     assert [event["type"] for event in goal_events] == [
         "product_connector_started",
         "product_required_action_started",
