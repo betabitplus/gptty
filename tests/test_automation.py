@@ -144,3 +144,58 @@ def test_source_citation_bundle_deduplicates_and_drops_orphans() -> None:
         "sources": [source],
         "citations": [],
     }
+
+
+def test_normalize_provider_connector_lifecycle_preserves_stable_ids() -> None:
+    connector = normalize_provider_event(
+        {
+            "type": "product_connector_started",
+            "observation_id": "connector:1:start",
+            "connector_activity_id": "connector-activity:1",
+            "connector_id": "calendar",
+            "connector_name": "Calendar",
+            "operation": "search_events",
+            "sequence": 10,
+            "observed_at_ms": 100,
+        }
+    )
+    action = normalize_provider_event(
+        {
+            "type": "product_required_action_started",
+            "observation_id": "action:1:start",
+            "action_id": "action:1",
+            "action_type": "user_authorization",
+            "connector_activity_id": "connector-activity:1",
+            "connector_id": "calendar",
+        }
+    )
+    surface = normalize_provider_event(
+        {
+            "type": "product_required_action_surface_observed",
+            "observation_id": "surface:gmail",
+            "connector_name": "gmail",
+            "action_type": "connector_authorization_required",
+            "connect_control_present": True,
+            "dismiss_control_present": True,
+            "stable_action_id_present": False,
+        }
+    )
+
+    assert connector is not None and connector["kind"] == "connector"
+    assert connector["connector_activity_id"] == "connector-activity:1"
+    assert connector["connector_id"] == "calendar"
+    assert connector["operation"] == "search_events"
+    assert connector["phase"] == "STARTED"
+    assert connector["observed_at_ms"] == 100
+
+    assert action is not None and action["kind"] == "action"
+    assert action["action_id"] == "action:1"
+    assert action["connector_activity_id"] == "connector-activity:1"
+    assert action["action_type"] == "user_authorization"
+    assert action["phase"] == "STARTED"
+
+    assert surface is not None and surface["kind"] == "action"
+    assert surface["connector_name"] == "gmail"
+    assert surface["stable_action_id_present"] is False
+    assert surface["phase"] == "OBSERVED"
+    assert "action_id" not in surface

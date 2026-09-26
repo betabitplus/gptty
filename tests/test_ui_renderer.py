@@ -470,3 +470,33 @@ def test_renderer_markdown_removes_generated_osc8_hyperlinks_on_direct_tty() -> 
     assert "Y2xpcGJvYXJk" not in rendered
     assert "\x1b]8" not in rendered
     assert "\x1b]52" not in rendered
+
+
+def test_renderer_surfaces_typed_connector_lifecycle_without_execution_controls() -> None:
+    out = StringIO()
+    renderer = PrettyRenderer(out, UISettings(markdown=False))
+
+    renderer.live_event(
+        {
+            "type": "product_connector_started",
+            "connector_activity_id": "connector-activity:1",
+            "connector_name": "Calendar",
+            "operation": "search_events",
+        }
+    )
+    renderer.live_event(
+        {
+            "type": "product_required_action_started",
+            "action_id": "action:1",
+            "action_type": "user_authorization",
+            "connector_id": "calendar",
+        }
+    )
+
+    text = out.getvalue()
+    compact = " ".join(text.split())
+    assert "[connector] Calendar · search_events · started" in compact
+    assert "[action required] calendar · user_authorization · started" in compact
+    assert "complete in ChatGPT web" in compact
+    assert "approve" not in compact.casefold()
+    assert "deny" not in compact.casefold()

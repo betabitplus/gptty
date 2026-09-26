@@ -18,6 +18,41 @@ LOCAL_RUN_PROVENANCE = {
     "source": "local-run",
 }
 
+CONNECTOR_PROVIDER_EVENT_TYPES = frozenset(
+    {
+        "product_connector_observed",
+        "product_connector_started",
+        "product_connector_updated",
+        "product_connector_completed",
+        "product_connector_failed",
+    }
+)
+REQUIRED_ACTION_PROVIDER_EVENT_TYPES = frozenset(
+    {
+        "product_required_action_observed",
+        "product_required_action_surface_observed",
+        "product_required_action_started",
+        "product_required_action_updated",
+        "product_required_action_completed",
+        "product_required_action_failed",
+    }
+)
+
+
+_PROVIDER_OBSERVATION_PHASE_BY_EVENT = {
+    "product_connector_observed": "OBSERVED",
+    "product_connector_started": "STARTED",
+    "product_connector_updated": "UPDATED",
+    "product_connector_completed": "COMPLETED",
+    "product_connector_failed": "FAILED",
+    "product_required_action_observed": "OBSERVED",
+    "product_required_action_surface_observed": "OBSERVED",
+    "product_required_action_started": "STARTED",
+    "product_required_action_updated": "UPDATED",
+    "product_required_action_completed": "COMPLETED",
+    "product_required_action_failed": "FAILED",
+}
+
 
 def new_run_id() -> str:
     return uuid.uuid4().hex
@@ -63,6 +98,7 @@ def summarize_observations(events: list[dict[str, Any]] | None) -> dict[str, Any
     grouped: dict[str, list[dict[str, Any]]] = {
         "tools": [],
         "actions": [],
+        "connectors": [],
         "sources": [],
         "citations": [],
     }
@@ -73,6 +109,7 @@ def summarize_observations(events: list[dict[str, Any]] | None) -> dict[str, Any
         target = {
             "tool": "tools",
             "action": "actions",
+            "connector": "connectors",
             "source": "sources",
             "citation": "citations",
         }.get(kind)
@@ -126,6 +163,14 @@ _PROVIDER_SAFE_FIELDS = (
     "display_text",
     "action_id",
     "action_type",
+    "connector_activity_id",
+    "connector_id",
+    "connector_name",
+    "connect_control_present",
+    "dismiss_control_present",
+    "stable_action_id_present",
+    "surface_origin",
+    "observed_at_ms",
     "activity_id",
     "activity_kind",
     "operation",
@@ -223,6 +268,12 @@ def normalize_provider_event(event: Any) -> dict[str, Any] | None:
     conversation = payload.pop("conversationId", None)
     if "conversation_id" not in payload and isinstance(conversation, str):
         payload["conversation_id"] = conversation
+    derived_phase = _PROVIDER_OBSERVATION_PHASE_BY_EVENT.get(event_type)
+    if derived_phase is not None:
+        # PR10 raw provider events encode lifecycle phase in the exact event type.
+        # Treat that type as authoritative rather than trusting an optional payload
+        # label that could contradict the CWA collector's stable-id semantics.
+        payload["phase"] = derived_phase
     if event_type == "product_citation_observed":
         # CWA deliberately preserves product-provided numeric ranges but their
         # Unicode coordinate space is not release-proven yet. Consumers must
@@ -299,11 +350,9 @@ def _provider_event_kind(event_type: str, event: dict[str, Any]) -> str:
         return "source"
     if event_type == "product_citation_observed":
         return "citation"
-    if event_type in {
-        "product_required_action_observed",
-        "product_connector_action_observed",
-        "product_connector_required_action_observed",
-    }:
+    if event_type in CONNECTOR_PROVIDER_EVENT_TYPES:
+        return "connector"
+    if event_type in REQUIRED_ACTION_PROVIDER_EVENT_TYPES:
         return "action"
     if event_type.startswith("activity_"):
         return "activity"

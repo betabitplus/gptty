@@ -1083,6 +1083,27 @@ class GoalStore:
                 f"{kind}: operation={payload.get('operation_id') or 'unknown'}; "
                 f"{label}; {detail[:1800]}"
             )
+        if kind == "connector_lifecycle_observed":
+            identity = str(
+                payload.get("connector_id")
+                or payload.get("connector_activity_id")
+                or "connector"
+            )
+            operation = str(payload.get("operation") or "").strip()
+            phase = str(payload.get("phase") or "OBSERVED").strip()
+            detail = f"; action={operation}" if operation else ""
+            return (
+                f"connector evidence: operation={payload.get('operation_id') or 'unknown'}; "
+                f"connector={identity}; phase={phase}{detail}"
+            )
+        if kind == "required_action_lifecycle_observed":
+            action_id = str(payload.get("action_id") or "").strip()
+            action_type = str(payload.get("action_type") or "required_action").strip()
+            phase = str(payload.get("phase") or "OBSERVED").strip()
+            return (
+                f"required action evidence: operation={payload.get('operation_id') or 'unknown'}; "
+                f"action_id={action_id}; type={action_type}; phase={phase}"
+            )
         if kind == "rollover":
             return (
                 f"rollover: generation {payload.get('from_generation')} -> "

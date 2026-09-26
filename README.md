@@ -46,6 +46,7 @@ gptty export --format markdown --output conversation.md
 - attach existing conversations through `gptty attach`
 - send prompts to attached, explicit, or new conversations through `gptty send`
 - SDK-backed image and general-file prompts through `gptty ask/send --image` and `--file`
+- typed ChatGPT connector/required-action lifecycle observations in terminal and JSONL, with approval/execution kept fail-closed to ChatGPT web
 - inspect attached or explicit conversations through `gptty messages` and `gptty status`
 - export attached or explicit conversations through `gptty export`
 - output modes for `messages`, `status`, `send`, and `export`: `plain`, `json`, `markdown`; `ask` and `send` also provide versioned `jsonl` automation streams
@@ -219,7 +220,7 @@ gptty export --format markdown --output conversation.md
 gptty export --format json --output conversation.json
 ```
 
-`gptty send --format json` returns a rich versioned final record with conversation/message identity, model and effort provenance, finality and observations. `--format jsonl` emits one JSON object per event and ends with the same `gptty.turn.result` contract. Markdown remains a human-readable final-text surface and is non-streaming.
+`gptty send --format json` returns a rich versioned final record with conversation/message identity, model and effort provenance, finality and observations. `--format jsonl` emits one JSON object per event and ends with the same `gptty.turn.result` contract. Typed connector lifecycle events preserve stable connector/activity/action ids and phases when ChatGPT exposes them; visible authorization cards without a stable action id remain point evidence only. gptty does **not** infer connector approval from labels or prose and currently provides no local approve/deny action: when ChatGPT requires authorization, complete it in ChatGPT web. Markdown remains a human-readable final-text surface and is non-streaming.
 
 You can also inspect or export an explicit conversation without attaching it:
 

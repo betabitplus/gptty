@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..automation import (
+    CONNECTOR_PROVIDER_EVENT_TYPES,
+    REQUIRED_ACTION_PROVIDER_EVENT_TYPES,
+    normalize_provider_event,
+)
 from ..commands.export import save_markdown_export
 from ..goal import (
     MAX_PROTOCOL_FAILURES,
@@ -599,6 +604,57 @@ class InteractiveCommands:
                 )
             except (GoalConflictError, OSError, sqlite3.Error) as exc:
                 self.renderer.warning(f"Goal journal route evidence write failed: {exc}")
+            return
+
+        if event_type in CONNECTOR_PROVIDER_EVENT_TYPES | REQUIRED_ACTION_PROVIDER_EVENT_TYPES:
+            normalized = normalize_provider_event(event)
+            if not isinstance(normalized, dict):
+                return
+            observation_id = str(normalized.get("observation_id") or "").strip()
+            connector_activity_id = str(
+                normalized.get("connector_activity_id") or ""
+            ).strip()
+            action_id = str(normalized.get("action_id") or "").strip()
+            if event_type in CONNECTOR_PROVIDER_EVENT_TYPES:
+                if not observation_id or not connector_activity_id:
+                    return
+                journal_type = "connector_lifecycle_observed"
+                stable_identity = connector_activity_id
+            else:
+                # A visible connect/dismiss surface without stable action_id is
+                # point evidence only. Never promote it into Goal operation identity.
+                if not observation_id or not action_id:
+                    return
+                journal_type = "required_action_lifecycle_observed"
+                stable_identity = action_id
+            payload = {
+                "operation_id": goal.active_operation_id,
+                "conversation_ref": goal.conversation_ref
+                or self.state.current_conversation,
+                "observation_id": observation_id,
+                "connector_activity_id": normalized.get("connector_activity_id"),
+                "connector_id": normalized.get("connector_id"),
+                "connector_name": normalized.get("connector_name"),
+                "operation": normalized.get("operation"),
+                "action_id": normalized.get("action_id"),
+                "action_type": normalized.get("action_type"),
+                "phase": normalized.get("phase"),
+                "source_event": event_type,
+            }
+            event_key = hashlib.sha256(
+                f"{journal_type}:{stable_identity}:{observation_id}".encode("utf-8")
+            ).hexdigest()
+            try:
+                self.goal_store.record_observed_event(
+                    goal,
+                    journal_type,
+                    payload,
+                    event_key=event_key,
+                )
+            except (GoalConflictError, OSError, sqlite3.Error) as exc:
+                self.renderer.warning(
+                    f"Goal journal connector evidence write failed: {exc}"
+                )
             return
 
         if event_type != "canonical_intermediate_message":

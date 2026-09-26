@@ -11,6 +11,7 @@ from gptty.output import (
     normalize_turn_failure,
     render_live_event,
     render_messages,
+    render_product_lifecycle_event,
     render_response,
     render_source_citations,
     render_status,
@@ -377,3 +378,66 @@ def test_render_source_citations_never_interprets_opaque_ranges() -> None:
     assert "https://example.com/article" in markdown
     assert "999999" not in markdown
     assert "1000000" not in markdown
+
+
+def test_render_product_connector_and_required_action_lifecycle() -> None:
+    connector = render_product_lifecycle_event(
+        {
+            "type": "product_connector_started",
+            "connector_activity_id": "connector-activity:1",
+            "connector_id": "calendar",
+            "connector_name": "Calendar\x1b]52;c;bad\x07",
+            "operation": "search_events",
+        }
+    )
+    action = render_product_lifecycle_event(
+        {
+            "type": "product_required_action_started",
+            "action_id": "action:1",
+            "action_type": "user_authorization",
+            "connector_activity_id": "connector-activity:1",
+            "connector_id": "calendar",
+        }
+    )
+    completed = render_product_lifecycle_event(
+        {
+            "type": "product_required_action_completed",
+            "action_id": "action:1",
+            "action_type": "user_authorization",
+            "connector_id": "calendar",
+        }
+    )
+    surface = render_product_lifecycle_event(
+        {
+            "type": "product_required_action_surface_observed",
+            "connector_name": "gmail",
+            "action_type": "connector_authorization_required",
+            "connect_control_present": True,
+            "dismiss_control_present": True,
+            "stable_action_id_present": False,
+        }
+    )
+
+    assert connector == "[connector] Calendar · search_events · started"
+    assert action == (
+        "[action required] calendar · user_authorization · started · "
+        "complete in ChatGPT web"
+    )
+    assert completed == "[action] calendar · user_authorization · completed"
+    assert surface == (
+        "[action required] gmail · connector_authorization_required · observed · "
+        "complete in ChatGPT web"
+    )
+    assert "approve" not in action.casefold()
+    assert "deny" not in action.casefold()
+
+
+def test_render_live_event_exposes_typed_connector_lifecycle() -> None:
+    assert render_live_event(
+        {
+            "type": "product_connector_completed",
+            "connector_activity_id": "connector-activity:1",
+            "connector_id": "calendar",
+            "operation": "search_events",
+        }
+    ) == "[connector] calendar · search_events · completed"

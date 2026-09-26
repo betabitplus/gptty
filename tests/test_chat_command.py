@@ -2195,6 +2195,25 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
                     "reference_type": "webpage",
                 }
             )
+            on_event(
+                {
+                    "type": "product_connector_started",
+                    "observation_id": "connector:1:start",
+                    "connector_activity_id": "connector-activity:1",
+                    "connector_id": "calendar",
+                    "operation": "search_events",
+                }
+            )
+            on_event(
+                {
+                    "type": "product_required_action_started",
+                    "observation_id": "action:1:start",
+                    "action_id": "action:1",
+                    "action_type": "user_authorization",
+                    "connector_activity_id": "connector-activity:1",
+                    "connector_id": "calendar",
+                }
+            )
             return Response(text="answer", conversation_id=ref, title="Sources")
 
     class SourceRenderer:
@@ -2235,6 +2254,7 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
         model=None,
     )
     renderer = SourceRenderer()
+    goal_events: list[dict[str, Any]] = []
 
     code = _send_chat_prompt(
         SourceClient(),
@@ -2250,6 +2270,7 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
         renderer=renderer,
         tui_archive=archive,
         archive_turn_id=turn_id,
+        goal_event_recorder=goal_events.append,
     )
 
     assert code == 0
@@ -2259,3 +2280,7 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
     persisted = archive.source_citation_observations(conversation_ref)
     assert [item["source_id"] for item in persisted["sources"]] == ["source-1"]
     assert [item["citation_id"] for item in persisted["citations"]] == ["citation-1"]
+    assert [event["type"] for event in goal_events] == [
+        "product_connector_started",
+        "product_required_action_started",
+    ]

@@ -18,7 +18,12 @@ from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from ..automation import normalize_provider_event, source_citation_bundle
+from ..automation import (
+    CONNECTOR_PROVIDER_EVENT_TYPES,
+    REQUIRED_ACTION_PROVIDER_EVENT_TYPES,
+    normalize_provider_event,
+    source_citation_bundle,
+)
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
 from ..locks import (
@@ -3117,6 +3122,8 @@ def _send_chat_prompt(
                 write_committed.set()
         if goal_event_recorder is not None and (
             event_type == "browser_native_write_completed"
+            or event_type
+            in CONNECTOR_PROVIDER_EVENT_TYPES | REQUIRED_ACTION_PROVIDER_EVENT_TYPES
             or (
                 event_type == "canonical_intermediate_message"
                 and event.get("message_kind") in {"tool_call", "tool_result"}

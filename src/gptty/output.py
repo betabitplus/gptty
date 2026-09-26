@@ -6,10 +6,14 @@ from typing import Any, Literal
 
 from .automation import (
     AUTOMATION_SCHEMA,
+    CONNECTOR_PROVIDER_EVENT_TYPES,
+    REQUIRED_ACTION_PROVIDER_EVENT_TYPES,
     TURN_RESULT_CONTRACT,
+    normalize_provider_event,
     summarize_observations,
 )
 from .privacy import redact_diagnostic_text, redact_diagnostic_value
+from .ui.terminal_safety import sanitize_terminal_text
 
 OutputFormat = Literal["plain", "json", "jsonl", "markdown"]
 
@@ -344,9 +348,66 @@ def render_jsonl_event(event: Any) -> str:
     )
 
 
+def render_product_lifecycle_event(event: Any) -> str | None:
+    """Render typed connector/action evidence without granting action authority."""
+
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    provider_type = event.get("provider_event_type")
+    raw_type = (
+        event_type
+        if isinstance(event_type, str)
+        and event_type in CONNECTOR_PROVIDER_EVENT_TYPES | REQUIRED_ACTION_PROVIDER_EVENT_TYPES
+        else provider_type
+    )
+    if not isinstance(raw_type, str):
+        return None
+
+    if event_type == "provider_event" and isinstance(provider_type, str):
+        normalized = dict(event)
+    else:
+        normalized = normalize_provider_event(event)
+    if not isinstance(normalized, dict):
+        return None
+
+    phase = _lifecycle_text(normalized.get("phase") or "OBSERVED").lower()
+    connector = _lifecycle_text(
+        normalized.get("connector_name") or normalized.get("connector_id")
+    )
+    operation = _lifecycle_text(normalized.get("operation"))
+    action_type = _lifecycle_text(normalized.get("action_type"))
+
+    if raw_type in CONNECTOR_PROVIDER_EVENT_TYPES:
+        subject = connector or "connector"
+        details = [value for value in (operation, phase) if value]
+        suffix = " · ".join(details)
+        return f"[connector] {subject}" + (f" · {suffix}" if suffix else "")
+
+    if raw_type in REQUIRED_ACTION_PROVIDER_EVENT_TYPES:
+        subject = connector or "ChatGPT action"
+        details = [value for value in (action_type, phase) if value]
+        suffix = " · ".join(details)
+        if phase in {"observed", "started", "updated"}:
+            suffix = (suffix + " · " if suffix else "") + "complete in ChatGPT web"
+            return f"[action required] {subject}" + (f" · {suffix}" if suffix else "")
+        return f"[action] {subject}" + (f" · {suffix}" if suffix else "")
+    return None
+
+
+def _lifecycle_text(value: Any, *, max_chars: int = 160) -> str:
+    if value is None:
+        return ""
+    safe = sanitize_terminal_text(str(value), allow_sgr=False)
+    return _clean_tool_detail(safe, max_chars=max_chars)
+
+
 def render_live_event(event: Any) -> str | None:
     if not isinstance(event, dict):
         return None
+    lifecycle = render_product_lifecycle_event(event)
+    if lifecycle is not None:
+        return lifecycle
     event_type = event.get("type")
     tool_name = event.get("tool_name")
     if event_type == "canonical_intermediate_message":

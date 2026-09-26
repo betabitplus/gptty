@@ -16,6 +16,7 @@ from ..output import (
     OutputMessage,
     RevisionTextState,
     _tool_result_error,
+    render_product_lifecycle_event,
     render_source_citations,
     render_tool_call_parts,
 )
@@ -326,6 +327,10 @@ class PrettyRenderer:
                 previous_text=previous_text,
                 previous_message_id=previous_message_id,
             )
+            return
+        lifecycle = render_product_lifecycle_event(event)
+        if lifecycle is not None:
+            self.activity(lifecycle)
             return
         if event.get("type") != "canonical_intermediate_message":
             return

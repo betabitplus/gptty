@@ -3082,3 +3082,82 @@ def test_async_file_command_uses_attachment_picker_contract(tmp_path) -> None:
 
     assert ui.prompts == ["File path: "]
     assert commands.pending_media == [str(document)]
+
+
+def test_goal_journals_stable_connector_and_action_lifecycle_without_promoting_surface(
+    tmp_path,
+) -> None:
+    operation_id = "goal-connectors:g1:t1"
+    state = ChatState(
+        current_conversation="conv-connectors",
+        goal=GoalState(
+            goal_id="goal-connectors",
+            conversation_ref="conv-connectors",
+            conversations=["conv-connectors"],
+            status="active",
+            active_operation_id=operation_id,
+            active_operation_turn=1,
+        ),
+    )
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+    assert commands._save_state(event_type="operation_resumed") is True
+
+    connector = {
+        "type": "product_connector_started",
+        "observation_id": "connector:1:start",
+        "connector_activity_id": "connector-activity:1",
+        "connector_id": "calendar",
+        "connector_name": "Calendar",
+        "operation": "search_events",
+    }
+    action = {
+        "type": "product_required_action_started",
+        "observation_id": "action:1:start",
+        "action_id": "action:1",
+        "action_type": "user_authorization",
+        "connector_activity_id": "connector-activity:1",
+        "connector_id": "calendar",
+    }
+    surface = {
+        "type": "product_required_action_surface_observed",
+        "observation_id": "surface:gmail",
+        "connector_name": "gmail",
+        "action_type": "connector_authorization_required",
+        "connect_control_present": True,
+        "dismiss_control_present": True,
+        "stable_action_id_present": False,
+    }
+
+    commands.record_goal_tool_event(connector)
+    commands.record_goal_tool_event(connector)
+    commands.record_goal_tool_event(action)
+    commands.record_goal_tool_event(action)
+    commands.record_goal_tool_event(surface)
+
+    events = commands.goal_store.events(state.goal)
+    connector_events = [
+        event for event in events if event["type"] == "connector_lifecycle_observed"
+    ]
+    action_events = [
+        event
+        for event in events
+        if event["type"] == "required_action_lifecycle_observed"
+    ]
+    assert len(connector_events) == 1
+    assert len(action_events) == 1
+    assert connector_events[0]["payload"]["operation_id"] == operation_id
+    assert connector_events[0]["payload"]["connector_activity_id"] == "connector-activity:1"
+    assert connector_events[0]["payload"]["connector_id"] == "calendar"
+    assert connector_events[0]["payload"]["operation"] == "search_events"
+    assert connector_events[0]["payload"]["phase"] == "STARTED"
+    assert action_events[0]["payload"]["action_id"] == "action:1"
+    assert action_events[0]["payload"]["connector_activity_id"] == "connector-activity:1"
+    assert action_events[0]["payload"]["phase"] == "STARTED"
+    assert not any(
+        event.get("payload", {}).get("observation_id") == "surface:gmail"
+        for event in events
+    )
+
+    recovery = "\n".join(commands.goal_store.recovery_context(state.goal))
+    assert "connector=calendar" in recovery
+    assert "action_id=action:1" in recovery
