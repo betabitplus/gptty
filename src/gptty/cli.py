@@ -129,13 +129,32 @@ def _add_stdin_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_image_options(parser: argparse.ArgumentParser) -> None:
+class _MediaFlagAction(argparse.Action):
+    """Preserve mixed --image/--file CLI order while keeping legacy attrs."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        current = list(getattr(namespace, self.dest, None) or ())
+        current.append(values)
+        setattr(namespace, self.dest, current)
+        ordered = list(getattr(namespace, "_media_inputs", None) or ())
+        ordered.append((self.dest, values))
+        setattr(namespace, "_media_inputs", ordered)
+
+
+def _add_media_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--image",
-        action="append",
+        action=_MediaFlagAction,
         default=[],
         metavar="PATH_OR_URL",
         help="Attach an image path, URL, or data URI. Can be used more than once.",
+    )
+    parser.add_argument(
+        "--file",
+        action=_MediaFlagAction,
+        default=[],
+        metavar="PATH_OR_URL",
+        help="Attach a general file path, URL, or data URI. Can be used more than once.",
     )
 
 
@@ -322,7 +341,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Prompt text. If omitted, gptty reads the prompt from piped stdin.",
     )
     _add_stdin_options(ask_parser)
-    _add_image_options(ask_parser)
+    _add_media_options(ask_parser)
     _add_auth_file_option(ask_parser)
     _add_backend_option(ask_parser)
     _add_effort_option(ask_parser)
@@ -370,7 +389,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start a new conversation instead of using an attached conversation.",
     )
     _add_stdin_options(send_parser)
-    _add_image_options(send_parser)
+    _add_media_options(send_parser)
     _add_session_options(send_parser)
     _add_effort_option(send_parser)
     send_parser.set_defaults(timeout=DEFAULT_TURN_TIMEOUT_SECONDS)

@@ -359,3 +359,37 @@ def test_ask_rejects_custom_model_plus_effort_before_client_creation() -> None:
     assert code == 2
     assert FakeGpttyClient.instances == []
     assert "explicit model" in stderr.getvalue()
+
+
+def test_run_ask_passes_general_file_through_existing_media_contract(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    document = tmp_path / "notes.txt"
+    document.write_text("typed file", encoding="utf-8")
+
+    code = run_ask(
+        make_args(file=[str(document)]),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls[0][2] == {
+        "stream": False,
+        "media": [str(document)],
+    }
+
+
+def test_run_ask_returns_2_for_missing_local_general_file(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    stderr = StringIO()
+
+    code = run_ask(
+        make_args(file=[str(tmp_path / "missing.txt")]),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "file does not exist" in stderr.getvalue()

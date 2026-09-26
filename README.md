@@ -45,7 +45,7 @@ gptty export --format markdown --output conversation.md
 - refresh `auth_data.json` through `gptty auth refresh`
 - attach existing conversations through `gptty attach`
 - send prompts to attached, explicit, or new conversations through `gptty send`
-- SDK-backed image prompts through `gptty ask --image` and `gptty send --image`
+- SDK-backed image and general-file prompts through `gptty ask/send --image` and `--file`
 - inspect attached or explicit conversations through `gptty messages` and `gptty status`
 - export attached or explicit conversations through `gptty export`
 - output modes for `messages`, `status`, `send`, and `export`: `plain`, `json`, `markdown`; `ask` and `send` also provide versioned `jsonl` automation streams
@@ -193,9 +193,11 @@ gptty ask --image screenshot.png "describe this UI"
 gptty ask --image https://example.com/chart.png "summarize this chart"
 gptty send --image diagram.webp "continue with this image"
 gptty send --image before.png --image after.png "compare these images"
+gptty ask --file notes.pdf "summarize this document"
+gptty send --file data.csv "continue using this file"
 ```
 
-`--image` accepts local file paths, `http(s)` URLs, and data URIs. It can be used more than once. Supported SDK image formats are PNG, JPEG/JPG, GIF, and WebP.
+`--image` and `--file` use the same CWA rich-input media contract and accept local file paths, `http(s)` URLs, and data URIs. Both may be repeated or mixed; their CLI order is preserved. `--image` is the image-oriented convenience surface (PNG, JPEG/JPG, GIF, WebP), while `--file` exposes CWA's live-proven general-file path rather than a separate uploader.
 
 Inspect the attached conversation:
 
@@ -249,13 +251,14 @@ In a TTY, press `/` and Enter to open the lightweight action menu:
 /goal
 /export
 /image
+/file
 /paste
 /model
 /effort
 /exit
 ```
 
-`/image <path>` stages an image for the next accepted prompt; `/image` without an argument opens a path prompt, so a file can be dragged from Finder into the terminal. Repeat it to attach multiple images. `/paste` materializes the current macOS clipboard image as a temporary PNG using the native pasteboard (`osascript`), so screenshots copied to the clipboard can be sent without manually saving them. Pending images are shown in the prompt as `[N images]`; `/image clear` removes them, and successful `/new`, `/temporary`, `/resume`, or `/detach` clears still-unbound pending images to prevent accidental cross-chat sends. When text is queued while another turn/resume/follow is active, that queued turn immediately snapshots the currently pending media, so a later `/image` or `/paste` belongs to a later prompt rather than drifting onto an older queued prompt. `/reload` refreshes the same attached chat and therefore preserves still-unbound pending images. Clipboard temp files are removed after their bound prompt finishes, when the queued item is removed/cleared, or when the session/context is closed.
+`/image <path>` stages an image and `/file <path>` stages a general file for the next accepted prompt; either command without an argument opens the same persistent path picker with the appropriate label, so files can be dragged from Finder into the terminal. Repeat or mix them for multiple attachments. `/image clear` removes pending images only; `/file clear` removes pending general files only. `/paste` materializes the current macOS clipboard image as a temporary PNG using the native pasteboard (`osascript`). The composer shows a generic `[N attachments]` marker. Successful `/new`, `/temporary`, `/resume`, or `/detach` clears still-unbound attachments to prevent accidental cross-chat sends. When text is queued while another turn/resume/follow is active, that queued turn immediately snapshots the current media list, so later `/image`, `/file`, or `/paste` staging belongs to a later prompt rather than drifting onto an older queued prompt. `/reload` preserves still-unbound attachments. Clipboard temp files are removed after their bound prompt finishes, when the queued item is removed/cleared, or when the session/context is closed.
 
 Queued turns in the enhanced UI are deliberately **memory-only** and bounded. Each accepted queued turn freezes its text, media list, conversation mode/reference, model/reasoning policy slot, Goal id/generation, origin and timestamp. `/queue` shows content-free queue metadata; `/queue remove <index|id>` removes one item, `/queue clear` discards all queued turns, and `/queue send` explicitly releases/rebinds held turns to the current context. Normal completion releases compatible queued turns FIFO. A user Stop (`/stop`, Ctrl-C or SIGINT), an abnormal terminal turn, a failed resume, or a chat/model/Goal binding mismatch holds the queue instead of auto-sending or silently discarding drafts. Held work stays local until explicit `/queue send` or `/queue clear`; process exit still loses it by design rather than pretending the queue is durable.
 
@@ -384,8 +387,8 @@ A plain `gptty chat` starts a fresh local runtime session so simultaneous termin
   Reinstall auth dependencies with `python -m pip install -e ".[auth]"` from checkout, or `python -m pip install "gptty-web[auth]"` from an installed package.
 - `gptty send`, `gptty messages`, `gptty status`, or `gptty export` says there is no attached conversation
   Run `gptty attach <url-or-id>` first, pass a conversation URL/id directly to the command, or use `gptty send --new`.
-- `gptty ask --image` or `gptty send --image` says an image file does not exist
-  Check the local path, or pass an `http(s)` image URL instead.
+- `gptty ask/send --image` says an image file does not exist, or `--file` says a file does not exist
+  Check the local path, or pass an `http(s)` URL instead.
 - `ImportError: cannot import name 'nodriver'`
   Reinstall auth dependencies with `python -m pip install -e ".[auth]"`. Recent `g4f` releases use `zendriver` instead of the older `nodriver` package name.
 - The wrong account opens in auth refresh

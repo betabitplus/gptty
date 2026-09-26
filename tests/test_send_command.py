@@ -760,3 +760,26 @@ def test_send_rejects_saved_custom_model_plus_effort_before_write(tmp_path: Path
     assert code == 2
     assert FakeGpttyClient.instances == []
     assert "explicit model" in stderr.getvalue()
+
+
+def test_send_passes_general_file_through_existing_media_contract(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    document = tmp_path / "data.csv"
+    document.write_text("a,b\n1,2\n", encoding="utf-8")
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-ref"),
+    )
+
+    code = run_send(
+        make_args(tmp_path, file=[str(document)]),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls[0] == (
+        "send_to_conversation",
+        ("attached-ref", "continue"),
+        {"stream": False, "media": [str(document)]},
+    )

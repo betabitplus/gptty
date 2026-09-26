@@ -31,6 +31,7 @@ def test_command_contexts_are_canonical_and_complete() -> None:
         "exit",
         "goal",
         "image",
+        "file",
         "paste",
     }
     assert {spec.name for spec in commands_for_context("resume_loading")} == {
@@ -46,6 +47,7 @@ def test_context_help_tokens_come_from_same_availability_metadata() -> None:
         "/exit",
         "/goal pause|status|list",
         "/image PATH|clear",
+        "/file PATH|clear",
         "/paste",
     )
     assert command_context_tokens("resume_loading") == ("/queue", "/exit")
@@ -90,7 +92,7 @@ def test_async_picker_metadata_matches_async_handlers() -> None:
         spec.name for spec in COMMANDS if spec.async_picker
     }
 
-    assert async_handlers == registered_async == {"resume", "model", "image", "effort"}
+    assert async_handlers == registered_async == {"resume", "model", "image", "file", "effort"}
 
 
 class _Renderer:

@@ -101,6 +101,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
         working_hint="/image PATH|clear",
     ),
     CommandSpec(
+        "file",
+        "Attach a general file to the next prompt",
+        "Enter: choose path · or clear",
+        (CommandOptionSpec("clear", "Remove pending files"),),
+        contexts=WORKING_CONTEXTS,
+        async_picker=True,
+        working_hint="/file PATH|clear",
+    ),
+    CommandSpec(
         "paste",
         "Attach the clipboard image to the next prompt",
         contexts=WORKING_CONTEXTS,
@@ -163,7 +172,7 @@ def commands_for_context(context: CommandContext) -> tuple[CommandSpec, ...]:
 
 
 _CONTEXT_ORDER: dict[CommandContext, tuple[str, ...]] = {
-    "working": ("queue", "stop", "exit", "goal", "image", "paste"),
+    "working": ("queue", "stop", "exit", "goal", "image", "file", "paste"),
     "resume_loading": ("queue", "exit"),
 }
 

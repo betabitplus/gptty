@@ -3036,3 +3036,49 @@ def test_normal_export_passes_persisted_typed_sources_to_markdown_exporter(
     assert ("get_messages", ref) in client.calls
     assert exported[0]["observations"]["sources"][0]["source_id"] == "source-1"
     assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+
+
+def test_file_command_stages_general_file_and_clear_is_kind_specific(tmp_path) -> None:
+    image = tmp_path / "plot.png"
+    document = tmp_path / "notes.txt"
+    image.write_bytes(b"png")
+    document.write_text("notes", encoding="utf-8")
+    commands, renderer, _, _ = make_commands(tmp_path)
+
+    commands.handle(f"/image {image}")
+    commands.handle(f"/file {document}")
+
+    assert commands.pending_media == [str(image), str(document)]
+    assert commands.pending_media_count_for("image") == 1
+    assert commands.pending_media_count_for("file") == 1
+    assert "Attached file for next prompt" in renderer.events[-1][1]
+
+    commands.handle("/image clear")
+    assert commands.pending_media == [str(document)]
+    assert "Cleared 1 pending image" in renderer.events[-1][1]
+
+    commands.handle("/file clear")
+    assert commands.pending_media == []
+    assert "Cleared 1 pending file" in renderer.events[-1][1]
+
+
+def test_async_file_command_uses_attachment_picker_contract(tmp_path) -> None:
+    document = tmp_path / "picked file.txt"
+    document.write_text("notes", encoding="utf-8")
+
+    class AttachmentUI(FakeUI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prompts: list[str] = []
+
+        async def read_attachment_path_async(self, *, prompt="Attachment path: "):
+            self.prompts.append(prompt)
+            return str(document).replace(" ", "\\ ")
+
+    ui = AttachmentUI()
+    commands, _, _, _ = make_commands(tmp_path, ui=ui)
+
+    asyncio.run(commands.handle_async("/file"))
+
+    assert ui.prompts == ["File path: "]
+    assert commands.pending_media == [str(document)]

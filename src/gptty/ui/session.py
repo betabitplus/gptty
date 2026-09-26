@@ -922,7 +922,7 @@ class InteractiveSession:
             return self._prompt_override
         if self._attachment_count:
             suffix = "s" if self._attachment_count != 1 else ""
-            return f"[{self._attachment_count} image{suffix}] ❯ "
+            return f"[{self._attachment_count} attachment{suffix}] ❯ "
         return "❯ "
 
     def _input_window_height(self) -> Dimension:
@@ -1519,7 +1519,7 @@ class InteractiveSession:
 
     def read_prompt(self, *, attachment_count: int = 0) -> str:
         marker = (
-            f"[{attachment_count} image{'s' if attachment_count != 1 else ''}] "
+            f"[{attachment_count} attachment{'s' if attachment_count != 1 else ''}] "
             if attachment_count
             else ""
         )
@@ -1663,13 +1663,15 @@ class InteractiveSession:
         # during SIGWINCH redraws.
         return max(1, columns - 1)
 
-    async def read_image_path_async(self) -> str | None:
+    async def read_attachment_path_async(
+        self, *, prompt: str = "Attachment path: "
+    ) -> str | None:
         await self.start_async()
         buffer = self._session.default_buffer
         self._picker_previous_completer = buffer.completer
         self._picker_previous_prompt = self._prompt_override
         self._picker_active = True
-        self._prompt_override = "Image path: "
+        self._prompt_override = prompt
         buffer.completer = PathCompleter(expanduser=True)
         buffer.reset()
         self._session.app.invalidate()
@@ -1683,7 +1685,10 @@ class InteractiveSession:
             if self._picker_active or self._picker_previous_completer is not None:
                 self._restore_picker_state()
 
-    def read_image_path(self) -> str | None:
+    async def read_image_path_async(self) -> str | None:
+        return await self.read_attachment_path_async(prompt="Image path: ")
+
+    def read_attachment_path(self, *, prompt: str = "Attachment path: ") -> str | None:
         kwargs: dict[str, Any] = {
             "completer": PathCompleter(expanduser=True),
             "complete_while_typing": True,
@@ -1695,10 +1700,13 @@ class InteractiveSession:
             kwargs["output"] = self._prompt_output
         session = PromptSession(**kwargs)
         try:
-            value = session.prompt("Image path: ").strip()
+            value = session.prompt(prompt).strip()
         except (KeyboardInterrupt, EOFError):
             return None
         return value or None
+
+    def read_image_path(self) -> str | None:
+        return self.read_attachment_path(prompt="Image path: ")
 
     def choose_command(self) -> str | None:
         selected = self.choose(

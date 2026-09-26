@@ -2934,9 +2934,11 @@ def _handle_working_input(
         )
         return True
 
-    if name == "image":
+    if name in {"image", "file"}:
         if not argv:
-            renderer.warning("While working, use /image PATH or /image clear.")
+            renderer.warning(
+                f"While working, use /{name} PATH or /{name} clear."
+            )
             return True
         commands.handle(prompt)
         return True

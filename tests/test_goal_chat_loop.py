@@ -3328,6 +3328,8 @@ def test_busy_queue_binds_pending_media_to_the_prompt_accepted_with_it(
 ) -> None:
     image = tmp_path / "queued-b.png"
     image.write_bytes(b"image")
+    document = tmp_path / "queued-b.txt"
+    document.write_text("file", encoding="utf-8")
 
     class MediaQueueClient:
         instances: list["MediaQueueClient"] = []
@@ -3394,6 +3396,15 @@ def test_busy_queue_binds_pending_media_to_the_prompt_accepted_with_it(
                     and "Attached for next prompt:" in str(event[1])
                     for event in _FakeRenderer.instances[0].events
                 ),
+                f"/file {document}",
+            ),
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    event[0] == "info"
+                    and "Attached file for next prompt:" in str(event[1])
+                    for event in _FakeRenderer.instances[0].events
+                ),
                 "queued B",
             ),
             (queued_two, ""),
@@ -3419,7 +3430,7 @@ def test_busy_queue_binds_pending_media_to_the_prompt_accepted_with_it(
     assert MediaQueueClient.instances[0].calls == [
         ("send", "first turn", ()),
         ("send_to_conversation", "queued A", ()),
-        ("send_to_conversation", "queued B", (str(image),)),
+        ("send_to_conversation", "queued B", (str(image), str(document))),
     ]
 
 

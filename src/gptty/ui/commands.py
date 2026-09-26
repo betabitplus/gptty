@@ -110,6 +110,7 @@ class InteractiveCommands:
         ):
             self._acquire_goal_run_lock(state.goal)
         self._pending_media: list[str] = []
+        self._pending_media_kinds: dict[str, str] = {}
         self._owned_media: set[Path] = set()
         self._clipboard_dir: Path | None = None
         self._conversation_titles: dict[str, str] = {}
@@ -186,6 +187,14 @@ class InteractiveCommands:
     @property
     def pending_media_count(self) -> int:
         return len(self._pending_media)
+
+    def pending_media_count_for(self, kind: str) -> int:
+        normalized = "file" if str(kind).strip().lower() == "file" else "image"
+        return sum(
+            1
+            for media in self._pending_media
+            if self._pending_media_kinds.get(media, "image") == normalized
+        )
 
     def _set_history_persistent(self, enabled: bool) -> None:
         setter = getattr(self.ui, "set_history_persistent", None)
@@ -1234,6 +1243,8 @@ class InteractiveCommands:
     def take_pending_media(self) -> list[str]:
         media = list(self._pending_media)
         self._pending_media.clear()
+        for item in media:
+            self._pending_media_kinds.pop(item, None)
         return media
 
     def release_media(self, media: list[str]) -> None:
@@ -1247,12 +1258,32 @@ class InteractiveCommands:
             shutil.rmtree(self._clipboard_dir, ignore_errors=True)
             self._clipboard_dir = None
 
-    def clear_pending_media(self) -> None:
-        self._pending_media.clear()
-        for path in list(self._owned_media):
-            path.unlink(missing_ok=True)
-        self._owned_media.clear()
-        if self._clipboard_dir is not None:
+    def clear_pending_media(self, *, kind: str | None = None) -> None:
+        normalized = (
+            "file" if str(kind).strip().lower() == "file" else "image"
+            if kind is not None
+            else None
+        )
+        if normalized is None:
+            removed = list(self._pending_media)
+            self._pending_media.clear()
+        else:
+            removed = [
+                media
+                for media in self._pending_media
+                if self._pending_media_kinds.get(media, "image") == normalized
+            ]
+            removed_set = set(removed)
+            self._pending_media = [
+                media for media in self._pending_media if media not in removed_set
+            ]
+        for media in removed:
+            self._pending_media_kinds.pop(media, None)
+            path = Path(media)
+            if path in self._owned_media:
+                path.unlink(missing_ok=True)
+                self._owned_media.discard(path)
+        if self._clipboard_dir is not None and not self._owned_media:
             shutil.rmtree(self._clipboard_dir, ignore_errors=True)
             self._clipboard_dir = None
 
@@ -2047,31 +2078,40 @@ class InteractiveCommands:
             self.renderer.info("No active ChatGPT response to stop.")
         return outcome
 
-    def _attach_image_input(self, raw: str | None, *, from_prompt: bool) -> None:
+    def _attach_media_input(
+        self, raw: str | None, *, kind: str, from_prompt: bool
+    ) -> None:
         if not raw:
             return
+        normalized_kind = "file" if str(kind).strip().lower() == "file" else "image"
         if from_prompt:
             try:
                 parsed = shlex.split(raw)
             except ValueError as exc:
-                self.renderer.warning(f"Invalid image path: {exc}")
+                self.renderer.warning(f"Invalid {normalized_kind} path: {exc}")
                 return
             raw = " ".join(parsed)
         try:
-            media = normalize_media_input(raw)
+            media = normalize_media_input(raw, kind=normalized_kind)
         except MediaInputError as exc:
             self.renderer.warning(str(exc))
             return
         if media not in self._pending_media:
             self._pending_media.append(media)
-        self.renderer.info(
-            f"Attached for next prompt: {Path(media).name or media} · pending: {self.pending_media_count}"
-        )
+        self._pending_media_kinds[media] = normalized_kind
+        if normalized_kind == "image":
+            message = f"Attached for next prompt: {Path(media).name or media}"
+        else:
+            message = f"Attached file for next prompt: {Path(media).name or media}"
+        self.renderer.info(f"{message} · pending: {self.pending_media_count}")
+
+    def _attach_image_input(self, raw: str | None, *, from_prompt: bool) -> None:
+        self._attach_media_input(raw, kind="image", from_prompt=from_prompt)
 
     def _cmd_image(self, argv: list[str]) -> None:
         if argv and argv[0].strip().lower() == "clear":
-            count = self.pending_media_count
-            self.clear_pending_media()
+            count = self.pending_media_count_for("image")
+            self.clear_pending_media(kind="image")
             self.renderer.info(
                 f"Cleared {count} pending image{'s' if count != 1 else ''}."
             )
@@ -2083,6 +2123,33 @@ class InteractiveCommands:
     async def _cmd_image_async(self) -> None:
         raw = await self.ui.read_image_path_async()
         self._attach_image_input(raw, from_prompt=True)
+
+    def _read_file_path(self) -> str | None:
+        reader = getattr(self.ui, "read_attachment_path", None)
+        if callable(reader):
+            return reader(prompt="File path: ")
+        return self.ui.read_image_path()
+
+    async def _read_file_path_async(self) -> str | None:
+        reader = getattr(self.ui, "read_attachment_path_async", None)
+        if callable(reader):
+            return await reader(prompt="File path: ")
+        return await self.ui.read_image_path_async()
+
+    def _cmd_file(self, argv: list[str]) -> None:
+        if argv and argv[0].strip().lower() == "clear":
+            count = self.pending_media_count_for("file")
+            self.clear_pending_media(kind="file")
+            self.renderer.info(
+                f"Cleared {count} pending file{'s' if count != 1 else ''}."
+            )
+            return
+        raw = " ".join(argv).strip() if argv else self._read_file_path()
+        self._attach_media_input(raw, kind="file", from_prompt=not argv)
+
+    async def _cmd_file_async(self) -> None:
+        raw = await self._read_file_path_async()
+        self._attach_media_input(raw, kind="file", from_prompt=True)
 
     def _cmd_paste(self, argv: list[str]) -> None:
         if argv:
@@ -2098,7 +2165,9 @@ class InteractiveCommands:
             self.renderer.warning(str(exc))
             return
         self._owned_media.add(path)
-        self._pending_media.append(str(path))
+        media = str(path)
+        self._pending_media.append(media)
+        self._pending_media_kinds[media] = "image"
         self.renderer.info(
             f"Attached clipboard image for next prompt · pending: {self.pending_media_count}"
         )

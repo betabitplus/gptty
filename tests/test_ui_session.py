@@ -1309,6 +1309,7 @@ def test_command_registry_exposes_session_actions() -> None:
         "goal",
         "export",
         "image",
+        "file",
         "paste",
         "model",
         "effort",
@@ -1629,3 +1630,48 @@ def test_transcript_row_index_compacts_after_many_front_evictions(tmp_path) -> N
     assert session._transcript_trimmed is True
     assert session._transcript_row_index._head < 4096
     assert "line 4299" in visible
+
+
+def test_file_path_prompt_reuses_persistent_application(tmp_path) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe:
+            session = InteractiveSession(
+                history_file=tmp_path / "history",
+                settings_file=tmp_path / "ui.json",
+                prompt_input=pipe,
+                prompt_output=ResizableDummyOutput(80),
+            )
+            await session.start_async()
+            app_task = session._application_task
+            assert app_task is not None and not app_task.done()
+
+            picker = asyncio.create_task(
+                session.read_attachment_path_async(prompt="File path: ")
+            )
+            await asyncio.sleep(0.05)
+            assert session._picker_active is True
+            assert session._prompt_override == "File path: "
+
+            pipe.send_text("/tmp/gptty-file.txt\r")
+            assert await picker == "/tmp/gptty-file.txt"
+            assert session._application_task is app_task
+            assert not app_task.done()
+            assert session._picker_active is False
+            assert session._prompt_override is None
+
+            await session.stop_async()
+
+    asyncio.run(scenario())
+
+
+def test_prompt_uses_generic_attachment_marker(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+    )
+
+    session._attachment_count = 1
+    assert session._prompt_text() == "[1 attachment] ❯ "
+
+    session._attachment_count = 2
+    assert session._prompt_text() == "[2 attachments] ❯ "
