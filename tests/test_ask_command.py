@@ -330,3 +330,32 @@ def test_run_ask_returns_2_for_empty_prompt() -> None:
 
     assert code == 2
     assert "requires a prompt" in stderr.getvalue()
+
+
+def test_ask_forwards_reasoning_effort_intent() -> None:
+    FakeGpttyClient.instances.clear()
+
+    code = run_ask(
+        make_args(effort="medium"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls[0][2]["reasoning_effort"] == "medium"
+
+
+def test_ask_rejects_custom_model_plus_effort_before_client_creation() -> None:
+    FakeGpttyClient.instances.clear()
+    stderr = StringIO()
+
+    code = run_ask(
+        make_args(model="gpt-custom", effort="high"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "explicit model" in stderr.getvalue()

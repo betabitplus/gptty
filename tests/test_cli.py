@@ -181,6 +181,7 @@ def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:
         calls["timeout"] = args.timeout
         calls["format"] = args.format
         calls["model"] = args.model
+        calls["effort"] = args.effort
         calls["no_stream"] = args.no_stream
         calls["session"] = args.session
         calls["stdin_text"] = stdin_text
@@ -219,6 +220,7 @@ def test_send_routes_to_send_command(monkeypatch: pytest.MonkeyPatch) -> None:
         "timeout": 12,
         "format": "json",
         "model": "gpt-4o",
+        "effort": None,
         "no_stream": True,
         "session": "automation-A",
         "stdin_text": "stdin context",
@@ -248,6 +250,7 @@ def test_chat_routes_to_sdk_chat_with_new_state_default(monkeypatch: pytest.Monk
         calls["state"] = args.state
         calls["auth"] = args.auth
         calls["model"] = args.model
+        calls["effort"] = args.effort
         calls["no_stream"] = args.no_stream
         calls["timeout"] = args.timeout
         return 0
@@ -259,6 +262,7 @@ def test_chat_routes_to_sdk_chat_with_new_state_default(monkeypatch: pytest.Monk
         "state": "gptty_state.json",
         "auth": "auth_data.json",
         "model": None,
+        "effort": None,
         "no_stream": False,
         "timeout": 7200,
     }
@@ -496,3 +500,45 @@ def test_status_routes_to_status_command(monkeypatch: pytest.MonkeyPatch) -> Non
         "timeout": 12,
         "format": "json",
     }
+
+
+def test_effort_option_reaches_ask_send_and_chat_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
+    seen: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(cli, "read_stdin_text", lambda _mode: None)
+    monkeypatch.setattr(
+        ask_command,
+        "run_ask",
+        lambda args, *, stdin_text=None: seen.append(("ask", args.effort)) or 0,
+    )
+    monkeypatch.setattr(
+        send_command,
+        "run_send",
+        lambda args, *, stdin_text=None: seen.append(("send", args.effort)) or 0,
+    )
+    monkeypatch.setattr(
+        chat_command,
+        "run_chat",
+        lambda args: seen.append(("chat", args.effort)) or 0,
+    )
+
+    assert cli.main(["ask", "--effort", "instant", "hello"]) == 0
+    assert cli.main(["send", "--effort", "medium", "hello"]) == 0
+    assert cli.main(["chat", "--effort", "high"]) == 0
+    assert seen == [("ask", "instant"), ("send", "medium"), ("chat", "high")]
+
+
+def test_effort_default_is_valid_cli_reset_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_legacy_profile_resolution(monkeypatch)
+    seen: dict[str, str | None] = {}
+    def fake_run_chat(args: Any) -> int:
+        seen["effort"] = args.effort
+        return 0
+
+    monkeypatch.setattr(chat_command, "run_chat", fake_run_chat)
+
+    assert cli.main(["chat", "--effort", "default"]) == 0
+    assert seen == {"effort": "default"}

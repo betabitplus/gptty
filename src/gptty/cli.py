@@ -7,6 +7,7 @@ from pathlib import Path
 from . import __version__
 from .io import StdinReadError, read_stdin_text
 from .profiles import ProfileError, resolve_auth_path, resolve_session_paths
+from .reasoning import EFFORT_VALUES
 
 DEFAULT_TURN_TIMEOUT_SECONDS = 7200
 BROWSER_BACKEND_CHOICES = ("chrome-native", "wkwebview")
@@ -135,6 +136,18 @@ def _add_image_options(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="PATH_OR_URL",
         help="Attach an image path, URL, or data URI. Can be used more than once.",
+    )
+
+
+def _add_effort_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--effort",
+        choices=("default", *EFFORT_VALUES),
+        default=None,
+        help=(
+            "Reasoning effort intent: instant, medium, or high. "
+            "Stored independently from the model for session commands."
+        ),
     )
 
 
@@ -312,6 +325,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_image_options(ask_parser)
     _add_auth_file_option(ask_parser)
     _add_backend_option(ask_parser)
+    _add_effort_option(ask_parser)
     ask_parser.add_argument(
         "--model",
         default=None,
@@ -358,6 +372,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_stdin_options(send_parser)
     _add_image_options(send_parser)
     _add_session_options(send_parser)
+    _add_effort_option(send_parser)
     send_parser.set_defaults(timeout=DEFAULT_TURN_TIMEOUT_SECONDS)
     _add_output_format_option(send_parser, jsonl=True)
     _add_lock_options(send_parser)
@@ -379,6 +394,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_profile_option(chat_parser)
     _add_backend_option(chat_parser)
     _add_session_identity_option(chat_parser)
+    _add_effort_option(chat_parser)
     chat_parser.add_argument(
         "--legacy",
         action="store_true",

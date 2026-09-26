@@ -109,7 +109,19 @@ COMMANDS: tuple[CommandSpec, ...] = (
         "model",
         "Choose a real ChatGPT model",
         "Enter: choose model · or default | <slug>",
-        (CommandOptionSpec("default", "Use latest frontier · High"),),
+        (CommandOptionSpec("default", "Use latest frontier model policy"),),
+        async_picker=True,
+    ),
+    CommandSpec(
+        "effort",
+        "Choose reasoning effort independently from the saved model intent",
+        "Enter: choose effort · or default | instant | medium | high",
+        (
+            CommandOptionSpec("default", "Use product default · High"),
+            CommandOptionSpec("instant", "Prefer Instant reasoning mode"),
+            CommandOptionSpec("medium", "Prefer Medium reasoning mode"),
+            CommandOptionSpec("high", "Prefer High reasoning mode"),
+        ),
         async_picker=True,
     ),
     CommandSpec(

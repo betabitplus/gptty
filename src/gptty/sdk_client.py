@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
+from .reasoning import model_profile_for_effort
+
 _CANONICAL_WAIT_MIN_POLL_INTERVAL_SECONDS = 15.0
 DEFAULT_MODEL_PROFILE = "DEEP"
 
@@ -297,7 +299,24 @@ class GpttyClient:
     def _prepare_send_options(self, options: dict[str, Any]) -> dict[str, Any]:
         prepared = dict(options)
         media = prepared.get("media")
+        requested_effort = prepared.pop("reasoning_effort", None)
+        effort_profile = model_profile_for_effort(requested_effort)
         has_explicit_model = bool(prepared.get("model") or prepared.get("model_profile"))
+        if effort_profile is not None:
+            if has_explicit_model:
+                raise ValueError(
+                    "explicit reasoning effort cannot be combined with an explicit "
+                    "model until the product runtime exposes independent model+effort "
+                    "selection"
+                )
+            if media:
+                raise ValueError(
+                    "explicit reasoning effort cannot be combined with media until "
+                    "the product runtime proves rich-input profile selection"
+                )
+            prepared["model_profile"] = effort_profile
+            has_explicit_model = True
+
         media_default_model: str | None = None
         if media and not has_explicit_model:
             semantic_default = getattr(self._client, "media_default_model_profile", None)
@@ -306,7 +325,9 @@ class GpttyClient:
                 prepared["model_profile"] = profile.strip()
             else:
                 if self._media_default_model is None:
-                    self._media_default_model = _resolve_latest_frontier_model(self._client.list_models())
+                    self._media_default_model = _resolve_latest_frontier_model(
+                        self._client.list_models()
+                    )
                 media_default_model = self._media_default_model
         return _sdk_send_options(prepared, media_default_model=media_default_model)
 

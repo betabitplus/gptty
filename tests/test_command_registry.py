@@ -90,7 +90,7 @@ def test_async_picker_metadata_matches_async_handlers() -> None:
         spec.name for spec in COMMANDS if spec.async_picker
     }
 
-    assert async_handlers == registered_async == {"resume", "model", "image"}
+    assert async_handlers == registered_async == {"resume", "model", "image", "effort"}
 
 
 class _Renderer:

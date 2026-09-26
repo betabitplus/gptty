@@ -25,6 +25,7 @@ from ..output import (
     render_response,
 )
 from ..prompt import PROMPT_STDIN_CONFLICT_ERROR, build_prompt
+from ..reasoning import normalize_effort, validate_model_effort_combination
 from ..required_action import render_required_action, required_action_state
 from ..runs import start_run
 from ..sdk_client import GpttyClient
@@ -129,6 +130,24 @@ def run_send(
     explicit_ref = getattr(args, "to", None)
     start_new = bool(getattr(args, "new", False))
     conversation_ref = None if start_new else explicit_ref or state.current_conversation
+    requested_model = getattr(args, "model", None)
+    requested_effort = normalize_effort(getattr(args, "effort", None))
+    use_session_policy = explicit_ref is None
+    effective_model = (
+        requested_model
+        if requested_model is not None
+        else state.model if use_session_policy else None
+    )
+    effective_effort = (
+        requested_effort
+        if getattr(args, "effort", None) is not None
+        else state.reasoning_effort if use_session_policy else None
+    )
+    try:
+        validate_model_effort_combination(effective_model, effective_effort)
+    except ValueError as exc:
+        print(f"gptty: {exc}", file=stderr)
+        return 2
 
     if not start_new and not conversation_ref:
         if jsonl:
@@ -190,9 +209,10 @@ def run_send(
                 print(rendered, file=stderr, flush=True)
 
     options: dict[str, Any] = {"stream": stream}
-    model = getattr(args, "model", None)
-    if model:
-        options["model"] = model
+    if effective_model:
+        options["model"] = effective_model
+    if effective_effort:
+        options["reasoning_effort"] = effective_effort
     if media:
         options["media"] = media
     if stream:
@@ -323,8 +343,19 @@ def run_send(
         ):
             state.current_conversation = updated_ref
             session_changed = True
-        if mutates_session and model and model != state.model:
-            state.model = model
+        if (
+            mutates_session
+            and requested_model is not None
+            and requested_model != state.model
+        ):
+            state.model = requested_model
+            session_changed = True
+        if (
+            mutates_session
+            and getattr(args, "effort", None) is not None
+            and requested_effort != state.reasoning_effort
+        ):
+            state.reasoning_effort = requested_effort
             session_changed = True
         if session_changed:
             try:

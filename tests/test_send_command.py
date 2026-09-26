@@ -654,3 +654,109 @@ def test_send_jsonl_ambiguous_write_has_machine_reconciliation_flags(
     assert failure["error"]["request_stage"] == "browser_owned_write"
     assert failure["error"]["write_may_have_been_submitted"] is True
     assert failure["error"]["reconciliation_required"] is True
+
+
+def test_send_uses_saved_reasoning_effort_for_attached_session(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-ref", reasoning_effort="medium"),
+    )
+
+    code = run_send(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls == [
+        (
+            "send_to_conversation",
+            ("attached-ref", "continue"),
+            {"stream": False, "reasoning_effort": "medium"},
+        )
+    ]
+
+
+def test_send_effort_override_persists_after_success(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-ref"),
+    )
+
+    code = run_send(
+        make_args(tmp_path, effort="high"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls[0][2]["reasoning_effort"] == "high"
+    assert _load_command_session(tmp_path).reasoning_effort == "high"
+
+
+def test_send_effort_default_clears_saved_intent_after_success(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-ref", reasoning_effort="high"),
+    )
+
+    code = run_send(
+        make_args(tmp_path, effort="default"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert "reasoning_effort" not in FakeGpttyClient.instances[0].calls[0][2]
+    assert _load_command_session(tmp_path).reasoning_effort is None
+
+
+def test_send_explicit_target_does_not_inherit_attached_effort(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(
+            current_conversation="attached-ref",
+            reasoning_effort="medium",
+        ),
+    )
+
+    code = run_send(
+        make_args(tmp_path, to="other-ref"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    assert FakeGpttyClient.instances[0].calls == [
+        ("send_to_conversation", ("other-ref", "continue"), {"stream": False})
+    ]
+    assert _load_command_session(tmp_path).reasoning_effort == "medium"
+
+
+def test_send_rejects_saved_custom_model_plus_effort_before_write(tmp_path: Path) -> None:
+    FakeGpttyClient.instances.clear()
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(
+            current_conversation="attached-ref",
+            model="gpt-custom",
+            reasoning_effort="medium",
+        ),
+    )
+    stderr = StringIO()
+
+    code = run_send(
+        make_args(tmp_path),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "explicit model" in stderr.getvalue()

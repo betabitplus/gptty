@@ -33,6 +33,7 @@ from ..local_store import local_store_path
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..output import _tool_result_error, normalize_messages, render_live_event
 from ..queued_turns import QueueBinding, QueueLimitError, QueuedTurn, QueuedTurnQueue
+from ..reasoning import effort_label, normalize_effort, validate_model_effort_combination
 from ..reconciliation import (
     ChatTerminalEvidence,
     chat_terminal_resolution,
@@ -185,9 +186,10 @@ def _render_queue_status(
         binding = turn.binding
         ref = (binding.conversation_ref or "new")[:8]
         model = binding.model or "default"
+        effort = binding.reasoning_effort or "default"
         renderer.info(
             f"Queue {index}: {turn.turn_id[:8]} · {len(turn.text)} chars · "
-            f"media {turn.media_count} · chat {ref} · model {model}"
+            f"media {turn.media_count} · chat {ref} · model {model} · effort {effort}"
         )
 
 
@@ -925,9 +927,28 @@ def run_chat(
     if state_load_error is not None and state.goal is None:
         print("gptty: use /goal list to locate preserved Goals", file=stderr)
 
-    model = getattr(args, "model", None)
-    if model and model != state.model:
-        state.model = model
+    requested_model = getattr(args, "model", None)
+    requested_effort_raw = getattr(args, "effort", None)
+    requested_effort = (
+        normalize_effort(requested_effort_raw)
+        if requested_effort_raw is not None
+        else state.reasoning_effort
+    )
+    desired_model = requested_model if requested_model is not None else state.model
+    try:
+        validate_model_effort_combination(desired_model, requested_effort)
+    except ValueError as exc:
+        print(f"gptty: {exc}", file=stderr)
+        return 2
+
+    state_changed = False
+    if requested_model is not None and requested_model != state.model:
+        state.model = requested_model
+        state_changed = True
+    if requested_effort_raw is not None and requested_effort != state.reasoning_effort:
+        state.reasoning_effort = requested_effort
+        state_changed = True
+    if state_changed:
         try:
             state_handle.save(state)
         except StateError as exc:
@@ -998,7 +1019,8 @@ def run_chat(
         renderer.header(
             profile=getattr(args, "profile", None),
             conversation=state.current_conversation,
-            model=state.model or "latest frontier · High",
+            model=state.model or "latest frontier",
+            effort=effort_label(state.reasoning_effort),
         )
         if startup_goal_paused and state.goal is not None:
             renderer.info("Goal · paused after restart · use /goal resume")
@@ -1179,6 +1201,7 @@ def run_chat(
                 profile=getattr(args, "profile", None),
                 prompt=prompt,
                 model=state.model,
+                reasoning_effort=state.reasoning_effort,
                 media=media,
                 stream=not bool(getattr(args, "no_stream", False)),
                 lock_timeout=_lock_timeout(args),
@@ -2633,6 +2656,7 @@ def _start_enhanced_turn(
             profile=getattr(args, "profile", None),
             prompt=prompt,
             model=state.model,
+            reasoning_effort=state.reasoning_effort,
             media=media or None,
             stream=not bool(getattr(args, "no_stream", False)),
             lock_timeout=_lock_timeout(args),
@@ -2966,6 +2990,7 @@ def _send_chat_prompt(
     profile: str | None,
     prompt: str,
     model: str | None,
+    reasoning_effort: str | None = None,
     media: list[str] | None,
     stream: bool,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
@@ -3128,6 +3153,8 @@ def _send_chat_prompt(
     options: dict[str, Any] = {"stream": stream}
     if model:
         options["model"] = model
+    if reasoning_effort:
+        options["reasoning_effort"] = reasoning_effort
     if media:
         options["media"] = media
     if stream:

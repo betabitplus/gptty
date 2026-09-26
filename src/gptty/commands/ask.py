@@ -21,6 +21,7 @@ from ..output import (
     render_response,
 )
 from ..prompt import PROMPT_STDIN_CONFLICT_ERROR, build_prompt
+from ..reasoning import validate_model_effort_combination
 from ..required_action import render_required_action, required_action_state
 from ..sdk_client import GpttyClient
 from ..turn_failure import classify_turn_failure
@@ -40,8 +41,11 @@ def _build_send_options(
 ) -> dict[str, Any]:
     options: dict[str, Any] = {"stream": stream}
     model = getattr(args, "model", None)
+    effort = getattr(args, "effort", None)
     if model:
         options["model"] = model
+    if effort:
+        options["reasoning_effort"] = effort
     if media:
         options["media"] = media
     if on_token is not None:
@@ -106,6 +110,15 @@ def run_ask(
                 ),
                 file=stdout,
             )
+        print(f"gptty: {exc}", file=stderr)
+        return 2
+
+    try:
+        validate_model_effort_combination(
+            getattr(args, "model", None),
+            getattr(args, "effort", None),
+        )
+    except ValueError as exc:
         print(f"gptty: {exc}", file=stderr)
         return 2
 

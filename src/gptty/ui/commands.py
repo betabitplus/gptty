@@ -44,6 +44,7 @@ from ..goal_lock import (
 from ..goal_store import GoalCompatibilityError, GoalConflictError, GoalStore, ensure_goal_id
 from ..media import MediaInputError, normalize_media_input
 from ..output import OutputMessage, normalize_messages
+from ..reasoning import EFFORT_VALUES, effort_label, normalize_effort, validate_model_effort_combination
 from ..reconciliation import (
     ChatTerminalEvidence,
     chat_terminal_resolution,
@@ -354,7 +355,8 @@ class InteractiveCommands:
         self.renderer.clear_context()
         self.renderer.header(
             conversation=attached_ref,
-            model=self.state.model or "latest frontier · High",
+            model=self.state.model or "latest frontier",
+            effort=effort_label(self.state.reasoning_effort),
         )
         action = "Reloaded" if request.reload else "Resumed"
         self.renderer.info(f"{action}: {_short_ref(attached_ref)}")
@@ -1888,7 +1890,10 @@ class InteractiveCommands:
             return
         self.clear_pending_media()
         self.renderer.clear_context()
-        self.renderer.header(model=self.state.model or "latest frontier · High")
+        self.renderer.header(
+            model=self.state.model or "latest frontier",
+            effort=effort_label(self.state.reasoning_effort),
+        )
         self.renderer.info("Started a new conversation.")
 
     def _cmd_temporary(self, argv: list[str]) -> None:
@@ -1911,7 +1916,9 @@ class InteractiveCommands:
         self.clear_pending_media()
         self.renderer.clear_context()
         self.renderer.header(
-            model=self.state.model or "latest frontier · High", temporary=True
+            model=self.state.model or "latest frontier",
+            effort=effort_label(self.state.reasoning_effort),
+            temporary=True,
         )
         self.renderer.info("Started a new Temporary ChatGPT conversation.")
 
@@ -1921,7 +1928,10 @@ class InteractiveCommands:
             self._leave_temporary_mode()
             self.clear_pending_media()
             self.renderer.clear_context()
-            self.renderer.header(model=self.state.model or "latest frontier · High")
+            self.renderer.header(
+            model=self.state.model or "latest frontier",
+            effort=effort_label(self.state.reasoning_effort),
+        )
             self.renderer.info("Detached from the Temporary ChatGPT conversation.")
             return
         if not self.state.current_conversation:
@@ -1937,7 +1947,10 @@ class InteractiveCommands:
             return
         self.clear_pending_media()
         self.renderer.clear_context()
-        self.renderer.header(model=self.state.model or "latest frontier · High")
+        self.renderer.header(
+            model=self.state.model or "latest frontier",
+            effort=effort_label(self.state.reasoning_effort),
+        )
         self.renderer.info(
             "Detached locally. The ChatGPT conversation was not changed."
         )
@@ -2197,7 +2210,7 @@ class InteractiveCommands:
         options: list[tuple[Any, str]] = [
             (
                 "",
-                "Default · latest frontier · High"
+                "Default · latest frontier"
                 + (" · current" if self.state.model is None else ""),
             )
         ]
@@ -2213,12 +2226,21 @@ class InteractiveCommands:
     def _apply_model(self, selected: str) -> None:
         # Model selection is local UI/session state. It must not be fenced by an
         # unrelated Goal owner in another process.
+        next_model = selected or None
+        try:
+            validate_model_effort_combination(
+                next_model,
+                self.state.reasoning_effort,
+            )
+        except ValueError as exc:
+            self.renderer.warning(str(exc))
+            return
         previous = self.state.model
-        self.state.model = selected or None
+        self.state.model = next_model
         if not self._save_state():
             self.state.model = previous
             return
-        self.renderer.info(f"Model: {self.state.model or 'latest frontier · High'}")
+        self.renderer.info(f"Model: {self.state.model or 'latest frontier'}")
 
     def _cmd_model(self, argv: list[str]) -> None:
         if argv and argv[0].strip().lower() == "default":
@@ -2255,6 +2277,61 @@ class InteractiveCommands:
         )
         if value is not None:
             self._apply_model(str(value))
+
+    def _effort_options(self) -> list[tuple[Any, str]]:
+        current = self.state.reasoning_effort
+        options: list[tuple[Any, str]] = [
+            (
+                "",
+                "Default · High" + (" · current" if current is None else ""),
+            )
+        ]
+        options.extend(
+            (
+                effort,
+                effort.title() + (" · current" if current == effort else ""),
+            )
+            for effort in EFFORT_VALUES
+        )
+        return options
+
+    def _apply_effort(self, selected: str) -> None:
+        try:
+            next_effort = normalize_effort(selected)
+            validate_model_effort_combination(self.state.model, next_effort)
+        except ValueError as exc:
+            self.renderer.warning(str(exc))
+            return
+        previous = self.state.reasoning_effort
+        self.state.reasoning_effort = next_effort
+        if not self._save_state():
+            self.state.reasoning_effort = previous
+            return
+        self.renderer.info(f"Effort: {effort_label(self.state.reasoning_effort)}")
+
+    def _cmd_effort(self, argv: list[str]) -> None:
+        if len(argv) > 1:
+            self.renderer.warning(
+                "Usage: /effort [default | instant | medium | high]"
+            )
+            return
+        if argv:
+            self._apply_effort(argv[0])
+            return
+        value = self.ui.choose_searchable(
+            "Reasoning effort",
+            self._effort_options(),
+        )
+        if value is not None:
+            self._apply_effort(str(value))
+
+    async def _cmd_effort_async(self) -> None:
+        value = await self.ui.choose_searchable_async(
+            "Reasoning effort",
+            self._effort_options(),
+        )
+        if value is not None:
+            self._apply_effort(str(value))
 
     def _resume_goal(self) -> None:
         goal = self.state.goal

@@ -68,6 +68,7 @@ class GoalState:
 class ChatState:
     current_conversation: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     goal_id: str | None = None
     goal: GoalState | None = None
 
@@ -150,6 +151,7 @@ def load_chat_state(path: str | Path) -> ChatState:
     return ChatState(
         current_conversation=_optional_str(data.get("current_conversation")),
         model=_optional_str(data.get("model")),
+        reasoning_effort=_optional_str(data.get("reasoning_effort")),
         goal_id=goal_id,
         goal=goal,
     )
@@ -158,6 +160,8 @@ def load_chat_state(path: str | Path) -> ChatState:
 def save_chat_state(path: str | Path, state: ChatState) -> None:
     state_path = Path(path)
     data = asdict(state)
+    if data.get("reasoning_effort") is None:
+        data.pop("reasoning_effort", None)
     if data.get("goal_id") is None:
         data.pop("goal_id", None)
     if data.get("goal") is None:

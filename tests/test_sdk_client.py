@@ -442,3 +442,46 @@ def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) ->
         ("get_status", ("c1",), {}),
         ("get_status", ("c1",), {}),
     ]
+
+
+def test_reasoning_effort_maps_to_proven_semantic_profiles() -> None:
+    sdk = FakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    assert client.send("instant", reasoning_effort="instant") == "send-result"
+    assert client.send("medium", reasoning_effort="medium") == "send-result"
+    assert client.send("high", reasoning_effort="high") == "send-result"
+
+    assert sdk.calls == [
+        ("send", ("instant",), {"model_profile": "FAST"}),
+        ("send", ("medium",), {"model_profile": "BALANCED"}),
+        ("send", ("high",), {"model_profile": "DEEP"}),
+    ]
+
+
+def test_reasoning_effort_with_media_fails_before_underlying_send() -> None:
+    sdk = SemanticMediaFakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="rich-input profile selection"):
+        client.send(
+            "inspect",
+            media=["one.png"],
+            reasoning_effort="medium",
+        )
+
+    assert sdk.calls == []
+
+
+def test_explicit_model_plus_effort_fails_before_underlying_send() -> None:
+    sdk = FakeSdkClient()
+    client = GpttyClient(sdk_client=sdk)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="independent model\\+effort selection"):
+        client.send("hello", model="gpt-custom", reasoning_effort="high")
+
+    assert sdk.calls == []

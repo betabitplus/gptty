@@ -346,3 +346,16 @@ def test_session_handle_wraps_future_local_store_schema(tmp_path: Path) -> None:
         match="local state schema is newer than this gptty build",
     ):
         session_handle(state_path=state_path, profile=None, environ={})
+
+
+def test_transactional_session_round_trips_reasoning_effort(tmp_path: Path) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    handle = session_handle(state_path=state_path, profile=None, environ={})
+    state = handle.load()
+    state.current_conversation = "conv-effort"
+    state.reasoning_effort = "instant"
+    handle.save(state)
+
+    reloaded = session_handle(state_path=state_path, profile=None, environ={}).load()
+    assert reloaded.current_conversation == "conv-effort"
+    assert reloaded.reasoning_effort == "instant"

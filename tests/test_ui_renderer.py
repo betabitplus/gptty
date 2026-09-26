@@ -138,11 +138,16 @@ def test_renderer_header_shows_full_chat_link() -> None:
     out = StringIO()
     renderer = PrettyRenderer(out, UISettings(markdown=False))
 
-    renderer.header(conversation="conv-123", model="latest frontier · High")
+    renderer.header(
+        conversation="conv-123",
+        model="latest frontier",
+        effort="Medium",
+    )
 
     text = out.getvalue()
     assert "https://chatgpt.com/c/conv-123" in text
-    assert "latest frontier · High" in text
+    assert "latest frontier" in text
+    assert "effort: Medium" in text
 
 
 def test_renderer_answer_model_shows_observed_model_and_mismatch() -> None:

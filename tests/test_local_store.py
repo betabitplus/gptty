@@ -428,6 +428,14 @@ def test_existing_schema_v3_without_claim_table_is_upgraded_in_place(
             ).fetchone()
             is not None
         )
+        assert int(check.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
+        columns = {
+            row[1] for row in check.execute("PRAGMA table_info(local_sessions)").fetchall()
+        }
+        assert "reasoning_effort" in columns
+    upgraded = store.get_session("runtime-old")
+    assert upgraded is not None
+    assert upgraded["reasoning_effort"] is None
 
 
 def test_legacy_session_import_claim_is_atomic_across_concurrent_sessions(
@@ -639,3 +647,29 @@ def test_privacy_inventory_counts_event_only_archives(tmp_path: Path) -> None:
     inventory = store.privacy_inventory()
 
     assert inventory["archived_conversations"] == 1
+
+
+def test_local_session_reasoning_effort_participates_in_create_and_cas(tmp_path: Path) -> None:
+    store = LocalEventStore(tmp_path / "runs" / "local.sqlite3")
+    created = store.create_session(
+        "effort-session",
+        kind="explicit",
+        discovery_hint="explicit:effort",
+        current_conversation="conv-1",
+        model=None,
+        reasoning_effort="medium",
+    )
+    assert created["reasoning_effort"] == "medium"
+
+    revision = store.save_session(
+        "effort-session",
+        expected_revision=created["revision"],
+        current_conversation="conv-1",
+        model=None,
+        reasoning_effort="high",
+        goal_id=None,
+    )
+    reloaded = store.get_session("effort-session")
+    assert reloaded is not None
+    assert reloaded["revision"] == revision
+    assert reloaded["reasoning_effort"] == "high"

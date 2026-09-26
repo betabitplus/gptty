@@ -1311,6 +1311,7 @@ def test_command_registry_exposes_session_actions() -> None:
         "image",
         "paste",
         "model",
+        "effort",
         "exit",
     }
 

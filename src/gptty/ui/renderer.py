@@ -100,6 +100,7 @@ class PrettyRenderer:
         profile: str | None = None,
         conversation: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         temporary: bool = False,
     ) -> None:
         self._rule("ChatGPT", style="dim")
@@ -108,6 +109,8 @@ class PrettyRenderer:
             details.append(f"profile: {sanitize_terminal_text(profile)}")
         if model:
             details.append(f"model: {sanitize_terminal_text(model)}")
+        if effort:
+            details.append(f"effort: {sanitize_terminal_text(effort)}")
         if temporary:
             details.append("temporary chat")
         if details:

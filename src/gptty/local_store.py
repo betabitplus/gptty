@@ -11,7 +11,7 @@ from typing import Any
 from .file_lock import KernelFileLock
 from .profiles import profile_paths
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_FILENAME = "local-state.sqlite3"
 
 
@@ -350,7 +350,7 @@ class LocalEventStore:
             row = db.execute(
                 """
                 SELECT session_id, revision, kind, discovery_hint,
-                       current_conversation, model, goal_id,
+                       current_conversation, model, reasoning_effort, goal_id,
                        created_at_ms, last_seen_at_ms, imported_from
                 FROM local_sessions
                 WHERE session_id = ?
@@ -386,6 +386,7 @@ class LocalEventStore:
         discovery_hint: str | None,
         current_conversation: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         goal_id: str | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
         """Create one session while atomically claiming a legacy state source.
@@ -404,7 +405,7 @@ class LocalEventStore:
             existing = db.execute(
                 """
                 SELECT session_id, revision, kind, discovery_hint,
-                       current_conversation, model, goal_id,
+                       current_conversation, model, reasoning_effort, goal_id,
                        created_at_ms, last_seen_at_ms, imported_from
                 FROM local_sessions
                 WHERE session_id = ?
@@ -439,10 +440,10 @@ class LocalEventStore:
                 """
                 INSERT INTO local_sessions(
                     session_id, revision, kind, discovery_hint,
-                    current_conversation, model, goal_id,
+                    current_conversation, model, reasoning_effort, goal_id,
                     created_at_ms, last_seen_at_ms, imported_from
                 )
-                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -450,6 +451,7 @@ class LocalEventStore:
                     discovery_hint,
                     current_conversation,
                     model,
+                    reasoning_effort,
                     goal_id,
                     now_ms,
                     now_ms,
@@ -466,7 +468,7 @@ class LocalEventStore:
             row = db.execute(
                 """
                 SELECT session_id, revision, kind, discovery_hint,
-                       current_conversation, model, goal_id,
+                       current_conversation, model, reasoning_effort, goal_id,
                        created_at_ms, last_seen_at_ms, imported_from
                 FROM local_sessions
                 WHERE session_id = ?
@@ -487,6 +489,7 @@ class LocalEventStore:
         discovery_hint: str | None,
         current_conversation: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         goal_id: str | None = None,
         imported_from: str | None = None,
     ) -> dict[str, Any]:
@@ -497,10 +500,10 @@ class LocalEventStore:
                 """
                 INSERT OR IGNORE INTO local_sessions(
                     session_id, revision, kind, discovery_hint,
-                    current_conversation, model, goal_id,
+                    current_conversation, model, reasoning_effort, goal_id,
                     created_at_ms, last_seen_at_ms, imported_from
                 )
-                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -508,6 +511,7 @@ class LocalEventStore:
                     discovery_hint,
                     current_conversation,
                     model,
+                    reasoning_effort,
                     goal_id,
                     now_ms,
                     now_ms,
@@ -517,7 +521,7 @@ class LocalEventStore:
             row = db.execute(
                 """
                 SELECT session_id, revision, kind, discovery_hint,
-                       current_conversation, model, goal_id,
+                       current_conversation, model, reasoning_effort, goal_id,
                        created_at_ms, last_seen_at_ms, imported_from
                 FROM local_sessions
                 WHERE session_id = ?
@@ -537,6 +541,7 @@ class LocalEventStore:
         expected_revision: int,
         current_conversation: str | None,
         model: str | None,
+        reasoning_effort: str | None = None,
         goal_id: str | None,
         discovery_hint: str | None = None,
     ) -> int:
@@ -549,6 +554,7 @@ class LocalEventStore:
                 SET revision = revision + 1,
                     current_conversation = ?,
                     model = ?,
+                    reasoning_effort = ?,
                     goal_id = ?,
                     discovery_hint = COALESCE(?, discovery_hint),
                     last_seen_at_ms = ?
@@ -557,6 +563,7 @@ class LocalEventStore:
                 (
                     current_conversation,
                     model,
+                    reasoning_effort,
                     goal_id,
                     discovery_hint,
                     now_ms,
@@ -1102,6 +1109,7 @@ class LocalEventStore:
                     discovery_hint TEXT,
                     current_conversation TEXT,
                     model TEXT,
+                    reasoning_effort TEXT,
                     goal_id TEXT,
                     created_at_ms INTEGER NOT NULL,
                     last_seen_at_ms INTEGER NOT NULL,
@@ -1152,6 +1160,11 @@ class LocalEventStore:
                 );
                 """
             )
+            session_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(local_sessions)")
+            }
+            if "reasoning_effort" not in session_columns:
+                db.execute("ALTER TABLE local_sessions ADD COLUMN reasoning_effort TEXT")
             if current < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             db.commit()
@@ -1200,10 +1213,11 @@ class LocalEventStore:
             "discovery_hint": str(row[3]) if row[3] is not None else None,
             "current_conversation": str(row[4]) if row[4] is not None else None,
             "model": str(row[5]) if row[5] is not None else None,
-            "goal_id": str(row[6]) if row[6] is not None else None,
-            "created_at_ms": int(row[7]),
-            "last_seen_at_ms": int(row[8]),
-            "imported_from": str(row[9]) if row[9] is not None else None,
+            "reasoning_effort": str(row[6]) if row[6] is not None else None,
+            "goal_id": str(row[7]) if row[7] is not None else None,
+            "created_at_ms": int(row[8]),
+            "last_seen_at_ms": int(row[9]),
+            "imported_from": str(row[10]) if row[10] is not None else None,
         }
 
     @staticmethod

@@ -2118,3 +2118,47 @@ def test_send_forwards_machine_observed_tool_events_to_goal_journal_callback(tmp
     assert observed[1]["message_id"] == "call-1"
     assert observed[2]["message_kind"] == "tool_result"
     assert observed[2]["message_id"] == "result-1"
+
+
+def test_chat_effort_override_is_persisted_and_sent_on_every_turn(tmp_path) -> None:
+    FakeGpttyClient.instances.clear()
+
+    code = run_chat(
+        make_args(tmp_path, effort="medium", no_stream=True),
+        input_stream=StringIO("hello\n/exit\n"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+    )
+
+    assert code == 0
+    client = FakeGpttyClient.instances[0]
+    assert client.calls == [
+        (
+            "send",
+            ("hello",),
+            {"stream": False, "reasoning_effort": "medium"},
+        )
+    ]
+    assert _load_command_session(tmp_path).reasoning_effort == "medium"
+
+
+def test_chat_rejects_custom_model_plus_effort_before_client_creation(tmp_path) -> None:
+    FakeGpttyClient.instances.clear()
+    stderr = StringIO()
+
+    code = run_chat(
+        make_args(
+            tmp_path,
+            model="gpt-custom",
+            effort="high",
+            no_stream=True,
+        ),
+        input_stream=StringIO("/exit\n"),
+        client_factory=FakeGpttyClient,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert code == 2
+    assert FakeGpttyClient.instances == []
+    assert "explicit model" in stderr.getvalue()

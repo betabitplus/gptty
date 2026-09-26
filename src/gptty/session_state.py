@@ -56,6 +56,7 @@ class SessionStateHandle:
         return ChatState(
             current_conversation=_optional_str(row.get("current_conversation")),
             model=_optional_str(row.get("model")),
+            reasoning_effort=_optional_str(row.get("reasoning_effort")),
             goal_id=_optional_str(row.get("goal_id")),
             goal=self.legacy_goal,
         )
@@ -72,6 +73,7 @@ class SessionStateHandle:
                 expected_revision=self.revision,
                 current_conversation=state.current_conversation,
                 model=state.model,
+                reasoning_effort=state.reasoning_effort,
                 goal_id=goal_id,
                 discovery_hint=self.discovery_hint,
             )
@@ -106,6 +108,7 @@ class SessionStateHandle:
                     discovery_hint=self.discovery_hint,
                     current_conversation=seed_state.current_conversation,
                     model=seed_state.model,
+                    reasoning_effort=seed_state.reasoning_effort,
                     goal_id=goal_id,
                 )
                 if row is not None:
@@ -118,6 +121,7 @@ class SessionStateHandle:
             seed_state = ChatState(
                 current_conversation=_optional_str(default.get("current_conversation")),
                 model=_optional_str(default.get("model")),
+                reasoning_effort=_optional_str(default.get("reasoning_effort")),
                 goal_id=_optional_str(default.get("goal_id")),
             )
 
@@ -127,6 +131,7 @@ class SessionStateHandle:
             discovery_hint=self.discovery_hint,
             current_conversation=seed_state.current_conversation,
             model=seed_state.model,
+            reasoning_effort=seed_state.reasoning_effort,
             goal_id=seed_state.goal_id,
         )
         return row, legacy_goal
@@ -155,6 +160,7 @@ class SessionStateHandle:
                     discovery_hint=None,
                     current_conversation=seed.current_conversation,
                     model=seed.model,
+                    reasoning_effort=seed.reasoning_effort,
                     goal_id=goal_id,
                 )
                 if row is not None:

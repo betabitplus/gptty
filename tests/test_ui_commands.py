@@ -930,7 +930,15 @@ def test_temporary_command_clears_persistent_attachment_without_persisting_temp_
     assert state.current_conversation is None
     assert load_chat_state(state_path).current_conversation is None
     assert any(
-        event == ("header", {"model": "latest frontier · High", "temporary": True})
+        event
+        == (
+            "header",
+            {
+                "model": "latest frontier",
+                "effort": "Default · High",
+                "temporary": True,
+            },
+        )
         for event in renderer.events
     )
     assert commands.ui.history_persistent is False
@@ -1131,7 +1139,7 @@ def test_model_picker_excludes_non_chat_modes(tmp_path) -> None:
     assert client.calls == [("list_models", None)]
     _message, options = ui.seen[-1]
     values = [value for value, _label in options]
-    assert options[0][1].startswith("Default · latest frontier · High")
+    assert options[0][1].startswith("Default · latest frontier")
     assert "gpt-real-a" in values
     assert "gpt-real-b" in values
     assert "disabled" not in values
@@ -1152,7 +1160,7 @@ def test_model_picker_can_reset_to_default(tmp_path) -> None:
     assert client.calls == [("list_models", None)]
     assert state.model is None
     assert load_chat_state(state_path).model is None
-    assert renderer.events[-1] == ("info", "Model: latest frontier · High")
+    assert renderer.events[-1] == ("info", "Model: latest frontier")
 
 
 def test_model_default_is_local_only(tmp_path) -> None:
@@ -1164,7 +1172,7 @@ def test_model_default_is_local_only(tmp_path) -> None:
     assert client.calls == []
     assert state.model is None
     assert load_chat_state(state_path).model is None
-    assert renderer.events[-1] == ("info", "Model: latest frontier · High")
+    assert renderer.events[-1] == ("info", "Model: latest frontier")
 
 
 def test_model_rejects_slug_not_in_live_catalog(tmp_path) -> None:
@@ -2911,3 +2919,68 @@ def test_goal_doctor_and_trace_are_read_only_and_visible(tmp_path) -> None:
     assert any(message.startswith("Goal trace · ") for message in infos)
     assert any("goal_created" in message for message in infos)
     assert state.goal.revision == revision
+
+
+def test_effort_command_persists_independent_session_intent(tmp_path) -> None:
+    state = ChatState()
+    commands, renderer, client, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/effort medium")
+
+    assert client.calls == []
+    assert state.reasoning_effort == "medium"
+    assert load_chat_state(state_path).reasoning_effort == "medium"
+    assert renderer.events[-1] == ("info", "Effort: Medium")
+
+
+def test_effort_picker_can_reset_to_default(tmp_path) -> None:
+    state = ChatState(reasoning_effort="high")
+    commands, renderer, _, state_path = make_commands(
+        tmp_path,
+        state=state,
+        ui=FakeUI(choices=[""]),
+    )
+
+    commands.handle("/effort")
+
+    assert state.reasoning_effort is None
+    assert load_chat_state(state_path).reasoning_effort is None
+    assert renderer.events[-1] == ("info", "Effort: Default · High")
+
+
+def test_effort_async_picker_stays_in_enhanced_ui(tmp_path) -> None:
+    state = ChatState()
+    ui = FakeUI(choices=["instant"])
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state, ui=ui)
+
+    assert asyncio.run(commands.handle_async("/effort")) is None
+
+    assert ui.seen[-1][0] == "Reasoning effort"
+    assert state.reasoning_effort == "instant"
+    assert load_chat_state(state_path).reasoning_effort == "instant"
+    assert renderer.events[-1] == ("info", "Effort: Instant")
+
+
+def test_custom_model_and_explicit_effort_cannot_form_invalid_saved_state(tmp_path) -> None:
+    state = ChatState(model="gpt-real-a")
+    commands, renderer, _, state_path = make_commands(tmp_path, state=state)
+
+    commands.handle("/effort high")
+
+    assert state.model == "gpt-real-a"
+    assert state.reasoning_effort is None
+    assert renderer.events[-1][0] == "warning"
+    assert "explicit model" in renderer.events[-1][1]
+    assert load_chat_state(state_path) == ChatState()
+
+
+def test_model_override_is_rejected_while_explicit_effort_is_saved(tmp_path) -> None:
+    state = ChatState(reasoning_effort="medium")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle("/model gpt-real-b")
+
+    assert state.model is None
+    assert state.reasoning_effort == "medium"
+    assert renderer.events[-1][0] == "warning"
+    assert "explicit model" in renderer.events[-1][1]

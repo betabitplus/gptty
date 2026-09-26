@@ -143,3 +143,25 @@ def test_non_tty_does_not_inherit_ambient_terminal_identity(tmp_path) -> None:
     )
 
     assert resolved == base
+
+
+def test_reasoning_effort_round_trips_without_changing_legacy_default_shape(tmp_path) -> None:
+    path = tmp_path / "gptty_state.json"
+
+    save_chat_state(
+        path,
+        ChatState(
+            current_conversation="conv-effort",
+            model=None,
+            reasoning_effort="medium",
+        ),
+    )
+
+    loaded = load_chat_state(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert loaded.reasoning_effort == "medium"
+    assert payload["reasoning_effort"] == "medium"
+
+    save_chat_state(path, ChatState(current_conversation="conv-default"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "reasoning_effort" not in payload
