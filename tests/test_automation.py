@@ -5,6 +5,7 @@ from gptty.automation import (
     RUN_EVENT_CONTRACT,
     normalize_provider_event,
     run_event_envelope,
+    source_citation_bundle,
 )
 
 
@@ -96,3 +97,50 @@ def test_normalize_provider_source_and_citation_events_are_typed() -> None:
     assert citation["source_id"] == "source-1"
     assert citation["start_index"] == 12
     assert citation["end_index"] == 25
+    assert citation["range_coordinate_space"] == "unknown"
+
+
+def test_source_citation_bundle_deduplicates_and_drops_orphans() -> None:
+    source = normalize_provider_event(
+        {
+            "type": "product_source_observed",
+            "observation_id": "source-observation:1",
+            "source_id": "source-1",
+            "url": "https://example.com/article",
+            "title": "Article",
+        }
+    )
+    citation = normalize_provider_event(
+        {
+            "type": "product_citation_observed",
+            "observation_id": "citation-observation:1",
+            "citation_id": "citation-1",
+            "source_id": "source-1",
+            "start_index": 5000,
+            "end_index": 9000,
+        }
+    )
+    orphan = normalize_provider_event(
+        {
+            "type": "product_citation_observed",
+            "observation_id": "citation-observation:2",
+            "citation_id": "citation-2",
+            "source_id": "missing-source",
+            "start_index": 0,
+            "end_index": 1,
+        }
+    )
+
+    bundle = source_citation_bundle([source, source, citation, citation, orphan])
+
+    assert [item["source_id"] for item in bundle["sources"]] == ["source-1"]
+    assert [item["citation_id"] for item in bundle["citations"]] == ["citation-1"]
+    assert bundle["citations"][0]["range_coordinate_space"] == "unknown"
+    assert source_citation_bundle([source, citation], max_sources=0) == {
+        "sources": [],
+        "citations": [],
+    }
+    assert source_citation_bundle([source, citation], max_citations=0) == {
+        "sources": [source],
+        "citations": [],
+    }

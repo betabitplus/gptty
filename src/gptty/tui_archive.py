@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .automation import source_citation_bundle
 from .file_lock import KernelFileLock
+from .output import render_source_citations
 from .local_store import DB_FILENAME, LocalEventStore
 from .private_fs import PRIVATE_FILE_MODE, PRIVATE_MODES_SUPPORTED, atomic_write_private_text
 from .profiles import data_dir
@@ -188,6 +190,7 @@ class TUIArchive:
         title: str | None,
         model: str | None,
         status: str,
+        observations: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         conversation_id = self.bind_turn(turn_id, conversation_ref)
         event = {
@@ -203,8 +206,32 @@ class TUIArchive:
             "status": status,
             "conversation_id": conversation_id,
         }
+        if isinstance(observations, dict) and (
+            observations.get("sources") or observations.get("citations")
+        ):
+            event["observations"] = source_citation_bundle(
+                list(observations.get("sources") or ())
+                + list(observations.get("citations") or ())
+            )
         self._append_conversation_event(conversation_id, event)
         self._write_meta(conversation_id, title=title)
+
+    def source_citation_observations(
+        self, conversation_ref: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        conversation_id = _conversation_id(conversation_ref)
+        self._ensure_conversation_imported(conversation_id)
+        flattened: list[dict[str, Any]] = []
+        for event in self.store.tui_events(conversation_id):
+            observations = event.get("observations")
+            if not isinstance(observations, dict):
+                continue
+            for key in ("sources", "citations"):
+                values = observations.get(key)
+                if isinstance(values, list):
+                    flattened.extend(item for item in values if isinstance(item, dict))
+        return source_citation_bundle(flattened)
+
 
     def record_terminal(
         self,
@@ -509,6 +536,9 @@ class TUIArchive:
         if observed:
             lines.extend([f"_Observed: {observed}_", ""])
         lines.extend([str(event.get("text") or ""), ""])
+        sources = render_source_citations(event.get("observations"), "markdown")
+        if sources:
+            lines.extend([sources, ""])
         return "\n".join(lines) + "\n"
 
     @staticmethod

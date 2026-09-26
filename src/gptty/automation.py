@@ -223,7 +223,64 @@ def normalize_provider_event(event: Any) -> dict[str, Any] | None:
     conversation = payload.pop("conversationId", None)
     if "conversation_id" not in payload and isinstance(conversation, str):
         payload["conversation_id"] = conversation
+    if event_type == "product_citation_observed":
+        # CWA deliberately preserves product-provided numeric ranges but their
+        # Unicode coordinate space is not release-proven yet. Consumers must
+        # treat them as opaque metadata rather than slicing Python strings.
+        payload["range_coordinate_space"] = "unknown"
     return payload
+
+
+def source_citation_bundle(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None,
+    *,
+    max_sources: int = 64,
+    max_citations: int = 128,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return bounded typed source/citation observations without text inference."""
+
+    source_limit = max(0, int(max_sources))
+    citation_limit = max(0, int(max_citations))
+    if source_limit == 0:
+        return {"sources": [], "citations": []}
+
+    summary = summarize_observations(list(events or ()))
+    sources: list[dict[str, Any]] = []
+    citations: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    seen_citations: set[str] = set()
+
+    for item in summary["sources"]:
+        source_id = item.get("source_id")
+        if not isinstance(source_id, str) or not source_id or source_id in seen_sources:
+            continue
+        seen_sources.add(source_id)
+        sources.append(dict(item))
+        if len(sources) >= source_limit:
+            break
+
+    if citation_limit == 0:
+        return {"sources": sources, "citations": []}
+
+    for item in summary["citations"]:
+        citation_id = item.get("citation_id")
+        source_id = item.get("source_id")
+        if (
+            not isinstance(citation_id, str)
+            or not citation_id
+            or citation_id in seen_citations
+            or not isinstance(source_id, str)
+            or source_id not in seen_sources
+        ):
+            continue
+        seen_citations.add(citation_id)
+        record = dict(item)
+        record.setdefault("range_coordinate_space", "unknown")
+        citations.append(record)
+        if len(citations) >= citation_limit:
+            break
+
+    return {"sources": sources, "citations": citations}
 
 
 def _provider_event_kind(event_type: str, event: dict[str, Any]) -> str:

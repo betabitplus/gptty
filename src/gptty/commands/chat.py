@@ -18,6 +18,7 @@ from typing import Any, TextIO
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ..automation import normalize_provider_event, source_citation_bundle
 from ..codexpro_activity import CodexProActivitySnapshot, CodexProActivityTracker
 from ..stream_delivery import StreamDeliveryJournal
 from ..locks import (
@@ -3017,6 +3018,7 @@ def _send_chat_prompt(
         result_out.clear()
     saw_stream_token = False
     stream_tokens: list[str] = []
+    typed_source_events: list[dict[str, Any]] = []
     recorder: RunRecorder | None = None
     completed_successfully = False
     stopped_by_user = False
@@ -3063,6 +3065,12 @@ def _send_chat_prompt(
                     "final_text_seen": turn_health.answer_progress_seen,
                     "last_tool_error": turn_health.last_tool_error or None,
                 }
+        normalized_event = normalize_provider_event(event)
+        if (
+            normalized_event is not None
+            and normalized_event.get("kind") in {"source", "citation"}
+        ):
+            typed_source_events.append(normalized_event)
         if recorder is not None:
             recorder.provider_event(event)
         if (
@@ -3533,6 +3541,12 @@ def _send_chat_prompt(
                 recorder.event("token_delta", text=text)
             print(text, file=stdout)
 
+        source_observations = source_citation_bundle(typed_source_events)
+        if renderer is not None:
+            render_sources = getattr(renderer, "source_citations", None)
+            if callable(render_sources):
+                render_sources(source_observations)
+
         conversation_ref = extract_conversation_ref(response) or active_ref
         if (
             not is_temporary
@@ -3555,6 +3569,7 @@ def _send_chat_prompt(
                     title=response_title(response),
                     model=observed_model or sent_model or model,
                     status=archive_status,
+                    observations=source_observations,
                 )
                 if terminal_marker is not None:
                     tui_archive.record_terminal(

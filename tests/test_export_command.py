@@ -294,3 +294,41 @@ def test_save_markdown_export_never_overwrites_previous_export(tmp_path: Path) -
     assert second.name == "2026-09-05_19-20-30 - Same chat (2).md"
     assert "first" in first.read_text(encoding="utf-8")
     assert "second" in second.read_text(encoding="utf-8")
+
+
+def test_save_markdown_export_appends_typed_sources_without_using_citation_offsets(
+    tmp_path: Path,
+) -> None:
+    path = save_markdown_export(
+        [OutputMessage(role="assistant", text="answer")],
+        directory=tmp_path,
+        title="Sources",
+        now=datetime(2026, 9, 26, 10, 0, 0, tzinfo=timezone.utc),
+        observations={
+            "sources": [
+                {
+                    "kind": "source",
+                    "source_id": "source-1",
+                    "url": "https://example.com/source",
+                    "title": "Typed Source",
+                }
+            ],
+            "citations": [
+                {
+                    "kind": "citation",
+                    "citation_id": "citation-1",
+                    "source_id": "source-1",
+                    "start_index": 123456,
+                    "end_index": 234567,
+                    "range_coordinate_space": "unknown",
+                }
+            ],
+        },
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert "### Sources" in rendered
+    assert "Typed Source" in rendered
+    assert "https://example.com/source" in rendered
+    assert "123456" not in rendered
+    assert "234567" not in rendered

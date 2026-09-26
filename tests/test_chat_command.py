@@ -2162,3 +2162,100 @@ def test_chat_rejects_custom_model_plus_effort_before_client_creation(tmp_path) 
     assert code == 2
     assert FakeGpttyClient.instances == []
     assert "explicit model" in stderr.getvalue()
+
+
+def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_path) -> None:
+    conversation_ref = "conv-sources-1234"
+
+    class SourceClient:
+        def send_to_conversation(self, ref, prompt, **options):
+            assert ref == conversation_ref
+            on_event = options.get("on_event")
+            assert callable(on_event)
+            on_event(
+                {
+                    "type": "product_source_observed",
+                    "observation_schema": 1,
+                    "observation_id": "source-observation:1",
+                    "source_id": "source-1",
+                    "url": "https://example.com/source",
+                    "title": "Typed Source",
+                    "domain": "example.com",
+                }
+            )
+            on_event(
+                {
+                    "type": "product_citation_observed",
+                    "observation_schema": 1,
+                    "observation_id": "citation-observation:1",
+                    "citation_id": "citation-1",
+                    "source_id": "source-1",
+                    "start_index": 500000,
+                    "end_index": 500100,
+                    "reference_type": "webpage",
+                }
+            )
+            return Response(text="answer", conversation_id=ref, title="Sources")
+
+    class SourceRenderer:
+        def __init__(self) -> None:
+            self.sources = None
+
+        def answer(self, text):
+            assert text == "answer"
+
+        def info(self, text):
+            return None
+
+        def live_event(self, event):
+            return None
+
+        def turn_abort(self):
+            return None
+
+        def turn_marker(self, *marker):
+            return None
+
+        def warning(self, text):
+            raise AssertionError(text)
+
+        def source_citations(self, observations):
+            self.sources = observations
+
+        def chat_link(self, ref):
+            assert ref == conversation_ref
+
+    state_path = tmp_path / "state.json"
+    state = ChatState(current_conversation=conversation_ref)
+    save_chat_state(state_path, state)
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "question",
+        conversation_ref=conversation_ref,
+        model=None,
+    )
+    renderer = SourceRenderer()
+
+    code = _send_chat_prompt(
+        SourceClient(),
+        state=state,
+        state_path=state_path,
+        profile=None,
+        prompt="question",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=renderer,
+        tui_archive=archive,
+        archive_turn_id=turn_id,
+    )
+
+    assert code == 0
+    assert renderer.sources is not None
+    assert [item["source_id"] for item in renderer.sources["sources"]] == ["source-1"]
+    assert renderer.sources["citations"][0]["range_coordinate_space"] == "unknown"
+    persisted = archive.source_citation_observations(conversation_ref)
+    assert [item["source_id"] for item in persisted["sources"]] == ["source-1"]
+    assert [item["citation_id"] for item in persisted["citations"]] == ["citation-1"]

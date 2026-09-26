@@ -12,6 +12,7 @@ from gptty.output import (
     render_live_event,
     render_messages,
     render_response,
+    render_source_citations,
     render_status,
 )
 
@@ -342,3 +343,37 @@ def test_normalize_turn_failure_redacts_diagnostics_and_preserves_typed_flags() 
     assert sensitive not in result["diagnostic_error"]
     assert "[REDACTED]" in result["error"]["message"]
     assert "[REDACTED]" in result["diagnostic_error"]
+
+
+def test_render_source_citations_never_interprets_opaque_ranges() -> None:
+    observations = {
+        "sources": [
+            {
+                "kind": "source",
+                "source_id": "source-1",
+                "url": "https://example.com/article",
+                "title": "Article [one]",
+                "domain": "example.com",
+            }
+        ],
+        "citations": [
+            {
+                "kind": "citation",
+                "citation_id": "citation-1",
+                "source_id": "source-1",
+                "start_index": 999999,
+                "end_index": 1000000,
+                "range_coordinate_space": "unknown",
+            }
+        ],
+    }
+
+    plain = render_source_citations(observations, "plain")
+    markdown = render_source_citations(observations, "markdown")
+
+    assert plain == "Sources:\n1. Article [one] · cited 1× — https://example.com/article"
+    assert "### Sources" in markdown
+    assert r"Article \[one\]" in markdown
+    assert "https://example.com/article" in markdown
+    assert "999999" not in markdown
+    assert "1000000" not in markdown

@@ -2984,3 +2984,55 @@ def test_model_override_is_rejected_while_explicit_effort_is_saved(tmp_path) -> 
     assert state.reasoning_effort == "medium"
     assert renderer.events[-1][0] == "warning"
     assert "explicit model" in renderer.events[-1][1]
+
+
+def test_normal_export_passes_persisted_typed_sources_to_markdown_exporter(
+    tmp_path, monkeypatch
+) -> None:
+    ref = "conv-sources-1234"
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user("question", conversation_ref=ref, model=None)
+    archive.record_assistant(
+        turn_id,
+        conversation_ref=ref,
+        text="answer",
+        title="Sources",
+        model=None,
+        status="complete",
+        observations={
+            "sources": [
+                {
+                    "kind": "source",
+                    "source_id": "source-1",
+                    "url": "https://example.com/source",
+                    "title": "Typed Source",
+                }
+            ],
+            "citations": [],
+        },
+    )
+    state = ChatState(current_conversation=ref)
+    commands, renderer, client, _ = make_commands(
+        tmp_path,
+        state=state,
+        tui_archive=archive,
+    )
+    exported: list[dict[str, object]] = []
+    export_path = tmp_path / "normal-with-sources.md"
+
+    def fake_export(messages, *, title=None, observations=None):
+        exported.append(
+            {
+                "messages": list(messages),
+                "title": title,
+                "observations": observations,
+            }
+        )
+        return export_path
+
+    monkeypatch.setattr("gptty.ui.commands.save_markdown_export", fake_export)
+    commands.handle("/export")
+
+    assert ("get_messages", ref) in client.calls
+    assert exported[0]["observations"]["sources"][0]["source_id"] == "source-1"
+    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")

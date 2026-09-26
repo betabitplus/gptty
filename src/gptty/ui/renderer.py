@@ -12,7 +12,13 @@ from rich.rule import Rule
 from rich.style import Style
 from rich.text import Text
 
-from ..output import OutputMessage, RevisionTextState, _tool_result_error, render_tool_call_parts
+from ..output import (
+    OutputMessage,
+    RevisionTextState,
+    _tool_result_error,
+    render_source_citations,
+    render_tool_call_parts,
+)
 from .state import UISettings
 from .terminal_safety import sanitize_terminal_text
 
@@ -119,6 +125,13 @@ class PrettyRenderer:
             self.chat_link(conversation)
         if details or conversation:
             self.console.print()
+
+    def source_citations(self, observations: dict[str, Any] | None) -> None:
+        rendered = render_source_citations(observations, "markdown")
+        if not rendered:
+            return
+        self._markdown(rendered)
+        self.console.print()
 
     def chat_link(self, conversation: str) -> None:
         url = _conversation_url(conversation)

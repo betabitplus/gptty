@@ -2017,11 +2017,17 @@ class InteractiveCommands:
             else self._conversation_titles.get(ref)
         )
         try:
+            observations = None
             if self._conversation_mode == "temporary":
                 messages = list(self._temporary_messages)
             else:
                 messages = normalize_messages(self.get_client().get_messages(ref))
-            path = save_markdown_export(messages, title=title)
+                if self.tui_archive is not None:
+                    observations = self.tui_archive.source_citation_observations(ref)
+            export_options: dict[str, Any] = {"title": title}
+            if isinstance(observations, dict) and observations.get("sources"):
+                export_options["observations"] = observations
+            path = save_markdown_export(messages, **export_options)
         except Exception as exc:  # noqa: BLE001 - interactive export boundary.
             self.renderer.warning(f"Export failed: {exc}")
             return

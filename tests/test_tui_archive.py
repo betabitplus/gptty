@@ -599,3 +599,66 @@ def test_archive_prune_removes_event_only_conversation_from_db_and_projection(
     assert removed == 1
     assert not directory.exists()
     assert archive.store.tui_events(conversation_id) == []
+
+
+def test_source_citation_observations_survive_restart_and_project_markdown(tmp_path) -> None:
+    root = tmp_path / "archive"
+    archive = TUIArchive(root)
+    turn_id = archive.record_user(
+        "question",
+        conversation_ref="conv-12345678",
+        model=None,
+    )
+    observations = {
+        "sources": [
+            {
+                "kind": "source",
+                "source_id": "source-1",
+                "url": "https://example.com/article",
+                "title": "Example Article",
+                "domain": "example.com",
+            }
+        ],
+        "citations": [
+            {
+                "kind": "citation",
+                "citation_id": "citation-1",
+                "source_id": "source-1",
+                "start_index": 999999,
+                "end_index": 1000000,
+                "range_coordinate_space": "unknown",
+            }
+        ],
+    }
+    archive.record_assistant(
+        turn_id,
+        conversation_ref="conv-12345678",
+        text="answer",
+        title="Sources Test",
+        model="gpt-test",
+        status="complete",
+        observations=observations,
+    )
+
+    events = archive.store.tui_events("conv-12345678")
+    assistant = next(event for event in events if event.get("role") == "assistant")
+    assert assistant["observations"]["sources"][0]["source_id"] == "source-1"
+    assert (
+        assistant["observations"]["citations"][0]["range_coordinate_space"]
+        == "unknown"
+    )
+
+    transcript = archive.conversation_paths("conv-12345678")["transcript"].read_text(
+        encoding="utf-8"
+    )
+    assert "### Sources" in transcript
+    assert "Example Article" in transcript
+    assert "https://example.com/article" in transcript
+    assert "999999" not in transcript
+    assert "1000000" not in transcript
+
+    restarted = TUIArchive(root, db_path=archive.store.db_path)
+    restored = restarted.source_citation_observations("conv-12345678")
+    assert [item["source_id"] for item in restored["sources"]] == ["source-1"]
+    assert [item["citation_id"] for item in restored["citations"]] == ["citation-1"]
+    assert restored["citations"][0]["range_coordinate_space"] == "unknown"

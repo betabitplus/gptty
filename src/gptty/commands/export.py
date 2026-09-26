@@ -7,10 +7,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
 
-from ..output import OutputFormat, OutputMessage, normalize_messages, render_messages
+from ..local_store import local_store_path
+from ..output import (
+    OutputFormat,
+    OutputMessage,
+    normalize_messages,
+    render_messages,
+    render_source_citations,
+)
 from ..private_fs import atomic_write_private_text, create_private_text, ensure_private_dir
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError
+from ..tui_archive import TUIArchive
 from ._client import build_client
 from ._session import resolve_attached_conversation
 
@@ -52,7 +60,13 @@ def run_export(
         return 1
 
     output_format: OutputFormat = getattr(args, "format", "markdown")
-    rendered = render_messages(normalize_messages(response), output_format)
+    messages = normalize_messages(response)
+    rendered = render_messages(messages, output_format)
+    observations = _local_source_citations(args, conversation_ref)
+    if output_format in {"plain", "markdown"}:
+        source_block = render_source_citations(observations, output_format)
+        if source_block:
+            rendered = rendered.rstrip() + "\n\n" + source_block
     output_path = getattr(args, "output", None)
     if output_path:
         return write_export(
@@ -103,6 +117,7 @@ def save_markdown_export(
     directory: str | Path | None = None,
     title: str | None = None,
     now: datetime | None = None,
+    observations: dict[str, Any] | None = None,
 ) -> Path:
     if directory is None:
         root = ensure_private_dir(DEFAULT_EXPORT_DIRECTORY)
@@ -111,7 +126,11 @@ def save_markdown_export(
         root.mkdir(parents=True, exist_ok=True)
     timestamp = (now or datetime.now().astimezone()).strftime("%Y-%m-%d_%H-%M-%S")
     stem = _export_filename_stem(title)
-    payload = render_messages(messages, "markdown") + "\n"
+    payload = render_messages(messages, "markdown").rstrip()
+    source_block = render_source_citations(observations, "markdown")
+    if source_block:
+        payload += "\n\n" + source_block
+    payload += "\n"
     suffix = 1
     while True:
         label = "" if suffix == 1 else f" ({suffix})"
@@ -122,6 +141,25 @@ def save_markdown_export(
             suffix += 1
             continue
         return candidate.resolve()
+
+
+def _local_source_citations(
+    args: Any,
+    conversation_ref: str,
+) -> dict[str, list[dict[str, Any]]] | None:
+    state_path = getattr(args, "state", None) or "gptty_state.json"
+    try:
+        archive = TUIArchive(
+            db_path=local_store_path(
+                profile=getattr(args, "profile", None),
+                state_path=state_path,
+            ),
+            reconcile_pending=False,
+        )
+        observations = archive.source_citation_observations(conversation_ref)
+    except Exception:
+        return None
+    return observations if observations.get("sources") else None
 
 
 def _export_filename_stem(title: str | None) -> str:

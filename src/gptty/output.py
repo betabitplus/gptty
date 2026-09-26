@@ -92,6 +92,68 @@ def render_messages(messages: list[OutputMessage], output_format: OutputFormat =
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
+def render_source_citations(
+    observations: dict[str, Any] | None,
+    output_format: OutputFormat = "plain",
+) -> str:
+    """Render typed source observations without interpreting citation offsets."""
+
+    if not isinstance(observations, dict):
+        return ""
+    raw_sources = observations.get("sources")
+    if not isinstance(raw_sources, list):
+        return ""
+    sources = [item for item in raw_sources if isinstance(item, dict)]
+    if not sources:
+        return ""
+
+    citation_counts: dict[str, int] = {}
+    raw_citations = observations.get("citations")
+    if isinstance(raw_citations, list):
+        for citation in raw_citations:
+            if not isinstance(citation, dict):
+                continue
+            source_id = citation.get("source_id")
+            if isinstance(source_id, str) and source_id:
+                citation_counts[source_id] = citation_counts.get(source_id, 0) + 1
+
+    if output_format == "plain":
+        lines = ["Sources:"]
+        for index, source in enumerate(sources, 1):
+            label = _source_label(source)
+            url = str(source.get("url") or "").strip()
+            count = citation_counts.get(str(source.get("source_id") or ""), 0)
+            cited = f" · cited {count}×" if count else ""
+            lines.append(f"{index}. {label}{cited}" + (f" — {url}" if url else ""))
+        return "\n".join(lines)
+    if output_format == "markdown":
+        lines = ["### Sources", ""]
+        for index, source in enumerate(sources, 1):
+            label = _markdown_inline(_source_label(source))
+            url = str(source.get("url") or "").strip()
+            count = citation_counts.get(str(source.get("source_id") or ""), 0)
+            cited = f" · cited {count}×" if count else ""
+            lines.append(f"{index}. {label}{cited}" + (f" — <{url}>" if url else ""))
+        return "\n".join(lines)
+    if output_format == "json":
+        return _json_dump({"sources": sources, "citations": observations.get("citations", [])})
+    raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def _source_label(source: dict[str, Any]) -> str:
+    title = str(source.get("title") or "").strip()
+    domain = str(source.get("domain") or "").strip()
+    attribution = str(source.get("attribution") or "").strip()
+    return title or attribution or domain or str(source.get("source_id") or "source")
+
+
+def _markdown_inline(value: str) -> str:
+    escaped = value.replace("\\", "\\\\")
+    for char in ("`", "*", "_", "[", "]", "<", ">"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
+
+
 def normalize_status(response: Any, *, conversation: str | None = None) -> dict[str, Any]:
     if isinstance(response, str):
         data: dict[str, Any] = {"status": response}
