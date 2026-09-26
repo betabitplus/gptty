@@ -6,6 +6,11 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+## 0.1.2 - 2026-09-26
+
+- release dependencies: require `chatgpt-web-adapter>=0.3.2,<0.4.0` and `chatgpt-conversation-exporter>=0.1.0,<0.2.0` so the installed package contains the exact CWA visible-graph contract and companion exporter used by persistent `gptty export`
+- product parity: expose independent reasoning effort, general-file attachments, typed source/citation evidence and connector/required-action lifecycle observations while keeping connector approval fail-closed to ChatGPT web
+- export/context: delegate persistent exports to the canonical-visible-graph companion artifact, preserve exact product message identity for reconciliation, and keep Temporary export explicitly local/in-memory and reduced-scope
 - auth privacy: delegate reusable auth persistence/loading/migration/logout to CWA, prefer the OS credential store through the auth extra's `keyring` dependency, retain an explicit owner-only file fallback, stop persisting transient proof/turnstile material, expose backend provenance in `auth status`, and add `auth migrate`, `auth logout`, plus `--credential-store` on refresh
 - privacy/notifications: use generic completion notifications by default, make response/title preview explicit opt-in and always suppress it for Temporary Chat, allow notifications and sound to be disabled, and dispatch through a bounded non-blocking worker
 - privacy: make interactive prompt history owner-only and bounded, keep Temporary Chat prompts memory-only and remove them from normal in-process history when Temporary mode ends, and add `/history clear` plus configurable `history_limit`
@@ -21,7 +26,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 - diagnostics: move stream-delivery evidence into the shared transactional store, import legacy rotated JSONL evidence once, and replace multiprocess-unsafe rename rotation with a bounded lock-serialized support projection
 - performance: tail the optional CodexPro activity journal incrementally by file identity and offset, recover from truncation/rotation, and cap the in-memory activity window instead of reparsing all history on every refresh
 - concurrency: replace conversation stale-file/PID lock recovery with the same kernel-backed ownership model used by Goal runs; retained sidecars are diagnostic only and `observe` probes the kernel lock rather than file existence
-- packaging: require `chatgpt-web-adapter>=0.3.1,<0.4.0`, the first exact CWA release candidate verified against the current gptty browser-authority/WK runtime contract
+- packaging: require `chatgpt-web-adapter>=0.3.2,<0.4.0` plus `chatgpt-conversation-exporter>=0.1.0,<0.2.0`, the exact staged release train verified against the current browser-authority/WK and canonical-visible-graph contracts
 - feat: add profile-aware auth/state path resolution with `gptty profile` commands
 - feat: add local conversation locks for `gptty send` and `gptty chat`
 - feat: add `gptty observe` for local active run status and recent output

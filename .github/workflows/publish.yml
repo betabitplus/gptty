@@ -4,33 +4,40 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. gptty-web-v0.1.2"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  id-token: write
+
+concurrency:
+  group: publish-gptty-web
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
     environment: pypi
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-
-      - name: Install build tools
+      - name: Build and verify tagged candidate
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install build twine
-
-      - name: Build package
-        run: |
           python -m build
           python -m twine check dist/*
-
+          python tools/release_gate.py --dist-dir dist --tag "$RELEASE_TAG"
+          python tools/installed_wheel_smoke.py --wheel-dir dist --expected-version 0.1.2
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
