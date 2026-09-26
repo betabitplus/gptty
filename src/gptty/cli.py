@@ -512,7 +512,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     export_parser = subparsers.add_parser(
         "export",
-        help="Export messages from an explicit or attached ChatGPT conversation.",
+        help="Export the complete canonical-visible conversation graph.",
+        description=(
+            "Export a complete canonical-visible graph artifact. Persistent export "
+            "requires the companion chatgpt-export-one executable (or "
+            "GPTTY_EXPORTER_COMMAND)."
+        ),
     )
     export_parser.add_argument(
         "url_or_id",
@@ -523,20 +528,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--last",
         type=int,
         default=None,
-        help="Limit export to the last N messages when supported by the SDK.",
+        help=(
+            "Not supported for visible-graph artifacts; accepted for compatibility "
+            "so gptty can direct you to gptty messages --last N."
+        ),
     )
     export_parser.add_argument(
         "--output",
         default=None,
-        help="Write export to a file instead of stdout.",
+        help=(
+            "Write a Markdown visible-graph bundle; .context.json and "
+            ".manifest.json sidecars are written beside it."
+        ),
     )
     export_parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite --output if it already exists.",
+        help="Replace the complete --output artifact bundle if it exists.",
+    )
+    export_parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+        help="Print Markdown or the visible-graph context JSON when --output is omitted.",
     )
     _add_session_options(export_parser)
-    _add_output_format_option(export_parser, default="markdown")
 
     return parser
 

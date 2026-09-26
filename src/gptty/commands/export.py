@@ -3,23 +3,21 @@ from __future__ import annotations
 from datetime import datetime
 import re
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
 
-from ..local_store import local_store_path
+from ..exporter_bridge import ExporterBridgeError, export_persistent_conversation
 from ..output import (
     OutputFormat,
     OutputMessage,
-    normalize_messages,
     render_messages,
     render_source_citations,
 )
-from ..private_fs import atomic_write_private_text, create_private_text, ensure_private_dir
+from ..private_fs import create_private_text, ensure_private_dir
 from ..sdk_client import GpttyClient
 from ..session_state import SessionStateError
-from ..tui_archive import TUIArchive
-from ._client import build_client
 from ._session import resolve_attached_conversation
 
 NO_CONVERSATION_ERROR = (
@@ -37,6 +35,9 @@ def run_export(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
+    # Retained in the signature for test/backward compatibility; persistent export
+    # is now delegated to chatgpt-exporter rather than the current-branch SDK reader.
+    _ = client_factory
     try:
         conversation_ref = resolve_conversation_ref(args, stderr=stderr)
     except SessionStateError as exc:
@@ -47,37 +48,81 @@ def run_export(
         print(NO_CONVERSATION_ERROR, file=stderr)
         return 2
 
-    client = build_client(client_factory, args)
-    options: dict[str, Any] = {}
-    last = getattr(args, "last", None)
-    if last is not None:
-        options["limit"] = int(last)
-
-    try:
-        response = client.get_messages(conversation_ref, **options)
-    except Exception as exc:
-        print(f"gptty: export request failed: {exc}", file=stderr)
-        return 1
+    if getattr(args, "last", None) is not None:
+        print(
+            "gptty: persistent export is a complete visible-graph artifact; "
+            "use `gptty messages --last N` for a current-branch slice.",
+            file=stderr,
+        )
+        return 2
 
     output_format: OutputFormat = getattr(args, "format", "markdown")
-    messages = normalize_messages(response)
-    rendered = render_messages(messages, output_format)
-    observations = _local_source_citations(args, conversation_ref)
-    if output_format in {"plain", "markdown"}:
-        source_block = render_source_citations(observations, output_format)
-        if source_block:
-            rendered = rendered.rstrip() + "\n\n" + source_block
-    output_path = getattr(args, "output", None)
-    if output_path:
-        return write_export(
-            output_path,
-            rendered,
-            overwrite=bool(getattr(args, "overwrite", False)),
-            stderr=stderr,
+    if output_format == "plain":
+        print(
+            "gptty: plain output is a current-branch projection, not a visible-graph "
+            "artifact; use `gptty messages --format plain` instead.",
+            file=stderr,
         )
+        return 2
 
-    print(rendered, file=stdout)
-    return 0
+    requested_output = getattr(args, "output", None)
+    if requested_output and output_format != "markdown":
+        print(
+            "gptty: persistent file export writes a Markdown visible-graph bundle; "
+            "use --format json without --output to print its context sidecar.",
+            file=stderr,
+        )
+        return 2
+
+    try:
+        if requested_output:
+            markdown_path = _persistent_markdown_path(requested_output)
+            reserved = False
+            if not bool(getattr(args, "overwrite", False)):
+                collision = reserve_persistent_bundle(markdown_path)
+                if collision is not None:
+                    print(
+                        f"gptty: export artifact already exists: {collision}. "
+                        "Use --overwrite to replace the bundle.",
+                        file=stderr,
+                    )
+                    return 1
+                reserved = True
+            try:
+                export_persistent_conversation(
+                    conversation_ref,
+                    markdown_path,
+                    auth_file=getattr(args, "auth", None),
+                    timeout=float(getattr(args, "timeout", 120)),
+                )
+            except Exception:
+                if reserved:
+                    cleanup_persistent_bundle(markdown_path)
+                raise
+            return 0
+
+        with tempfile.TemporaryDirectory(prefix="gptty-export-") as temporary:
+            markdown_path = Path(temporary) / "conversation.md"
+            artifact = export_persistent_conversation(
+                conversation_ref,
+                markdown_path,
+                auth_file=getattr(args, "auth", None),
+                timeout=float(getattr(args, "timeout", 120)),
+            )
+            selected = (
+                artifact.markdown_path
+                if output_format == "markdown"
+                else artifact.context_path
+            )
+            rendered = selected.read_text(encoding="utf-8").rstrip("\n")
+            print(rendered, file=stdout)
+            return 0
+    except ExporterBridgeError as exc:
+        print(f"gptty: export failed: {exc}", file=stderr)
+        return 1
+    except OSError as exc:
+        print(f"gptty: failed to read/write export artifact: {exc}", file=stderr)
+        return 1
 
 
 def resolve_conversation_ref(
@@ -92,23 +137,55 @@ def resolve_conversation_ref(
     )
 
 
-def write_export(output_path: str | Path, content: str, *, overwrite: bool, stderr: TextIO) -> int:
-    path = Path(output_path)
-    payload = content + "\n"
+def _persistent_markdown_path(output_path: str | Path) -> Path:
+    path = Path(output_path).expanduser()
+    if path.suffix.lower() != ".md":
+        path = path.with_suffix(".md")
+    return path
 
-    try:
-        if overwrite:
-            atomic_write_private_text(path, payload)
-        else:
-            create_private_text(path, payload)
-    except FileExistsError:
-        print(f"gptty: output file already exists: {path}. Use --overwrite to replace it.", file=stderr)
-        return 1
-    except OSError as exc:
-        print(f"gptty: failed to write export to {path}: {exc}", file=stderr)
-        return 1
 
-    return 0
+def _bundle_paths(markdown_path: Path) -> tuple[Path, Path, Path]:
+    return (
+        markdown_path,
+        markdown_path.with_suffix(".context.json"),
+        markdown_path.with_suffix(".manifest.json"),
+    )
+
+
+def reserve_persistent_bundle(markdown_path: Path) -> Path | None:
+    created: list[Path] = []
+    for candidate in _bundle_paths(markdown_path):
+        try:
+            create_private_text(candidate, "")
+        except FileExistsError:
+            for reserved in created:
+                reserved.unlink(missing_ok=True)
+            return candidate
+        created.append(candidate)
+    return None
+
+
+def cleanup_persistent_bundle(markdown_path: Path) -> None:
+    for candidate in _bundle_paths(markdown_path):
+        candidate.unlink(missing_ok=True)
+
+
+def reserve_default_persistent_export_path(
+    *,
+    title: str | None = None,
+    now: datetime | None = None,
+    directory: str | Path | None = None,
+) -> Path:
+    root = ensure_private_dir(directory or DEFAULT_EXPORT_DIRECTORY)
+    timestamp = (now or datetime.now().astimezone()).strftime("%Y-%m-%d_%H-%M-%S")
+    stem = _export_filename_stem(title)
+    suffix = 1
+    while True:
+        label = "" if suffix == 1 else f" ({suffix})"
+        candidate = root / f"{timestamp} - {stem}{label}.md"
+        if reserve_persistent_bundle(candidate) is None:
+            return candidate.resolve()
+        suffix += 1
 
 
 def save_markdown_export(
@@ -118,6 +195,8 @@ def save_markdown_export(
     title: str | None = None,
     now: datetime | None = None,
     observations: dict[str, Any] | None = None,
+    artifact_scope: str | None = None,
+    artifact_provenance: str | None = None,
 ) -> Path:
     if directory is None:
         root = ensure_private_dir(DEFAULT_EXPORT_DIRECTORY)
@@ -127,6 +206,13 @@ def save_markdown_export(
     timestamp = (now or datetime.now().astimezone()).strftime("%Y-%m-%d_%H-%M-%S")
     stem = _export_filename_stem(title)
     payload = render_messages(messages, "markdown").rstrip()
+    if artifact_scope or artifact_provenance:
+        metadata: list[str] = []
+        if artifact_scope:
+            metadata.append(f"> Export scope: `{artifact_scope}`")
+        if artifact_provenance:
+            metadata.append(f"> Provenance: `{artifact_provenance}`")
+        payload = "\n".join(metadata) + "\n\n" + payload
     source_block = render_source_citations(observations, "markdown")
     if source_block:
         payload += "\n\n" + source_block
@@ -141,25 +227,6 @@ def save_markdown_export(
             suffix += 1
             continue
         return candidate.resolve()
-
-
-def _local_source_citations(
-    args: Any,
-    conversation_ref: str,
-) -> dict[str, list[dict[str, Any]]] | None:
-    state_path = getattr(args, "state", None) or "gptty_state.json"
-    try:
-        archive = TUIArchive(
-            db_path=local_store_path(
-                profile=getattr(args, "profile", None),
-                state_path=state_path,
-            ),
-            reconcile_pending=False,
-        )
-        observations = archive.source_citation_observations(conversation_ref)
-    except Exception:
-        return None
-    return observations if observations.get("sources") else None
 
 
 def _export_filename_stem(title: str | None) -> str:

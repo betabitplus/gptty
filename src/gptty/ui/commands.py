@@ -20,7 +20,12 @@ from ..automation import (
     REQUIRED_ACTION_PROVIDER_EVENT_TYPES,
     normalize_provider_event,
 )
-from ..commands.export import save_markdown_export
+from ..commands.export import (
+    cleanup_persistent_bundle,
+    reserve_default_persistent_export_path,
+    save_markdown_export,
+)
+from ..exporter_bridge import ExporterBridgeError, export_persistent_conversation
 from ..goal import (
     MAX_PROTOCOL_FAILURES,
     MAX_RECOVERY_ATTEMPTS,
@@ -2103,22 +2108,40 @@ class InteractiveCommands:
             if self._conversation_mode == "temporary"
             else self._conversation_titles.get(ref)
         )
+
+        if self._conversation_mode == "temporary":
+            try:
+                path = save_markdown_export(
+                    list(self._temporary_messages),
+                    title=title,
+                    artifact_scope="temporary_in_memory_current_branch",
+                    artifact_provenance="gptty_temporary_transcript",
+                )
+            except Exception as exc:  # noqa: BLE001 - interactive export boundary.
+                self.renderer.warning(f"Export failed: {exc}")
+                return
+            self.renderer.info(f"Exported Temporary Markdown: {path}")
+            return
+
+        reserved_path: Path | None = None
         try:
-            observations = None
-            if self._conversation_mode == "temporary":
-                messages = list(self._temporary_messages)
-            else:
-                messages = normalize_messages(self.get_client().get_messages(ref))
-                if self.tui_archive is not None:
-                    observations = self.tui_archive.source_citation_observations(ref)
-            export_options: dict[str, Any] = {"title": title}
-            if isinstance(observations, dict) and observations.get("sources"):
-                export_options["observations"] = observations
-            path = save_markdown_export(messages, **export_options)
-        except Exception as exc:  # noqa: BLE001 - interactive export boundary.
+            reserved_path = reserve_default_persistent_export_path(title=title)
+            client = self.get_client()
+            artifact = export_persistent_conversation(
+                ref,
+                reserved_path,
+                auth_file=getattr(client, "auth_file", None),
+                timeout=float(getattr(client, "timeout", 120)),
+            )
+        except (ExporterBridgeError, OSError) as exc:
+            if reserved_path is not None:
+                cleanup_persistent_bundle(reserved_path)
             self.renderer.warning(f"Export failed: {exc}")
             return
-        self.renderer.info(f"Exported Markdown: {path}")
+        self.renderer.info(
+            "Exported visible-graph artifact: "
+            f"{artifact.markdown_path} · manifest: {artifact.manifest_path}"
+        )
 
     def _request_stop_generation(
         self,

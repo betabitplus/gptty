@@ -11,7 +11,10 @@ from ..tui_archive import TUIArchive, archive_root
 from .export import DEFAULT_EXPORT_DIRECTORY
 
 _GENERATED_EXPORT_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2} - .+\.md$"
+    r"^(?P<stem>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2} - .+)\.md$"
+)
+_GENERATED_EXPORT_SIDECAR_RE = re.compile(
+    r"^(?P<stem>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2} - .+)\.(?:context|manifest)\.json$"
 )
 
 
@@ -29,16 +32,31 @@ def _run_root(args: Any) -> Path:
     )
 
 
-def _generated_exports() -> list[Path]:
+def _generated_export_bundles() -> list[tuple[Path, ...]]:
     root = DEFAULT_EXPORT_DIRECTORY
     if not root.is_dir():
         return []
-    result: list[Path] = []
+    grouped: dict[str, set[Path]] = {}
     for path in root.iterdir():
         if path.is_symlink() or not path.is_file():
             continue
-        if _GENERATED_EXPORT_RE.match(path.name):
-            result.append(path)
+        match = _GENERATED_EXPORT_RE.match(path.name)
+        if match is None:
+            match = _GENERATED_EXPORT_SIDECAR_RE.match(path.name)
+        if match is None:
+            continue
+        grouped.setdefault(match.group("stem"), set()).add(path)
+    return [
+        tuple(sorted(paths, key=lambda item: item.name))
+        for _, paths in sorted(grouped.items())
+    ]
+
+
+def _generated_exports() -> list[Path]:
+    result: list[Path] = []
+    for bundle in _generated_export_bundles():
+        markdown = next((path for path in bundle if path.suffix == ".md"), None)
+        result.append(markdown or bundle[0])
     return result
 
 
@@ -90,18 +108,21 @@ def _remove_run_projections(root: Path, run_ids: list[str]) -> list[str]:
 def _prune_generated_exports(cutoff: datetime) -> int:
     removed = 0
     cutoff_epoch = cutoff.timestamp()
-    for path in _generated_exports():
+    for bundle in _generated_export_bundles():
         try:
-            stale = path.stat().st_mtime <= cutoff_epoch
+            stale = max(path.stat().st_mtime for path in bundle) <= cutoff_epoch
         except OSError:
             continue
         if not stale:
             continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
-        removed += 1
+        failed = False
+        for path in bundle:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                failed = True
+        if not failed:
+            removed += 1
     return removed
 
 

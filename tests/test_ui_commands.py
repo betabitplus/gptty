@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
+from gptty.exporter_bridge import PersistentExportArtifact
 from gptty.goal import MAX_ROLLOVERS
 from gptty.goal_store import GoalStore
 from gptty.state import (
@@ -964,15 +966,28 @@ def test_history_clear_delegates_to_ui_and_reports_success(tmp_path) -> None:
     assert renderer.events[-1] == ("info", "Prompt history cleared.")
 
 
-def test_temporary_export_uses_live_transcript_and_prints_exact_path(
+def test_temporary_export_uses_live_transcript_and_marks_scope(
     tmp_path, monkeypatch
 ) -> None:
     commands, renderer, client, _ = make_commands(tmp_path)
-    exported: list[tuple[list[object], str | None]] = []
+    exported: list[dict[str, object]] = []
     export_path = tmp_path / "temporary.md"
 
-    def fake_export(messages, *, title=None):
-        exported.append((list(messages), title))
+    def fake_export(
+        messages,
+        *,
+        title=None,
+        artifact_scope=None,
+        artifact_provenance=None,
+    ):
+        exported.append(
+            {
+                "messages": list(messages),
+                "title": title,
+                "artifact_scope": artifact_scope,
+                "artifact_provenance": artifact_provenance,
+            }
+        )
         return export_path
 
     monkeypatch.setattr("gptty.ui.commands.save_markdown_export", fake_export)
@@ -985,30 +1000,62 @@ def test_temporary_export_uses_live_transcript_and_prints_exact_path(
     )
     commands.handle("/export")
 
-    assert [message.role for message in exported[0][0]] == ["user", "assistant"]
-    assert [message.text for message in exported[0][0]] == ["hello", "hi"]
-    assert exported[0][1] == "Temporary title"
+    assert [message.role for message in exported[0]["messages"]] == ["user", "assistant"]
+    assert [message.text for message in exported[0]["messages"]] == ["hello", "hi"]
+    assert exported[0]["title"] == "Temporary title"
+    assert exported[0]["artifact_scope"] == "temporary_in_memory_current_branch"
+    assert exported[0]["artifact_provenance"] == "gptty_temporary_transcript"
     assert ("get_messages", "temp-1") not in client.calls
-    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+    assert renderer.events[-1] == (
+        "info",
+        f"Exported Temporary Markdown: {export_path}",
+    )
 
 
-def test_normal_export_reads_complete_attached_history_from_cwa(
+def test_normal_export_delegates_visible_graph_without_sdk_message_read(
     tmp_path, monkeypatch
 ) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, renderer, client, _ = make_commands(tmp_path, state=state)
-    exported: list[list[object]] = []
-    export_path = tmp_path / "normal.md"
+    export_path = (tmp_path / "normal.md").resolve()
+    calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
-        "gptty.ui.commands.save_markdown_export",
-        lambda messages, *, title=None: exported.append(list(messages)) or export_path,
+        "gptty.ui.commands.reserve_default_persistent_export_path",
+        lambda *, title=None: export_path,
     )
+
+    def fake_export(ref, output_path, *, auth_file=None, timeout=120.0):
+        calls.append(
+            {
+                "ref": ref,
+                "output_path": Path(output_path),
+                "auth_file": auth_file,
+                "timeout": timeout,
+            }
+        )
+        return PersistentExportArtifact(
+            conversation_id="conv-1",
+            markdown_path=export_path,
+            context_path=export_path.with_suffix(".context.json"),
+            manifest_path=export_path.with_suffix(".manifest.json"),
+            title="First chat",
+            messages=2,
+            branch_points=0,
+            leaf_branches=1,
+        )
+
+    monkeypatch.setattr("gptty.ui.commands.export_persistent_conversation", fake_export)
     commands.handle("/export")
 
-    assert ("get_messages", "conv-1") in client.calls
-    assert [message.text for message in exported[0]] == ["question", "answer"]
-    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+    assert calls[0]["ref"] == "conv-1"
+    assert calls[0]["output_path"] == export_path
+    assert ("get_messages", "conv-1") not in client.calls
+    assert renderer.events[-1] == (
+        "info",
+        "Exported visible-graph artifact: "
+        f"{export_path} · manifest: {export_path.with_suffix('.manifest.json')}",
+    )
 
 
 def test_new_ends_live_temporary_lifecycle(tmp_path) -> None:
@@ -2986,7 +3033,7 @@ def test_model_override_is_rejected_while_explicit_effort_is_saved(tmp_path) -> 
     assert "explicit model" in renderer.events[-1][1]
 
 
-def test_normal_export_passes_persisted_typed_sources_to_markdown_exporter(
+def test_normal_export_does_not_mix_current_branch_local_sources_into_visible_graph(
     tmp_path, monkeypatch
 ) -> None:
     ref = "conv-sources-1234"
@@ -3012,30 +3059,34 @@ def test_normal_export_passes_persisted_typed_sources_to_markdown_exporter(
         },
     )
     state = ChatState(current_conversation=ref)
-    commands, renderer, client, _ = make_commands(
+    commands, _, client, _ = make_commands(
         tmp_path,
         state=state,
         tui_archive=archive,
     )
-    exported: list[dict[str, object]] = []
-    export_path = tmp_path / "normal-with-sources.md"
+    export_path = (tmp_path / "visible.md").resolve()
 
-    def fake_export(messages, *, title=None, observations=None):
-        exported.append(
-            {
-                "messages": list(messages),
-                "title": title,
-                "observations": observations,
-            }
-        )
-        return export_path
+    def reject_partial_sources(_ref):
+        raise AssertionError("current-branch sources must not be mixed into visible graph")
 
-    monkeypatch.setattr("gptty.ui.commands.save_markdown_export", fake_export)
+    monkeypatch.setattr(archive, "source_citation_observations", reject_partial_sources)
+    monkeypatch.setattr(
+        "gptty.ui.commands.reserve_default_persistent_export_path",
+        lambda *, title=None: export_path,
+    )
+    monkeypatch.setattr(
+        "gptty.ui.commands.export_persistent_conversation",
+        lambda *args, **kwargs: PersistentExportArtifact(
+            conversation_id=ref,
+            markdown_path=export_path,
+            context_path=export_path.with_suffix(".context.json"),
+            manifest_path=export_path.with_suffix(".manifest.json"),
+        ),
+    )
+
     commands.handle("/export")
 
-    assert ("get_messages", ref) in client.calls
-    assert exported[0]["observations"]["sources"][0]["source_id"] == "source-1"
-    assert renderer.events[-1] == ("info", f"Exported Markdown: {export_path}")
+    assert ("get_messages", ref) not in client.calls
 
 
 def test_file_command_stages_general_file_and_clear_is_kind_specific(tmp_path) -> None:

@@ -10,7 +10,9 @@ from typing import Any
 
 import gptty.commands.export as export_command
 from gptty.commands.export import run_export, save_markdown_export
+from gptty.exporter_bridge import PersistentExportArtifact
 from gptty.output import OutputMessage
+from gptty.private_fs import atomic_write_private_text
 from gptty.session_state import SessionStateError
 from gptty.state import ChatState, save_chat_state
 
@@ -52,8 +54,53 @@ def make_args(tmp_path: Path, **overrides: Any) -> Namespace:
     return Namespace(**values)
 
 
-def test_export_prints_explicit_conversation_as_markdown(tmp_path: Path) -> None:
+def _install_fake_visible_export(monkeypatch, calls, *, markdown="# Visible graph\n"):
+    def fake_export(conversation_ref, output_path, *, auth_file=None, timeout=120.0):
+        path = Path(output_path)
+        context_path = path.with_suffix(".context.json")
+        manifest_path = path.with_suffix(".manifest.json")
+        calls.append(
+            {
+                "conversation_ref": conversation_ref,
+                "output_path": path,
+                "auth_file": auth_file,
+                "timeout": timeout,
+            }
+        )
+        atomic_write_private_text(path, markdown)
+        atomic_write_private_text(
+            context_path,
+            json.dumps(
+                {
+                    "schema": 1,
+                    "conversation_id": str(conversation_ref),
+                    "scope": "canonical-web-visible",
+                    "messages": [],
+                }
+            )
+            + "\n",
+        )
+        atomic_write_private_text(manifest_path, "{}\n")
+        return PersistentExportArtifact(
+            conversation_id=str(conversation_ref),
+            markdown_path=path.resolve(),
+            context_path=context_path.resolve(),
+            manifest_path=manifest_path.resolve(),
+            title="Visible graph",
+            messages=3,
+            branch_points=1,
+            leaf_branches=2,
+        )
+
+    monkeypatch.setattr(export_command, "export_persistent_conversation", fake_export)
+
+
+def test_export_prints_visible_graph_markdown_without_sdk_read(
+    monkeypatch, tmp_path: Path
+) -> None:
     FakeGpttyClient.instances.clear()
+    calls = []
+    _install_fake_visible_export(monkeypatch, calls)
     stdout = StringIO()
 
     result = run_export(
@@ -63,32 +110,29 @@ def test_export_prints_explicit_conversation_as_markdown(tmp_path: Path) -> None
     )
 
     assert result == 0
-    assert stdout.getvalue() == "### user\n\nhello\n\n### assistant\n\nhi\n"
-    assert FakeGpttyClient.instances[0].calls == [
-        ("get_messages", ("conversation-123",), {}),
-    ]
+    assert stdout.getvalue() == "# Visible graph\n"
+    assert calls[0]["conversation_ref"] == "conversation-123"
+    assert calls[0]["auth_file"] == "auth_data.json"
+    assert FakeGpttyClient.instances == []
 
 
-def test_export_uses_attached_conversation_and_last_limit(tmp_path: Path) -> None:
-    FakeGpttyClient.instances.clear()
-    save_chat_state(tmp_path / "gptty_state.json", ChatState(current_conversation="attached-456"))
+def test_export_rejects_last_limit_for_persistent_artifact(tmp_path: Path) -> None:
+    save_chat_state(
+        tmp_path / "gptty_state.json",
+        ChatState(current_conversation="attached-456"),
+    )
+    stderr = StringIO()
 
     result = run_export(
-        make_args(
-            tmp_path,
-            last=5,
-            auth="custom_auth.json",
-            timeout=12,
-        ),
+        make_args(tmp_path, last=5),
         client_factory=FakeGpttyClient,
         stdout=StringIO(),
+        stderr=stderr,
     )
 
-    assert result == 0
-    client = FakeGpttyClient.instances[0]
-    assert client.auth_file == "custom_auth.json"
-    assert client.timeout == 12
-    assert client.calls == [("get_messages", ("attached-456",), {"limit": 5})]
+    assert result == 2
+    assert "complete visible-graph artifact" in stderr.getvalue()
+    assert "gptty messages --last N" in stderr.getvalue()
 
 
 def test_export_requires_explicit_or_attached_conversation(tmp_path: Path) -> None:
@@ -106,60 +150,77 @@ def test_export_requires_explicit_or_attached_conversation(tmp_path: Path) -> No
     assert FakeGpttyClient.instances == []
 
 
-def test_export_supports_json_output(tmp_path: Path) -> None:
+def test_export_prints_visible_graph_context_json(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+    _install_fake_visible_export(monkeypatch, calls)
     stdout = StringIO()
 
     result = run_export(
         make_args(tmp_path, url_or_id="conversation-123", format="json"),
-        client_factory=FakeGpttyClient,
         stdout=stdout,
     )
 
     assert result == 0
-    assert json.loads(stdout.getvalue()) == {
-        "messages": [
-            {"created_at": None, "role": "user", "text": "hello"},
-            {"created_at": None, "role": "assistant", "text": "hi"},
-        ]
-    }
+    payload = json.loads(stdout.getvalue())
+    assert payload["scope"] == "canonical-web-visible"
+    assert payload["conversation_id"] == "conversation-123"
 
 
-def test_export_writes_markdown_to_file(tmp_path: Path) -> None:
+def test_export_rejects_plain_persistent_projection(tmp_path: Path) -> None:
+    stderr = StringIO()
+    result = run_export(
+        make_args(tmp_path, url_or_id="conversation-123", format="plain"),
+        stderr=stderr,
+    )
+    assert result == 2
+    assert "gptty messages --format plain" in stderr.getvalue()
+
+
+def test_export_writes_reserved_visible_graph_bundle(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+    _install_fake_visible_export(monkeypatch, calls)
     output_path = tmp_path / "conversation.md"
 
     result = run_export(
         make_args(tmp_path, url_or_id="conversation-123", output=str(output_path)),
-        client_factory=FakeGpttyClient,
         stdout=StringIO(),
     )
 
     assert result == 0
-    assert output_path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
+    assert output_path.read_text(encoding="utf-8") == "# Visible graph\n"
+    assert output_path.with_suffix(".context.json").is_file()
+    assert output_path.with_suffix(".manifest.json").is_file()
     if os.name != "nt":
-        assert output_path.stat().st_mode & 0o777 == 0o600
+        for path in (
+            output_path,
+            output_path.with_suffix(".context.json"),
+            output_path.with_suffix(".manifest.json"),
+        ):
+            assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_export_refuses_to_overwrite_existing_file_by_default(tmp_path: Path) -> None:
+def test_export_refuses_existing_bundle_by_default(monkeypatch, tmp_path: Path) -> None:
     output_path = tmp_path / "conversation.md"
-    output_path.write_text("existing\n", encoding="utf-8")
+    output_path.with_suffix(".context.json").write_text("existing\n", encoding="utf-8")
+    calls = []
+    _install_fake_visible_export(monkeypatch, calls)
     stderr = StringIO()
 
     result = run_export(
         make_args(tmp_path, url_or_id="conversation-123", output=str(output_path)),
-        client_factory=FakeGpttyClient,
         stderr=stderr,
     )
 
     assert result == 1
-    assert output_path.read_text(encoding="utf-8") == "existing\n"
-    assert "output file already exists" in stderr.getvalue()
+    assert calls == []
+    assert "export artifact already exists" in stderr.getvalue()
 
 
-def test_export_allows_overwrite(tmp_path: Path) -> None:
+def test_export_allows_bundle_overwrite(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+    _install_fake_visible_export(monkeypatch, calls)
     output_path = tmp_path / "conversation.md"
     output_path.write_text("existing\n", encoding="utf-8")
-    if os.name != "nt":
-        output_path.chmod(0o666)
 
     result = run_export(
         make_args(
@@ -168,27 +229,50 @@ def test_export_allows_overwrite(tmp_path: Path) -> None:
             output=str(output_path),
             overwrite=True,
         ),
-        client_factory=FakeGpttyClient,
         stdout=StringIO(),
     )
 
     assert result == 0
-    assert output_path.read_text(encoding="utf-8") == "### user\n\nhello\n\n### assistant\n\nhi\n"
-    if os.name != "nt":
-        assert output_path.stat().st_mode & 0o777 == 0o600
+    assert output_path.read_text(encoding="utf-8") == "# Visible graph\n"
+    assert len(calls) == 1
 
 
-def test_export_returns_1_on_sdk_error(tmp_path: Path) -> None:
+def test_export_bridge_failure_is_reported(monkeypatch, tmp_path: Path) -> None:
+    def fail(*args, **kwargs):
+        raise export_command.ExporterBridgeError("backend unavailable")
+
+    monkeypatch.setattr(export_command, "export_persistent_conversation", fail)
     stderr = StringIO()
 
     result = run_export(
         make_args(tmp_path, url_or_id="conversation-123"),
-        client_factory=RaisingGpttyClient,
         stderr=stderr,
     )
 
     assert result == 1
-    assert "export request failed: backend unavailable" in stderr.getvalue()
+    assert "export failed: backend unavailable" in stderr.getvalue()
+
+
+def test_export_bridge_failure_cleans_new_reserved_bundle(
+    monkeypatch, tmp_path: Path
+) -> None:
+    output_path = tmp_path / "conversation.md"
+
+    def fail(*args, **kwargs):
+        raise export_command.ExporterBridgeError("failed after reservation")
+
+    monkeypatch.setattr(export_command, "export_persistent_conversation", fail)
+    stderr = StringIO()
+
+    result = run_export(
+        make_args(tmp_path, url_or_id="conversation-123", output=str(output_path)),
+        stderr=stderr,
+    )
+
+    assert result == 1
+    assert not output_path.exists()
+    assert not output_path.with_suffix(".context.json").exists()
+    assert not output_path.with_suffix(".manifest.json").exists()
 
 
 def test_export_recovers_from_corrupt_legacy_state_with_warning(tmp_path: Path) -> None:
@@ -222,24 +306,6 @@ def test_export_returns_1_on_transactional_state_error(monkeypatch, tmp_path: Pa
 
     assert result == 1
     assert "local session database failed" in stderr.getvalue()
-
-
-def test_export_returns_1_on_file_write_error(tmp_path: Path) -> None:
-    stderr = StringIO()
-
-    result = run_export(
-        make_args(
-            tmp_path,
-            url_or_id="conversation-123",
-            output=str(tmp_path),
-            overwrite=True,
-        ),
-        client_factory=FakeGpttyClient,
-        stderr=stderr,
-    )
-
-    assert result == 1
-    assert "failed to write export" in stderr.getvalue()
 
 
 def test_save_markdown_export_creates_timestamped_readable_file(tmp_path: Path) -> None:
@@ -332,3 +398,21 @@ def test_save_markdown_export_appends_typed_sources_without_using_citation_offse
     assert "https://example.com/source" in rendered
     assert "123456" not in rendered
     assert "234567" not in rendered
+
+
+def test_save_markdown_export_marks_reduced_artifact_scope(tmp_path: Path) -> None:
+    path = save_markdown_export(
+        [OutputMessage(role="assistant", text="temporary answer")],
+        directory=tmp_path,
+        title="Temporary",
+        now=datetime(2026, 9, 26, 14, 45, 0, tzinfo=timezone.utc),
+        artifact_scope="temporary_in_memory_current_branch",
+        artifact_provenance="gptty_temporary_transcript",
+    )
+
+    rendered = path.read_text(encoding="utf-8")
+    assert rendered.startswith(
+        "> Export scope: `temporary_in_memory_current_branch`\n"
+        "> Provenance: `gptty_temporary_transcript`\n\n"
+    )
+    assert "temporary answer" in rendered

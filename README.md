@@ -217,7 +217,7 @@ gptty send --format json "summarize the current thread"
 gptty send --format jsonl "summarize the current thread"
 gptty ask --format jsonl "explain this error"
 gptty export --format markdown --output conversation.md
-gptty export --format json --output conversation.json
+gptty export --format json
 ```
 
 `gptty send --format json` returns a rich versioned final record with conversation/message identity, model and effort provenance, finality and observations. `--format jsonl` emits one JSON object per event and ends with the same `gptty.turn.result` contract. Typed connector lifecycle events preserve stable connector/activity/action ids and phases when ChatGPT exposes them; visible authorization cards without a stable action id remain point evidence only. gptty does **not** infer connector approval from labels or prose and currently provides no local approve/deny action: when ChatGPT requires authorization, complete it in ChatGPT web. Markdown remains a human-readable final-text surface and is non-streaming.
@@ -227,10 +227,12 @@ You can also inspect or export an explicit conversation without attaching it:
 ```bash
 gptty messages https://chatgpt.com/c/... --last 5
 gptty status https://chatgpt.com/c/...
-gptty export https://chatgpt.com/c/... --last 20 --output conversation.md
+gptty export https://chatgpt.com/c/... --output conversation.md
 ```
 
-`gptty export` defaults to Markdown output. When `--output` points to an existing file, add `--overwrite` to replace it.
+Persistent `gptty export` is a **complete canonical-visible-graph artifact**, not a current-branch message slice. With `--output conversation.md` it writes a three-file bundle beside that path: `conversation.md`, `conversation.context.json`, and `conversation.manifest.json`. The schema-v2 manifest records `canonical_visible_graph` scope, hashes, source freshness/provenance, owner-only storage semantics, and is verified by CWA before gptty reports success. `--overwrite` replaces the complete bundle. `--format json` without `--output` prints the visible-graph context sidecar; use `gptty messages --last N` for current-branch slices.
+
+Persistent visible-graph export delegates to the companion `chatgpt-export-one` executable from **chatgpt-conversation-exporter**. Until that companion is published as a normal install dependency, it must be installed separately or configured with `GPTTY_EXPORTER_COMMAND`; if it is missing, export fails closed with an explicit error. The currently attached Temporary Chat does not have a persistent canonical graph: interactive `/export` therefore writes the in-memory Temporary transcript locally and labels it `temporary_in_memory_current_branch` / `gptty_temporary_transcript` instead of claiming whole-conversation scope.
 
 Interactive chat:
 
@@ -263,7 +265,7 @@ In a TTY, press `/` and Enter to open the lightweight action menu:
 
 Queued turns in the enhanced UI are deliberately **memory-only** and bounded. Each accepted queued turn freezes its text, media list, conversation mode/reference, model/reasoning policy slot, Goal id/generation, origin and timestamp. `/queue` shows content-free queue metadata; `/queue remove <index|id>` removes one item, `/queue clear` discards all queued turns, and `/queue send` explicitly releases/rebinds held turns to the current context. Normal completion releases compatible queued turns FIFO. A user Stop (`/stop`, Ctrl-C or SIGINT), an abnormal terminal turn, a failed resume, or a chat/model/Goal binding mismatch holds the queue instead of auto-sending or silently discarding drafts. Held work stays local until explicit `/queue send` or `/queue clear`; process exit still loses it by design rather than pretending the queue is durable.
 
-`/temporary` starts a fresh real ChatGPT Temporary Chat using CWA's live temporary lifecycle. Continuation is supported while that same gptty process/runtime remains active; the temporary conversation id is deliberately not persisted or treated as resumable authority. Temporary prompts are not written to persistent prompt history and are removed from normal in-process history when Temporary mode ends. `/new`, `/resume`, `/detach`, and normal `/exit` end the live temporary lifecycle. `/export` writes the entire currently attached user-visible conversation to a new Markdown file under `~/Documents/gptty-exports/` and immediately prints the absolute path. Normal conversations are exported from CWA's canonical history; the currently attached Temporary Chat is exported from the live transcript held by this gptty session. Existing export files are never overwritten.
+`/temporary` starts a fresh real ChatGPT Temporary Chat using CWA's live temporary lifecycle. Continuation is supported while that same gptty process/runtime remains active; the temporary conversation id is deliberately not persisted or treated as resumable authority. Temporary prompts are not written to persistent prompt history and are removed from normal in-process history when Temporary mode ends. `/new`, `/resume`, `/detach`, and normal `/exit` end the live temporary lifecycle. `/export` on a normal persistent chat delegates to the companion exporter and writes a verified canonical-visible-graph Markdown/context/manifest bundle under `~/Documents/gptty-exports/`; it does not mix the partial local TUI archive into that graph. `/export` in Temporary mode writes only the live in-memory transcript and embeds explicit reduced-scope provenance in the Markdown. Auto-named exports reserve all bundle paths race-safely so a partial collision cannot silently overwrite another artifact.
 
 Enhanced normal chats are also self-archiving. Every prompt actually submitted through gptty and every answer observed for that turn is appended under `~/.local/share/gptty/chat-archive/conversations/<conversation-id>/events.jsonl`; `transcript.md` is a readable projection and `meta.json` records the scope. This ledger is deliberately `tui-observed`: `/resume` and `/reload` do not import web-only history into it, Temporary Chat is excluded, and a later ChatGPT web snapshot cannot erase an event that gptty already observed. `GPTTY_ARCHIVE_HOME` can override the archive root.
 

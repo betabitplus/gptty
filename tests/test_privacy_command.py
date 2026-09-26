@@ -147,14 +147,27 @@ def test_privacy_prune_respects_lifecycle_and_user_owned_exports(
     export_root = tmp_path / "exports"
     export_root.mkdir()
     old_generated = export_root / "2026-01-01_00-00-00 - old.md"
+    old_context = export_root / "2026-01-01_00-00-00 - old.context.json"
+    old_manifest = export_root / "2026-01-01_00-00-00 - old.manifest.json"
     recent_generated = export_root / "2026-09-20_00-00-00 - recent.md"
+    recent_context = export_root / "2026-09-20_00-00-00 - recent.context.json"
+    recent_manifest = export_root / "2026-09-20_00-00-00 - recent.manifest.json"
     user_owned = export_root / "my-explicit-export.md"
-    for path in (old_generated, recent_generated, user_owned):
+    for path in (
+        old_generated,
+        old_context,
+        old_manifest,
+        recent_generated,
+        recent_context,
+        recent_manifest,
+        user_owned,
+    ):
         path.write_text("copy\n", encoding="utf-8")
     recent_epoch = datetime(2026, 9, 20, tzinfo=timezone.utc).timestamp()
-    os.utime(old_generated, (old_epoch, old_epoch))
-    os.utime(user_owned, (old_epoch, old_epoch))
-    os.utime(recent_generated, (recent_epoch, recent_epoch))
+    for path in (old_generated, old_context, old_manifest, user_owned):
+        os.utime(path, (old_epoch, old_epoch))
+    for path in (recent_generated, recent_context, recent_manifest):
+        os.utime(path, (recent_epoch, recent_epoch))
     monkeypatch.setattr(privacy_command, "DEFAULT_EXPORT_DIRECTORY", export_root)
     stdout = StringIO()
 
@@ -176,10 +189,44 @@ def test_privacy_prune_respects_lifecycle_and_user_owned_exports(
     assert store.tui_events("conv-old1234") == []
     assert not old_conversation_dir.exists()
     assert not old_generated.exists()
+    assert not old_context.exists()
+    assert not old_manifest.exists()
     assert recent_generated.exists()
+    assert recent_context.exists()
+    assert recent_manifest.exists()
     assert user_owned.exists()
     output = stdout.getvalue()
     assert "Runs removed: 1" in output
     assert "Orphan pending prompts removed: 1" in output
     assert "Archived conversations removed: 1" in output
     assert "Default generated exports removed: 1" in output
+
+
+def test_privacy_prune_removes_stale_orphan_export_sidecars(
+    monkeypatch, tmp_path: Path
+) -> None:
+    state_path = tmp_path / "gptty_state.json"
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    orphan_context = export_root / "2026-01-01_00-00-00 - orphan.context.json"
+    orphan_manifest = export_root / "2026-01-01_00-00-00 - orphan.manifest.json"
+    orphan_context.write_text("{}\n", encoding="utf-8")
+    orphan_manifest.write_text("{}\n", encoding="utf-8")
+    old_epoch = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(orphan_context, (old_epoch, old_epoch))
+    os.utime(orphan_manifest, (old_epoch, old_epoch))
+    monkeypatch.setattr(privacy_command, "DEFAULT_EXPORT_DIRECTORY", export_root)
+    stdout = StringIO()
+
+    assert run_privacy_status(_args(state_path), stdout=stdout) == 0
+    assert "Default generated exports: 1" in stdout.getvalue()
+
+    stdout = StringIO()
+    assert run_privacy_prune(
+        _args(state_path, include_exports=True),
+        stdout=stdout,
+        now=datetime(2026, 9, 25, tzinfo=timezone.utc),
+    ) == 0
+    assert not orphan_context.exists()
+    assert not orphan_manifest.exists()
+    assert "Default generated exports removed: 1" in stdout.getvalue()
