@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
 import os
 import signal
 from collections import deque
@@ -346,6 +347,153 @@ class _TranscriptLine:
         return self._wrapped_rows
 
 
+class _TranscriptRowIndex:
+    """Incremental wrapped-row index for the bounded transcript."""
+
+    def __init__(self, first_line: _TranscriptLine) -> None:
+        self._lines: list[_TranscriptLine] = [first_line]
+        self._row_starts: list[int] = [0]
+        self._row_counts: list[int] = [0]
+        self._head = 0
+        self._width = 0
+        self._dirty_from: int | None = 0
+
+    def reset(self, first_line: _TranscriptLine) -> None:
+        self._lines = [first_line]
+        self._row_starts = [0]
+        self._row_counts = [0]
+        self._head = 0
+        self._width = 0
+        self._dirty_from = 0
+
+    def append(self, line: _TranscriptLine) -> None:
+        self._lines.append(line)
+        self._row_starts.append(0)
+        self._row_counts.append(0)
+        physical = len(self._lines) - 1
+        self._dirty_from = (
+            physical
+            if self._dirty_from is None
+            else min(self._dirty_from, physical)
+        )
+
+    def replace_last(self, line: _TranscriptLine) -> None:
+        if self._head >= len(self._lines):
+            self.reset(line)
+            return
+        self._lines[-1] = line
+        self.mark_changed(-1)
+
+    def mark_changed(self, active_index: int) -> None:
+        active_count = len(self._lines) - self._head
+        if active_count <= 0:
+            return
+        logical = active_index if active_index >= 0 else active_count + active_index
+        logical = min(max(0, logical), active_count - 1)
+        physical = self._head + logical
+        self._dirty_from = (
+            physical
+            if self._dirty_from is None
+            else min(self._dirty_from, physical)
+        )
+
+    def drop_first(self) -> None:
+        if self._head >= len(self._lines):
+            return
+        self._head += 1
+        if self._dirty_from is not None and self._dirty_from < self._head:
+            self._dirty_from = self._head if self._head < len(self._lines) else None
+        if self._head >= 4096 and self._head * 2 >= len(self._lines):
+            self._compact()
+
+    def _compact(self) -> None:
+        if self._head <= 0:
+            return
+        active_lines = self._lines[self._head :]
+        active_counts = self._row_counts[self._head :]
+        base = self._row_starts[self._head] if active_lines else 0
+        active_starts = [value - base for value in self._row_starts[self._head :]]
+        dirty = self._dirty_from
+        self._lines = active_lines
+        self._row_counts = active_counts
+        self._row_starts = active_starts
+        self._dirty_from = None if dirty is None else max(0, dirty - self._head)
+        self._head = 0
+
+    def _sync(self, width: int) -> None:
+        width = max(1, int(width))
+        if self._head >= len(self._lines):
+            return
+        if width != self._width:
+            self._compact()
+            self._width = width
+            self._row_starts = [0] * len(self._lines)
+            self._row_counts = [0] * len(self._lines)
+            self._dirty_from = 0
+
+        dirty = self._dirty_from
+        if dirty is None:
+            return
+        start = max(self._head, dirty)
+        if start >= len(self._lines):
+            self._dirty_from = None
+            return
+        next_start = (
+            self._row_starts[start]
+            if start == self._head
+            else self._row_starts[start - 1] + self._row_counts[start - 1]
+        )
+        for physical in range(start, len(self._lines)):
+            self._row_starts[physical] = next_start
+            count = len(self._lines[physical].wrapped(width))
+            self._row_counts[physical] = count
+            next_start += count
+        self._dirty_from = None
+
+    def total_rows(self, width: int) -> int:
+        self._sync(width)
+        if self._head >= len(self._lines):
+            return 0
+        base = self._row_starts[self._head]
+        last = len(self._lines) - 1
+        return self._row_starts[last] + self._row_counts[last] - base
+
+    def visible_rows(
+        self, width: int, start: int, height: int
+    ) -> list[list[tuple[str, str]]]:
+        self._sync(width)
+        height = max(0, int(height))
+        if height <= 0 or self._head >= len(self._lines):
+            return []
+        total = self.total_rows(width)
+        if total <= 0:
+            return []
+        start = min(max(0, int(start)), max(0, total - 1))
+        base = self._row_starts[self._head]
+        target = base + start
+        physical = max(
+            self._head,
+            bisect_right(
+                self._row_starts,
+                target,
+                lo=self._head,
+                hi=len(self._lines),
+            )
+            - 1,
+        )
+        offset = max(0, target - self._row_starts[physical])
+        visible: list[list[tuple[str, str]]] = []
+        while physical < len(self._lines) and len(visible) < height:
+            wrapped = self._lines[physical].wrapped(width)
+            for row in wrapped[offset:]:
+                visible.append(list(row))
+                if len(visible) >= height:
+                    break
+            physical += 1
+            offset = 0
+        return visible
+
+
 class _TranscriptControl(UIControl):
     def __init__(
         self,
@@ -456,7 +604,14 @@ class InteractiveSession:
         self._prompt_output = prompt_output
         self._turn_controls: TurnControlSignals | None = None
         self._working_status: Callable[[], str] | None = None
-        self._transcript_lines: deque[_TranscriptLine] = deque([_TranscriptLine()])
+        initial_transcript_line = _TranscriptLine()
+        self._transcript_lines: deque[_TranscriptLine] = deque([initial_transcript_line])
+        self._transcript_row_index = _TranscriptRowIndex(initial_transcript_line)
+        self._transcript_trimmed = False
+        self._transcript_trim_marker = _TranscriptLine(
+            rule_title="older local transcript trimmed",
+            rule_style="fg:#888888",
+        )
         self._transcript_chars = 0
         self._transcript_char_limit = 1_000_000
         self._transcript_line_limit = 20_000
@@ -858,6 +1013,22 @@ class InteractiveSession:
     def transcript_stream(self, base: TextIO, *, stream_name: str) -> TranscriptStream:
         return TranscriptStream(self, base, stream_name=stream_name)
 
+    def _append_transcript_line(self, line: _TranscriptLine | None = None) -> _TranscriptLine:
+        value = line or _TranscriptLine()
+        self._transcript_lines.append(value)
+        self._transcript_row_index.append(value)
+        return value
+
+    def _replace_transcript_last(self, line: _TranscriptLine) -> None:
+        self._transcript_lines[-1] = line
+        self._transcript_row_index.replace_last(line)
+
+    def _mark_transcript_trimmed(self, width: int) -> int:
+        if self._transcript_trimmed:
+            return 0
+        self._transcript_trimmed = True
+        return len(self._transcript_trim_marker.wrapped(width))
+
     def append_transcript(self, text: str) -> None:
         if not text:
             return
@@ -869,10 +1040,11 @@ class InteractiveSession:
             for index, part in enumerate(parts):
                 if part:
                     self._transcript_lines[-1].append(style, part)
+                    self._transcript_row_index.mark_changed(-1)
                     self._transcript_chars += len(part)
                 if index < len(parts) - 1:
                     self._transcript_chars += 1
-                    self._transcript_lines.append(_TranscriptLine())
+                    self._append_transcript_line()
         self._trim_transcript()
         if not self._transcript_follow_tail:
             self._transcript_has_new_output = True
@@ -891,12 +1063,11 @@ class InteractiveSession:
             or current.rule_title is not None
             or current.markdown_text is not None
         ):
-            self._transcript_lines.append(_TranscriptLine())
-        self._transcript_lines[-1] = _TranscriptLine(
-            chars=len(value),
-            markdown_text=value,
+            self._append_transcript_line()
+        self._replace_transcript_last(
+            _TranscriptLine(chars=len(value), markdown_text=value)
         )
-        self._transcript_lines.append(_TranscriptLine())
+        self._append_transcript_line()
         self._transcript_chars += len(value) + 1
         self._trim_transcript()
         if not self._transcript_follow_tail:
@@ -915,7 +1086,7 @@ class InteractiveSession:
         ):
             return
         self._transcript_chars += 1
-        self._transcript_lines.append(_TranscriptLine())
+        self._append_transcript_line()
         self._trim_transcript()
 
     def append_rule(self, title: str, *, style: str | None = None) -> None:
@@ -928,13 +1099,15 @@ class InteractiveSession:
             or current.rule_title is not None
             or current.markdown_text is not None
         ):
-            self._transcript_lines.append(_TranscriptLine())
-        self._transcript_lines[-1] = _TranscriptLine(
-            chars=len(title),
-            rule_title=title,
-            rule_style="fg:#888888" if style == "dim" else "",
+            self._append_transcript_line()
+        self._replace_transcript_last(
+            _TranscriptLine(
+                chars=len(title),
+                rule_title=title,
+                rule_style="fg:#888888" if style == "dim" else "",
+            )
         )
-        self._transcript_lines.append(_TranscriptLine())
+        self._append_transcript_line()
         self._transcript_chars += len(title) + 1
         self._trim_transcript()
         if not self._transcript_follow_tail:
@@ -945,7 +1118,10 @@ class InteractiveSession:
             pass
 
     def clear_transcript(self) -> None:
-        self._transcript_lines = deque([_TranscriptLine()])
+        initial_line = _TranscriptLine()
+        self._transcript_lines = deque([initial_line])
+        self._transcript_row_index.reset(initial_line)
+        self._transcript_trimmed = False
         self._transcript_chars = 0
         self._transcript_has_new_output = False
         self._transcript_follow_tail = True
@@ -964,10 +1140,13 @@ class InteractiveSession:
         ):
             first = self._transcript_lines.popleft()
             removed_rows = len(first.wrapped(width))
+            self._transcript_row_index.drop_first()
+            marker_rows = self._mark_transcript_trimmed(width)
             self._transcript_chars = max(0, self._transcript_chars - first.chars - 1)
             if not self._transcript_follow_tail:
                 self._transcript_scroll_row = max(
-                    0, self._transcript_scroll_row - removed_rows
+                    0,
+                    self._transcript_scroll_row - removed_rows + marker_rows,
                 )
         if (
             self._transcript_chars > self._transcript_char_limit
@@ -978,16 +1157,23 @@ class InteractiveSession:
             excess = self._transcript_chars - self._transcript_char_limit
             removed = first.trim_prefix(excess)
             self._transcript_chars = max(0, self._transcript_chars - removed)
-            if not self._transcript_follow_tail and removed:
-                after_rows = len(first.wrapped(width))
-                self._transcript_scroll_row = max(
-                    0,
-                    self._transcript_scroll_row - max(0, before_rows - after_rows),
-                )
+            if removed:
+                self._transcript_row_index.mark_changed(0)
+                marker_rows = self._mark_transcript_trimmed(width)
+                if not self._transcript_follow_tail:
+                    after_rows = len(first.wrapped(width))
+                    self._transcript_scroll_row = max(
+                        0,
+                        self._transcript_scroll_row
+                        - max(0, before_rows - after_rows)
+                        + marker_rows,
+                    )
 
     def _formatted_transcript(self) -> list[tuple[str, str]]:
         fragments: list[tuple[str, str]] = []
         lines = list(self._transcript_lines)
+        if self._transcript_trimmed:
+            lines.insert(0, self._transcript_trim_marker)
         width = max(1, self._transcript_view_width)
         for index, line in enumerate(lines):
             if line.markdown_text is not None:
@@ -1011,9 +1197,14 @@ class InteractiveSession:
         height = max(1, int(height))
         self._transcript_view_width = width
         self._transcript_view_height = height
-        total_rows = sum(
-            len(line.wrapped(width)) for line in self._transcript_lines
+
+        marker_rows = (
+            self._transcript_trim_marker.wrapped(width)
+            if self._transcript_trimmed
+            else ()
         )
+        content_rows = self._transcript_row_index.total_rows(width)
+        total_rows = len(marker_rows) + content_rows
         self._transcript_max_scroll = max(0, total_rows - height)
         if self._transcript_follow_tail:
             self._transcript_scroll_row = self._transcript_max_scroll
@@ -1025,19 +1216,24 @@ class InteractiveSession:
 
         start = self._transcript_scroll_row
         visible: list[list[tuple[str, str]]] = []
-        row_cursor = 0
-        for line in self._transcript_lines:
-            wrapped = line.wrapped(width)
-            next_cursor = row_cursor + len(wrapped)
-            if next_cursor <= start:
-                row_cursor = next_cursor
-                continue
-            offset = max(0, start - row_cursor)
-            for row in wrapped[offset:]:
+        marker_count = len(marker_rows)
+        content_start = max(0, start - marker_count)
+        if marker_count and start < marker_count:
+            for row in marker_rows[start:]:
                 visible.append(list(row))
                 if len(visible) >= height:
                     return visible
-            row_cursor = next_cursor
+            content_start = 0
+
+        remaining = height - len(visible)
+        if remaining > 0:
+            visible.extend(
+                self._transcript_row_index.visible_rows(
+                    width,
+                    content_start,
+                    remaining,
+                )
+            )
         return visible or [[]]
 
     def _transcript_mouse_handler(self, event: MouseEvent) -> object:

@@ -17,6 +17,7 @@ from prompt_toolkit.output.base import Size
 from gptty.ui.session import (
     COMMANDS,
     InteractiveSession,
+    _TranscriptLine,
     _text_width,
     should_use_enhanced_ui,
 )
@@ -852,8 +853,16 @@ def test_transcript_buffer_is_bounded(tmp_path) -> None:
     session.append_transcript("latest line\n")
 
     rendered = "".join(fragment[1] for fragment in session._formatted_transcript())
-    assert len(rendered) <= 20
+    assert session._transcript_chars <= 20
+    assert session._transcript_trimmed is True
     assert "latest line" in rendered
+    session._transcript_follow_tail = False
+    session._transcript_scroll_row = 0
+    visible = session._visible_transcript(80, 3)
+    visible_text = "\n".join(
+        "".join(text for _style, text in row) for row in visible
+    )
+    assert "older local transcript trimmed" in visible_text
 
 
 def test_prompt_session_reads_input_and_persists_history(tmp_path) -> None:
@@ -1510,3 +1519,112 @@ def test_persistent_runtime_owns_first_class_application_not_prompt_session(tmp_
     assert session.application.full_screen is True
     assert session.application.renderer.full_screen is True
     assert session._session.default_buffer.accept_handler == session._persistent_accept
+
+
+def test_transcript_trim_marker_is_visible_and_clear_resets_it(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    session._transcript_char_limit = 24
+
+    session.append_transcript("alpha line\n")
+    session.append_transcript("beta line\n")
+    session.append_transcript("gamma line\n")
+
+    assert session._transcript_trimmed is True
+    session._transcript_follow_tail = False
+    session._transcript_scroll_row = 0
+    rows = session._visible_transcript(80, 4)
+    visible = "\n".join("".join(text for _style, text in row) for row in rows)
+    assert "older local transcript trimmed" in visible
+
+    session.clear_transcript()
+    assert session._transcript_trimmed is False
+    cleared = "".join(text for _style, text in session._formatted_transcript())
+    assert "older local transcript trimmed" not in cleared
+
+
+def test_transcript_trim_preserves_frozen_viewport_content(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    for index in range(10):
+        session.append_transcript(f"line {index}\n")
+
+    session._visible_transcript(80, 3)
+    session.scroll_transcript(-5)
+    before = session._visible_transcript(80, 3)
+    before_text = ["".join(text for _style, text in row) for row in before]
+
+    session._transcript_line_limit = len(session._transcript_lines)
+    session.append_transcript("line 10\n")
+    after = session._visible_transcript(80, 3)
+    after_text = ["".join(text for _style, text in row) for row in after]
+
+    assert session._transcript_trimmed is True
+    assert session._transcript_follow_tail is False
+    assert after_text == before_text
+
+
+def test_long_transcript_repeated_redraw_uses_incremental_row_index(
+    tmp_path, monkeypatch
+) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    for index in range(1200):
+        session.append_transcript(f"line {index:04d} payload\n")
+
+    session._visible_transcript(80, 20)
+    original = _TranscriptLine.wrapped
+    calls = 0
+
+    def counted(self, width):
+        nonlocal calls
+        calls += 1
+        return original(self, width)
+
+    monkeypatch.setattr(_TranscriptLine, "wrapped", counted)
+
+    session._visible_transcript(80, 20)
+    assert calls <= 22
+
+    calls = 0
+    session.append_transcript("tail payload\n")
+    session._visible_transcript(80, 20)
+    assert calls <= 24
+
+    calls = 0
+    active_lines = len(session._transcript_lines)
+    session._visible_transcript(40, 20)
+    assert active_lines <= calls <= active_lines + 22
+
+    calls = 0
+    session._visible_transcript(40, 20)
+    assert calls <= 22
+
+
+def test_transcript_row_index_compacts_after_many_front_evictions(tmp_path) -> None:
+    session = InteractiveSession(
+        history_file=tmp_path / "history",
+        settings_file=tmp_path / "ui.json",
+        prompt_output=ResizableDummyOutput(80),
+    )
+    session._transcript_line_limit = 50
+
+    for index in range(4300):
+        session.append_transcript(f"line {index:04d}\n")
+
+    rows = session._visible_transcript(80, 8)
+    visible = "\n".join("".join(text for _style, text in row) for row in rows)
+
+    assert len(session._transcript_lines) <= 50
+    assert session._transcript_trimmed is True
+    assert session._transcript_row_index._head < 4096
+    assert "line 4299" in visible
