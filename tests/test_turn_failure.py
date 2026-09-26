@@ -84,6 +84,8 @@ def test_legacy_rate_limit_text_is_compatibility_only() -> None:
 
     assert failure.status == "rate-limited"
     assert failure.source == "compat-text"
+    assert failure.authoritative is False
+    assert failure.to_dict()["authoritative"] is False
     assert failure.status_code is None
 
 
@@ -92,6 +94,7 @@ def test_legacy_verification_text_is_compatibility_only() -> None:
 
     assert failure.status == "blocked"
     assert failure.source == "compat-text"
+    assert failure.authoritative is False
 
 
 def test_plain_unknown_exception_remains_generic() -> None:
@@ -113,4 +116,6 @@ def test_structured_reason_code_can_classify_conversation_state() -> None:
         "This conversation is no longer available; continue in a new chat.",
     )
     assert failure.source == "structured"
+    assert failure.authoritative is True
+    assert failure.to_dict()["authoritative"] is True
     assert failure.code == "conversation_unavailable"

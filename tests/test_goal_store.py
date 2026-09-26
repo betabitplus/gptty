@@ -474,7 +474,11 @@ def test_operation_evidence_does_not_let_unrelated_tool_result_resolve_write(tmp
         {"operation_id": operation_id, "tool_name": "write_api", "text": "created id=7"},
         event_key="result-write",
     )
-    assert store.operation_evidence(goal, operation_id)["unresolved_tool_calls"] == 0
+    evidence = store.operation_evidence(goal, operation_id)
+    assert evidence["matched_tool_results"] == 0
+    assert evidence["inferred_matches"] == 0
+    assert evidence["ambiguous_tool_results"] == 1
+    assert evidence["unresolved_tool_calls"] == 1
 
 
 def test_legacy_current_pointer_never_overrides_conversation_routing(tmp_path) -> None:
@@ -1217,3 +1221,45 @@ def test_goal_trace_is_bounded_and_preserves_machine_identity(tmp_path) -> None:
     assert trace[0]["type"] == "tool_call_observed"
     assert trace[0]["operation_id"] == operation_id
     assert trace[0]["tool_call_id"] == "call-1"
+
+
+def test_operation_evidence_uses_call_message_id_and_result_parent_as_exact_identity(
+    tmp_path,
+) -> None:
+    store = GoalStore(tmp_path / "state.json")
+    operation_id = "goal-parent-correlation:g1:t1"
+    goal = GoalState(
+        goal_id="goal-parent-correlation",
+        status="active",
+        active_operation_id=operation_id,
+        active_operation_turn=1,
+    )
+    store.save(goal, event_type="operation_started")
+    store.record_observed_event(
+        goal,
+        "tool_call_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "call-node-1",
+            "parent_message_id": "previous-assistant-node",
+            "tool_name": "write_api",
+        },
+        event_key="call:node-1",
+    )
+    store.record_observed_event(
+        goal,
+        "tool_result_observed",
+        {
+            "operation_id": operation_id,
+            "message_id": "result-node-1",
+            "parent_message_id": "call-node-1",
+            "tool_name": "write_api",
+        },
+        event_key="result:node-1",
+    )
+
+    evidence = store.operation_evidence(goal, operation_id)
+    assert evidence["exact_matches"] == 1
+    assert evidence["inferred_matches"] == 0
+    assert evidence["unresolved_tool_calls"] == 0
+    assert evidence["ambiguous_tool_results"] == 0

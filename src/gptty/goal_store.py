@@ -410,12 +410,12 @@ class GoalStore:
 
     @staticmethod
     def _tool_evidence_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
-        """Pair tool calls/results without guessing across ambiguous identities.
+        """Pair tool calls/results only by exact provider/correlation identity.
 
-        Exact CWA tool_call_id is authoritative. A result without exact
-        identity may resolve a call only when there is exactly one unmatched call
-        for that tool. Two same-tool outstanding calls therefore remain unresolved
-        instead of being paired by arrival order.
+        Exact CWA tool_call_id (or its exact parent-message correlation) is
+        authoritative. A result without exact identity never resolves a call,
+        even when only one same-tool call is outstanding. Tool-name uniqueness is
+        observational evidence, not causal identity.
         """
         calls = 0
         results = 0
@@ -431,12 +431,12 @@ class GoalStore:
             return str(payload.get("tool_name") or "<unknown>").strip() or "<unknown>"
 
         def explicit_call_id(payload: dict[str, Any], *, call: bool) -> str | None:
-            for key in ("tool_call_id", "parent_message_id"):
+            keys = ("tool_call_id", "message_id") if call else (
+                "tool_call_id",
+                "parent_message_id",
+            )
+            for key in keys:
                 value = payload.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-            if call:
-                value = payload.get("message_id")
                 if isinstance(value, str) and value.strip():
                     return value.strip()
             return None
@@ -489,10 +489,10 @@ class GoalStore:
                 for token, candidate in unmatched.items()
                 if candidate.get("tool") == tool
             ]
-            if len(candidates) == 1:
-                unmatched.pop(candidates[0], None)
-                inferred_matches += 1
-            elif len(candidates) > 1:
+            if candidates:
+                # Same-tool uniqueness is still not causal identity. Keep every
+                # candidate unresolved until an exact provider/correlation id or
+                # an explicit reconciliation proof is available.
                 ambiguous_results += 1
             else:
                 orphan_results += 1

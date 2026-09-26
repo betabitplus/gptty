@@ -109,6 +109,8 @@ def test_tracker_binds_exact_session_and_persists_mapping(tmp_path: Path) -> Non
     assert reloaded.session_for("conversation-1") == session
     snapshot = reloaded.snapshot("conversation-1", now_ms=1_789_764_071_500)
     assert snapshot.bound is True
+    assert snapshot.binding_method == "heuristic_tool_args_time_window"
+    assert snapshot.authoritative is False
     assert snapshot.inflight is False
     assert snapshot.last_tool == "read"
     assert snapshot.outcome == "ok"

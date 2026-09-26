@@ -1188,7 +1188,7 @@ def test_active_toolbar_reflows_to_current_terminal_width(tmp_path) -> None:
     status = (
         "PROLONGED SILENCE · no observable server events 06:46"
         " · turn may still be working · do not resend yet"
-        " · CodexPro exact activity 00:04"
+        " · CodexPro observed activity 00:04"
     )
     session.set_active_turn(
         TurnControlSignals(),
@@ -1213,7 +1213,7 @@ def test_active_toolbar_reflows_to_current_terminal_width(tmp_path) -> None:
     assert rendered[120] != rendered[80]
     assert "Ctrl-C stop" in rendered[120]
     assert "Ctrl-C stop" not in rendered[80]
-    assert "CodexPro active 00:04" in rendered[80]
+    assert "CodexPro hint 00:04" in rendered[80]
     assert rendered[50].endswith("…")
 
 

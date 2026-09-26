@@ -21,6 +21,8 @@ _ANCHOR_BYTES = 512
 @dataclass(frozen=True)
 class CodexProActivitySnapshot:
     bound: bool = False
+    binding_method: str = "unbound"
+    authoritative: bool = False
     session_sha256: str | None = None
     last_event_age_seconds: float | None = None
     last_tool: str | None = None
@@ -324,7 +326,12 @@ class CodexProActivityTracker:
                 elif activity_id in starts:
                     events_by_activity.setdefault(activity_id, []).append(record)
             if not starts:
-                return CodexProActivitySnapshot(bound=True, session_sha256=session)
+                return CodexProActivitySnapshot(
+                    bound=True,
+                    binding_method="heuristic_tool_args_time_window",
+                    authoritative=False,
+                    session_sha256=session,
+                )
 
             current_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
             latest_record: dict[str, Any] | None = None
@@ -399,6 +406,8 @@ class CodexProActivityTracker:
             active = inflight[0] if inflight else None
             return CodexProActivitySnapshot(
                 bound=True,
+                binding_method="heuristic_tool_args_time_window",
+                authoritative=False,
                 session_sha256=session,
                 last_event_age_seconds=last_age,
                 last_tool=latest_tool,

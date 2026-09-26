@@ -2339,6 +2339,7 @@ def test_unresolved_machine_observed_tool_call_forces_reconciliation_before_comp
         "tool_call_observed",
         {
             "operation_id": state.goal.active_operation_id,
+            "tool_call_id": "call-marker-1",
             "label": "write marker",
             "text": "touch marker.txt",
         },
@@ -2372,6 +2373,7 @@ def test_unresolved_machine_observed_tool_call_forces_reconciliation_before_comp
         "tool_result_observed",
         {
             "operation_id": state.goal.active_operation_id,
+            "tool_call_id": "call-marker-1",
             "label": "marker written",
             "text": "exit 0",
         },
@@ -3212,3 +3214,66 @@ def test_goal_journals_stable_connector_and_action_lifecycle_without_promoting_s
     recovery = "\n".join(commands.goal_store.recovery_context(state.goal))
     assert "connector=calendar" in recovery
     assert "action_id=action:1" in recovery
+
+
+def test_goal_compat_text_chat_limit_cannot_authorize_rollover(tmp_path) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, _, _, _ = make_commands(tmp_path, state=state)
+
+    commands.handle('/goal "finish safely"')
+    activation = commands.pop_automatic_prompt()
+    assert activation is not None
+    assert commands.mark_goal_turn_started(activation, automatic=True) is not None
+    assert state.goal is not None
+    original_generation = state.goal.generation
+
+    handled = commands.handle_goal_turn_failure(
+        {
+            "terminal_marker": (
+                "chat",
+                "limit-reached",
+                "This conversation reached its length limit; start a new chat to continue.",
+            ),
+            "terminal_source": "request_error",
+            "conversation_ref": "conv-1",
+            "failure_classification": {
+                "label": "chat",
+                "status": "limit-reached",
+                "message": "This conversation reached its length limit; start a new chat to continue.",
+                "source": "compat-text",
+                "write_may_have_been_submitted": False,
+                "reconciliation_required": False,
+            },
+        },
+        "chat turn failed with exit code 1",
+    )
+
+    assert handled is True
+    assert state.goal.generation == original_generation
+    assert state.goal.rollover_count == 0
+    assert state.goal.conversation_ref == "conv-1"
+    assert state.current_conversation == "conv-1"
+    assert commands.has_automatic_prompt is True
+    assert not any(
+        event["type"] == "rollover" for event in commands.goal_store.events(state.goal)
+    )
+
+
+def test_goal_terminal_authority_rejects_archive_and_uncoded_error_text() -> None:
+    assert InteractiveCommands._goal_terminal_evidence_authoritative(
+        {"terminal_source": "conversation_archive"}
+    ) is False
+    assert InteractiveCommands._goal_terminal_evidence_authoritative(
+        {
+            "terminal_source": "browser-stream",
+            "terminal_error": "conversation too long; start a new chat",
+            "terminal_error_code": None,
+        }
+    ) is False
+    assert InteractiveCommands._goal_terminal_evidence_authoritative(
+        {
+            "terminal_source": "browser-stream",
+            "terminal_error": "localized provider text",
+            "terminal_error_code": "conversation_too_large",
+        }
+    ) is True

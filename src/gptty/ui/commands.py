@@ -819,6 +819,9 @@ class InteractiveCommands:
                 status=status,
                 final_signal=parsed.signal,
                 provider_write_ambiguous=provider_write_ambiguous,
+                terminal_evidence_authoritative=self._goal_terminal_evidence_authoritative(
+                    result
+                ),
             )
             event_payload = self._goal_result_event_payload(result, parsed)
             if decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS:
@@ -1057,6 +1060,9 @@ class InteractiveCommands:
             label=label,
             status=status,
             provider_write_ambiguous=self._goal_provider_write_ambiguous(result),
+            terminal_evidence_authoritative=self._goal_terminal_evidence_authoritative(
+                result
+            ),
         )
         if decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS:
             return self._block_goal_for_ambiguous_operation(
@@ -1113,6 +1119,26 @@ class InteractiveCommands:
                 or failure_classification.get("write_may_have_been_submitted") is True
             )
         )
+
+    @staticmethod
+    def _goal_terminal_evidence_authoritative(result: dict[str, Any]) -> bool:
+        failure_classification = result.get("failure_classification")
+        if isinstance(failure_classification, dict):
+            authoritative = failure_classification.get("authoritative")
+            if isinstance(authoritative, bool):
+                return authoritative
+            source = str(failure_classification.get("source") or "").strip().lower()
+            return source == "structured"
+
+        terminal_source = str(result.get("terminal_source") or "").strip().lower()
+        if terminal_source == "conversation_archive":
+            return False
+
+        terminal_error = str(result.get("terminal_error") or "").strip()
+        terminal_error_code = str(result.get("terminal_error_code") or "").strip()
+        if terminal_error and not terminal_error_code:
+            return False
+        return True
 
     def _bind_goal_conversation(
         self,

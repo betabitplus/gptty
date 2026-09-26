@@ -485,7 +485,11 @@ def test_goal_hard_chat_limit_rolls_over_to_new_chat_and_completes(
 
         def send_to_conversation(self, ref: str, prompt: str, **options):
             self.calls.append(("send_to_conversation", prompt, ref))
-            raise RuntimeError("CHATGPT_CONVERSATION_LIMIT_EXCEEDED")
+
+            class ConversationTooLargeError(RuntimeError):
+                reason_code = "conversation_too_large"
+
+            raise ConversationTooLargeError("localized provider wording")
 
         def send(self, prompt: str, **options):
             self.calls.append(("send", prompt, None))
@@ -2740,7 +2744,7 @@ def test_resume_terminal_backend_override_does_not_enter_follow(
     assert _load_session_state(tmp_path / "state.json").current_conversation == "conv-stale"
 
 
-def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
+def test_working_status_surfaces_observed_codexpro_heartbeat(monkeypatch) -> None:
     class Tracker:
         def snapshot(self, _conversation_ref):
             return chat_module.CodexProActivitySnapshot(
@@ -2768,7 +2772,7 @@ def test_working_status_surfaces_exact_codexpro_heartbeat(monkeypatch) -> None:
 
     status = chat_module._working_status(500.0, 0, health=health)
     assert "PROLONGED SILENCE" in status
-    assert "CodexPro exact: bash running" in status
+    assert "CodexPro observed: bash running" in status
     assert "heartbeat 00:07 ago" in status
     assert "do not resend yet" in status
 

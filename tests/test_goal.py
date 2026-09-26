@@ -231,3 +231,31 @@ def test_goal_history_sanitizer_preserves_user_steering_without_service_suffix()
 def test_goal_history_sanitizer_does_not_hide_matching_user_phrase_without_protocol() -> None:
     text = "Continue pursuing the active goal from this conversation. This is my own wording."
     assert sanitize_goal_history_text("user", text) == text
+
+
+def test_goal_terminal_decision_non_authoritative_marker_cannot_rollover() -> None:
+    decision = goal_terminal_decision(
+        label="chat",
+        status="limit-reached",
+        terminal_evidence_authoritative=False,
+    )
+    assert decision.action is GoalTerminalAction.RECOVER
+    assert decision.allow_rollover is False
+
+    completed = goal_terminal_decision(
+        label="chat",
+        status="limit-reached",
+        final_signal=GoalSignal.COMPLETE,
+        terminal_evidence_authoritative=False,
+    )
+    assert completed.action is GoalTerminalAction.NONE
+
+
+def test_goal_terminal_decision_ambiguity_still_dominates_non_authoritative_marker() -> None:
+    decision = goal_terminal_decision(
+        label="chat",
+        status="limit-reached",
+        provider_write_ambiguous=True,
+        terminal_evidence_authoritative=False,
+    )
+    assert decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS

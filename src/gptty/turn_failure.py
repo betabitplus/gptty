@@ -22,8 +22,14 @@ class TurnFailure:
     def marker(self) -> tuple[str, str, str]:
         return (self.label, self.status, self.message)
 
+    @property
+    def authoritative(self) -> bool:
+        return self.source == "structured"
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["authoritative"] = self.authoritative
+        return payload
 
 
 _CONVERSATION_LIMIT_CODES = {

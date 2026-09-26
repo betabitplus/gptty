@@ -166,8 +166,8 @@ def _compact_active_status(status: str) -> str:
         (" · answer text received", " · answer received"),
         (" · do not resend yet", " · don't resend"),
         (" · finality unconfirmed ", " · finality "),
-        ("CodexPro exact activity ", "CodexPro active "),
-        ("CodexPro exact: ", "CodexPro "),
+        ("CodexPro observed activity ", "CodexPro hint "),
+        ("CodexPro observed: ", "CodexPro hint "),
         (" · heartbeat ", " · hb "),
     )
     for old, new in replacements:

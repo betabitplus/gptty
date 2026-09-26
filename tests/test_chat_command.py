@@ -320,9 +320,9 @@ def test_terminal_marker_classifies_post_final_conversation_limit() -> None:
             "but you can keep talking by starting a new chat."
         ),
     ) == (
-        "chat",
-        "limit-reached",
-        "This conversation reached its maximum length; start a new chat to continue.",
+        "turn",
+        "abnormal",
+        "ChatGPT reported a terminal error without a stable semantic code.",
     )
 
 
@@ -420,6 +420,7 @@ def test_goal_recovery_can_suppress_raw_request_error_output(tmp_path) -> None:
     assert stderr.getvalue() == ""
     assert result["terminal_marker"][:2] == ("chat", "limit-reached")
     assert result["failure_classification"]["source"] == "compat-text"
+    assert result["failure_classification"]["authoritative"] is False
 
 
 def test_send_result_records_structured_rate_limit_classification(tmp_path) -> None:
@@ -463,6 +464,7 @@ def test_send_result_records_structured_rate_limit_classification(tmp_path) -> N
         "status": "rate-limited",
         "message": "ChatGPT rate-limited this turn before final completion.",
         "source": "structured",
+        "authoritative": True,
         "code": None,
         "status_code": 429,
         "request_stage": "conversation_stream",
@@ -890,16 +892,16 @@ def test_current_chat_error_blocks_supersession_of_older_marker(tmp_path) -> Non
 
     assert code == 0
     assert result["terminal_marker"] == (
-        "chat",
-        "limit-reached",
-        "This conversation reached its maximum length; start a new chat to continue.",
+        "turn",
+        "abnormal",
+        "ChatGPT reported a terminal error without a stable semantic code.",
     )
     assert result["terminal_source"] == "browser-stream"
     assert archive.conversation_terminal_marker(conversation_ref) == (
         "chat",
-        "limit-reached",
-        "This conversation reached its maximum length; start a new chat to continue.",
-        "browser-stream",
+        "unavailable",
+        "This conversation is no longer available; continue in a new chat.",
+        "stream",
     )
     events = archive.store.tui_events(conversation_ref)
     assert not any(event.get("terminal_resolution") is True for event in events)
@@ -2308,3 +2310,52 @@ def test_send_chat_prompt_projects_typed_sources_to_renderer_and_archive(tmp_pat
         "product_connector_started",
         "product_required_action_started",
     ]
+
+
+def test_compat_text_failure_does_not_persist_chat_terminal_authority(tmp_path) -> None:
+    conversation_ref = "conv-compat-hint"
+
+    class LimitClient:
+        def send_to_conversation(self, ref, prompt, **options):
+            assert ref == conversation_ref
+            raise RuntimeError("maximum length reached; start a new chat to continue")
+
+    class Renderer:
+        def turn_abort(self):
+            return None
+
+        def warning(self, text):
+            return None
+
+    archive = TUIArchive(tmp_path / "archive")
+    turn_id = archive.record_user(
+        "question",
+        conversation_ref=conversation_ref,
+        model=None,
+    )
+    state = ChatState(current_conversation=conversation_ref)
+    result: dict[str, Any] = {}
+
+    code = _send_chat_prompt(
+        LimitClient(),
+        state=state,
+        state_path=tmp_path / "state.json",
+        profile=None,
+        prompt="question",
+        model=None,
+        media=None,
+        stream=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+        renderer=Renderer(),
+        defer_final_rendering=True,
+        suppress_request_error_output=True,
+        result_out=result,
+        tui_archive=archive,
+        archive_turn_id=turn_id,
+    )
+
+    assert code == 1
+    assert result["failure_classification"]["source"] == "compat-text"
+    assert result["failure_classification"]["authoritative"] is False
+    assert archive.conversation_terminal_marker(conversation_ref) is None

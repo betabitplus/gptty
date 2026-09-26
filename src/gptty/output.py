@@ -471,6 +471,8 @@ def _render_tool_call(*, tool: str, text: str, label: str) -> str | None:
 
 
 def _api_tool_label_parts(label: str) -> tuple[str, str]:
+    """Best-effort display labels only; never identity, approval, or recovery authority."""
+
     cleaned = _clean_tool_detail(label)
     if not cleaned:
         return "", ""

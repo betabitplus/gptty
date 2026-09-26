@@ -162,11 +162,20 @@ def goal_terminal_decision(
     status: str,
     final_signal: GoalSignal | None = None,
     provider_write_ambiguous: bool = False,
+    terminal_evidence_authoritative: bool = True,
 ) -> GoalTerminalDecision:
     """Choose recovery policy from typed terminal evidence without performing side effects."""
 
     if provider_write_ambiguous:
         return GoalTerminalDecision(GoalTerminalAction.BLOCK_AMBIGUOUS)
+
+    if not terminal_evidence_authoritative:
+        if final_signal in {GoalSignal.COMPLETE, GoalSignal.BLOCKED}:
+            return GoalTerminalDecision(GoalTerminalAction.NONE)
+        return GoalTerminalDecision(
+            GoalTerminalAction.RECOVER,
+            allow_rollover=False,
+        )
 
     normalized_label = str(label or "").strip().lower()
     normalized_status = str(status or "").strip().lower()

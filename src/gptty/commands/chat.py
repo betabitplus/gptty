@@ -666,41 +666,17 @@ def _turn_terminal_marker(
         return None
     error_code = str(terminal_error_code or "").strip().lower()
     error_text = str(terminal_error or "").strip()
-    normalized_error_text = error_text.casefold()
-    conversation_limit_text = any(
-        token in normalized_error_text
-        for token in (
-            "maximum length for this conversation",
-            "max conversation",
-            "conversation too long",
-            "conversation length",
-            "conversation_limit_exceeded",
-            "conversation limit exceeded",
-            "start a new chat",
-            "new chat to continue",
-        )
-    )
-    if error_code == "conversation_too_large" or conversation_limit_text:
+    if error_code == "conversation_too_large":
         return (
             "chat",
             "limit-reached",
             "This conversation reached its maximum length; start a new chat to continue.",
         )
-    conversation_unavailable_text = any(
-        token in normalized_error_text
-        for token in (
-            "conversation not found",
-            "conversation unavailable",
-            "unable to load conversation",
-            "could not load conversation",
-            "chat not found",
-        )
-    )
     if error_code in {
         "conversation_unavailable",
         "conversation_not_found",
         "conversation_missing",
-    } or conversation_unavailable_text:
+    }:
         return (
             "chat",
             "unavailable",
@@ -711,6 +687,12 @@ def _turn_terminal_marker(
         if error_text:
             detail = f"{detail} {error_text}"
         return ("turn", "abnormal", detail)
+    if error_text:
+        return (
+            "turn",
+            "abnormal",
+            "ChatGPT reported a terminal error without a stable semantic code.",
+        )
     reason = str(finish_reason or "").strip().lower()
     if reason == "incomplete":
         return (
@@ -2773,7 +2755,7 @@ def _codexpro_status_suffix(snapshot: CodexProActivitySnapshot) -> str:
         heartbeat_age = snapshot.last_heartbeat_age_seconds
         if heartbeat_age is not None and heartbeat_age <= 45.0:
             return (
-                f" · CodexPro exact: {tool} running"
+                f" · CodexPro observed: {tool} running"
                 f" · heartbeat {_format_status_duration(heartbeat_age)} ago"
             )
         if (
@@ -2782,17 +2764,17 @@ def _codexpro_status_suffix(snapshot: CodexProActivitySnapshot) -> str:
             and snapshot.last_event_age_seconds <= 20.0
         ):
             return (
-                f" · CodexPro exact: {tool} in flight"
+                f" · CodexPro observed: {tool} in flight"
                 f" · started {_format_status_duration(snapshot.last_event_age_seconds)} ago"
             )
     if snapshot.last_event_age_seconds is not None:
         if snapshot.last_event_age_seconds <= CODEXPRO_RECENT_ACTIVITY_MAX_AGE_SECONDS:
             return (
-                " · CodexPro exact activity "
+                " · CodexPro observed activity "
                 f"{_format_status_duration(snapshot.last_event_age_seconds)} ago"
             )
         return ""
-    return " · CodexPro session mapped"
+    return " · CodexPro session heuristically mapped"
 
 
 def _working_status(
@@ -3441,6 +3423,7 @@ def _send_chat_prompt(
                         and marker_ref.strip()
                         and tui_archive is not None
                         and archive_turn_id
+                        and failure.authoritative
                     ):
                         try:
                             tui_archive.record_terminal(
