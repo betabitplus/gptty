@@ -1063,6 +1063,7 @@ class InteractiveCommands:
             terminal_evidence_authoritative=self._goal_terminal_evidence_authoritative(
                 result
             ),
+            automatic_retry_allowed=self._goal_automatic_retry_allowed(result),
         )
         if decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS:
             return self._block_goal_for_ambiguous_operation(
@@ -1119,6 +1120,14 @@ class InteractiveCommands:
                 or failure_classification.get("write_may_have_been_submitted") is True
             )
         )
+
+    @staticmethod
+    def _goal_automatic_retry_allowed(result: dict[str, Any]) -> bool | None:
+        failure_classification = result.get("failure_classification")
+        if not isinstance(failure_classification, dict):
+            return None
+        value = failure_classification.get("automatic_retry_allowed")
+        return value if isinstance(value, bool) else None
 
     @staticmethod
     def _goal_terminal_evidence_authoritative(result: dict[str, Any]) -> bool:

@@ -59,8 +59,27 @@ def test_goal_terminal_decision_provider_ambiguity_dominates_other_statuses() ->
         status="limit-reached",
         final_signal=GoalSignal.COMPLETE,
         provider_write_ambiguous=True,
+        automatic_retry_allowed=False,
     )
     assert decision.action is GoalTerminalAction.BLOCK_AMBIGUOUS
+
+
+def test_goal_terminal_decision_provider_forbidden_retry_blocks_without_recovery() -> None:
+    decision = goal_terminal_decision(
+        label="turn",
+        status="failed",
+        automatic_retry_allowed=False,
+    )
+    assert decision.action is GoalTerminalAction.BLOCK
+    assert decision.allow_rollover is True
+
+    compatibility_marker = goal_terminal_decision(
+        label="turn",
+        status="failed",
+        terminal_evidence_authoritative=False,
+        automatic_retry_allowed=False,
+    )
+    assert compatibility_marker.action is GoalTerminalAction.BLOCK
 
 
 def test_parse_goal_response_supports_all_terminal_signals_case_insensitively() -> None:

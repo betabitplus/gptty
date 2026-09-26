@@ -2140,6 +2140,68 @@ def test_goal_provider_write_ambiguity_blocks_without_recovery_prompt(
     assert "turn_abnormal" not in [event["type"] for event in events[-2:]]
 
 
+def test_goal_pre_dispatch_retry_prohibition_blocks_without_automatic_recovery(
+    tmp_path, monkeypatch
+) -> None:
+    state = ChatState(current_conversation="conv-1")
+    commands, renderer, _, _ = make_commands(tmp_path, state=state)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **_kwargs: None,
+    )
+
+    commands.handle('/goal "finish safely"')
+    activation = commands.pop_automatic_prompt()
+    assert activation is not None
+    assert commands.mark_goal_turn_started(activation, automatic=True) is not None
+    assert state.goal is not None
+    original_generation = state.goal.generation
+
+    handled = commands.handle_goal_turn_failure(
+        {
+            "terminal_marker": (
+                "turn",
+                "failed",
+                "Provider proved protected write was not dispatched.",
+            ),
+            "terminal_source": "request_error",
+            "conversation_ref": "conv-1",
+            "failure_classification": {
+                "label": "turn",
+                "status": "failed",
+                "message": "Provider proved protected write was not dispatched.",
+                "source": "structured",
+                "code": "BROWSER_OWNED_WRITE_NOT_DISPATCHED",
+                "request_stage": "browser_owned_write_pre_dispatch",
+                "automatic_retry_allowed": False,
+                "manual_retry_safe_after_repair": True,
+                "write_may_have_been_submitted": False,
+                "reconciliation_required": False,
+                "write_dispatched": False,
+                "submit_request_observed": False,
+                "submit_response_observed": False,
+            },
+        },
+        "chat turn failed with exit code 1",
+    )
+
+    assert handled is True
+    assert state.goal.status == "blocked"
+    assert state.goal.generation == original_generation
+    assert state.goal.rollover_count == 0
+    assert state.goal.active_operation_id is None
+    assert commands.has_automatic_prompt is False
+    assert ("warning", "Goal · blocked · user action required") in renderer.events
+
+    events = commands.goal_store.events(state.goal)
+    assert events[-1]["type"] == "turn_terminal"
+    payload = events[-1]["payload"]["failure_classification"]
+    assert payload["automatic_retry_allowed"] is False
+    assert payload["manual_retry_safe_after_repair"] is True
+    assert payload["write_dispatched"] is False
+    assert not any(event["type"] == "rollover" for event in events[-2:])
+
+
 def test_goal_operation_identity_and_tool_evidence_survive_pause_resume(tmp_path) -> None:
     state = ChatState(current_conversation="conv-1")
     commands, _, _, _ = make_commands(tmp_path, state=state)

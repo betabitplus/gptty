@@ -163,11 +163,18 @@ def goal_terminal_decision(
     final_signal: GoalSignal | None = None,
     provider_write_ambiguous: bool = False,
     terminal_evidence_authoritative: bool = True,
+    automatic_retry_allowed: bool | None = None,
 ) -> GoalTerminalDecision:
     """Choose recovery policy from typed terminal evidence without performing side effects."""
 
     if provider_write_ambiguous:
         return GoalTerminalDecision(GoalTerminalAction.BLOCK_AMBIGUOUS)
+
+    # Provider-owned retry authority outranks generic terminal-label recovery.
+    # Even when a terminal label itself came from compatibility text, an exact
+    # write-layer prohibition must never be converted into an automatic resend.
+    if automatic_retry_allowed is False:
+        return GoalTerminalDecision(GoalTerminalAction.BLOCK)
 
     if not terminal_evidence_authoritative:
         if final_signal in {GoalSignal.COMPLETE, GoalSignal.BLOCKED}:

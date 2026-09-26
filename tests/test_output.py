@@ -326,6 +326,11 @@ def test_normalize_turn_failure_redacts_diagnostics_and_preserves_typed_flags() 
         "write_may_have_been_submitted": True,
         "reconciliation_required": True,
         "automatic_retry_allowed": False,
+        "manual_retry_safe_after_repair": False,
+        "write_dispatched": True,
+        "submit_request_observed": True,
+        "submit_response_observed": True,
+        "submit_response_status": 429,
     }
 
     result = normalize_turn_failure(
@@ -340,6 +345,11 @@ def test_normalize_turn_failure_redacts_diagnostics_and_preserves_typed_flags() 
     assert result["error"]["write_may_have_been_submitted"] is True
     assert result["error"]["reconciliation_required"] is True
     assert result["error"]["automatic_retry_allowed"] is False
+    assert result["error"]["manual_retry_safe_after_repair"] is False
+    assert result["error"]["write_dispatched"] is True
+    assert result["error"]["submit_request_observed"] is True
+    assert result["error"]["submit_response_observed"] is True
+    assert result["error"]["submit_response_status"] == 429
     assert sensitive not in result["error"]["message"]
     assert sensitive not in result["diagnostic_error"]
     assert "[REDACTED]" in result["error"]["message"]

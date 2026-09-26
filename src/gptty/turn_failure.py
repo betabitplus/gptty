@@ -17,6 +17,12 @@ class TurnFailure:
     request_stage: str | None = None
     write_may_have_been_submitted: bool = False
     reconciliation_required: bool = False
+    automatic_retry_allowed: bool | None = None
+    manual_retry_safe_after_repair: bool | None = None
+    write_dispatched: bool | None = None
+    submit_request_observed: bool | None = None
+    submit_response_observed: bool | None = None
+    submit_response_status: int | None = None
 
     @property
     def marker(self) -> tuple[str, str, str]:
@@ -28,6 +34,16 @@ class TurnFailure:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        for key in (
+            "automatic_retry_allowed",
+            "manual_retry_safe_after_repair",
+            "write_dispatched",
+            "submit_request_observed",
+            "submit_response_observed",
+            "submit_response_status",
+        ):
+            if payload.get(key) is None:
+                payload.pop(key, None)
         payload["authoritative"] = self.authoritative
         return payload
 
@@ -62,12 +78,36 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
     reconciliation_required = (
         getattr(error, "reconciliation_required", None) is True
     )
+    automatic_retry_allowed = _optional_bool(
+        getattr(error, "automatic_retry_allowed", None)
+    )
+    manual_retry_safe_after_repair = _optional_bool(
+        getattr(error, "manual_retry_safe_after_repair", None)
+    )
+    write_dispatched = _optional_bool(getattr(error, "write_dispatched", None))
+    submit_request_observed = _optional_bool(
+        getattr(error, "submit_request_observed", None)
+    )
+    submit_response_observed = _optional_bool(
+        getattr(error, "submit_response_observed", None)
+    )
+    submit_response_status = _optional_int(
+        getattr(error, "submit_response_status", None)
+    )
     structured_code = (
         terminal_error_code
         or reason_code
         or failure_kind
     )
     normalized_code = (structured_code or "").strip().lower()
+    dispatch_evidence = {
+        "automatic_retry_allowed": automatic_retry_allowed,
+        "manual_retry_safe_after_repair": manual_retry_safe_after_repair,
+        "write_dispatched": write_dispatched,
+        "submit_request_observed": submit_request_observed,
+        "submit_response_observed": submit_response_observed,
+        "submit_response_status": submit_response_status,
+    }
 
     # Once the provider says a write may have crossed the commit point, that
     # ambiguity dominates secondary HTTP/status details. Retrying from an HTTP
@@ -84,6 +124,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
             write_may_have_been_submitted=write_may_have_been_submitted,
             reconciliation_required=reconciliation_required,
         )
@@ -99,6 +140,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     if normalized_code in _CONVERSATION_UNAVAILABLE_CODES:
@@ -110,6 +152,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     if normalized_code in _VERIFICATION_CODES:
@@ -121,6 +164,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     if status_code == 429:
@@ -132,6 +176,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     if isinstance(error, ConversationTimeoutError):
@@ -146,6 +191,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     # RequestError is a typed provider failure even when it lacks a semantic
@@ -162,6 +208,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
                 code=structured_code,
                 status_code=status_code,
                 request_stage=request_stage,
+                **dispatch_evidence,
             )
         return TurnFailure(
             label="turn",
@@ -171,6 +218,7 @@ def classify_turn_failure(error: BaseException) -> TurnFailure:
             code=structured_code,
             status_code=status_code,
             request_stage=request_stage,
+            **dispatch_evidence,
         )
 
     compatibility = _classify_compat_text(str(error))
@@ -265,6 +313,10 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _optional_int(value: Any) -> int | None:

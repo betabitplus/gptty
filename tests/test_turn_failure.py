@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from chatgpt_web_adapter import ConversationTimeoutError, RequestError
 from chatgpt_web_adapter.browser_owned_write_runtime import (
+    WRITE_NOT_DISPATCHED,
     WRITE_OUTCOME_UNKNOWN,
     BrowserOwnedWriteRuntimeError,
 )
@@ -63,6 +64,34 @@ def test_post_submit_ambiguity_dominates_429_and_requires_reconciliation() -> No
     assert failure.reconciliation_required is True
     assert "reconcile" in failure.message
     assert failure.status != "rate-limited"
+
+
+def test_exact_pre_dispatch_failure_preserves_dispatch_evidence() -> None:
+    error = BrowserOwnedWriteRuntimeError(
+        "provider proved protected write was not dispatched",
+        failure_kind=WRITE_NOT_DISPATCHED,
+        automatic_retry_allowed=False,
+        manual_retry_safe_after_repair=True,
+        write_may_have_been_submitted=False,
+        reconciliation_required=False,
+        request_stage="browser_owned_write_pre_dispatch",
+        write_dispatched=False,
+        submit_request_observed=False,
+        submit_response_observed=False,
+    )
+
+    failure = classify_turn_failure(error)
+
+    assert failure.status == "failed"
+    assert failure.source == "structured"
+    assert failure.code == WRITE_NOT_DISPATCHED
+    assert failure.write_may_have_been_submitted is False
+    assert failure.reconciliation_required is False
+    assert failure.write_dispatched is False
+    assert failure.submit_request_observed is False
+    assert failure.submit_response_observed is False
+    assert failure.submit_response_status is None
+    assert failure.to_dict()["write_dispatched"] is False
 
 
 def test_structured_403_is_generic_failure_not_verification_guess() -> None:

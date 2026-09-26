@@ -664,6 +664,108 @@ def test_goal_post_submit_ambiguity_never_auto_resends(
     assert not any(event["type"] == "rollover" for event in events)
 
 
+def test_goal_proven_pre_dispatch_failure_never_auto_resends(
+    tmp_path, monkeypatch
+) -> None:
+    from chatgpt_web_adapter.browser_owned_write_runtime import (
+        WRITE_NOT_DISPATCHED,
+        BrowserOwnedWriteRuntimeError,
+    )
+
+    class PreDispatchFailureClient:
+        instances: list["PreDispatchFailureClient"] = []
+
+        def __init__(
+            self, auth_file: str = "auth_data.json", timeout: int = 90
+        ) -> None:
+            self.calls: list[tuple[str, str, str | None]] = []
+            self.__class__.instances.append(self)
+
+        def get_messages(self, ref: str):
+            return [
+                {"role": "user", "text": "Finish safely."},
+                {"role": "assistant", "text": "Ready."},
+            ]
+
+        def send_to_conversation(self, ref: str, prompt: str, **options):
+            self.calls.append(("send_to_conversation", prompt, ref))
+            raise BrowserOwnedWriteRuntimeError(
+                "provider proved protected write was not dispatched",
+                failure_kind=WRITE_NOT_DISPATCHED,
+                automatic_retry_allowed=False,
+                manual_retry_safe_after_repair=True,
+                write_may_have_been_submitted=False,
+                reconciliation_required=False,
+                request_stage="browser_owned_write_pre_dispatch",
+                write_dispatched=False,
+                submit_request_observed=False,
+                submit_response_observed=False,
+            )
+
+        def send(self, prompt: str, **options):
+            self.calls.append(("send", prompt, None))
+            raise AssertionError("pre-dispatch Goal failure must not auto-resend")
+
+    save_chat_state(
+        tmp_path / "state.json",
+        ChatState(current_conversation="conv-pre-dispatch"),
+    )
+    PreDispatchFailureClient.instances.clear()
+    _FakeRenderer.instances.clear()
+    _FakeSession.script = iter(
+        [
+            '/goal "Finish safely without duplicate writes"',
+            (
+                lambda: bool(_FakeRenderer.instances)
+                and any(
+                    kind == "warning"
+                    and "user action required" in str(message)
+                    for kind, message in _FakeRenderer.instances[0].events
+                ),
+                "/exit",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "gptty.commands.chat.should_use_enhanced_ui",
+        lambda **kwargs: (True, SimpleNamespace()),
+    )
+    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
+    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
+    monkeypatch.setattr(
+        "gptty.ui.commands.notify_response_complete",
+        lambda **_kwargs: None,
+    )
+
+    code = run_chat(
+        _args(tmp_path),
+        client_factory=PreDispatchFailureClient,
+        input_stream=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert code == 0
+    client = PreDispatchFailureClient.instances[0]
+    assert [call[0] for call in client.calls] == ["send_to_conversation"]
+    assert client.calls[0][2] == "conv-pre-dispatch"
+
+    _state, goal = _load_session_goal(tmp_path / "state.json")
+    assert goal.status == "blocked"
+    assert goal.rollover_count == 0
+    assert goal.active_operation_id is None
+    events = GoalStore(tmp_path / "state.json").events(goal)
+    assert events[-1]["type"] == "turn_terminal"
+    classification = events[-1]["payload"]["failure_classification"]
+    assert classification["code"] == WRITE_NOT_DISPATCHED
+    assert classification["automatic_retry_allowed"] is False
+    assert classification["manual_retry_safe_after_repair"] is True
+    assert classification["write_dispatched"] is False
+    assert classification["submit_request_observed"] is False
+    assert classification["submit_response_observed"] is False
+    assert not any(event["type"] == "rollover" for event in events)
+
+
 def test_goal_queued_steering_replaces_pending_auto_continuation(
     tmp_path, monkeypatch
 ) -> None:

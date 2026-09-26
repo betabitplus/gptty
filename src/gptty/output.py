@@ -314,6 +314,10 @@ def normalize_turn_failure(
             "manual_retry_safe_after_repair": payload.get(
                 "manual_retry_safe_after_repair"
             ),
+            "write_dispatched": payload.get("write_dispatched"),
+            "submit_request_observed": payload.get("submit_request_observed"),
+            "submit_response_observed": payload.get("submit_response_observed"),
+            "submit_response_status": payload.get("submit_response_status"),
         },
         "provenance": {
             "producer": "gptty",
