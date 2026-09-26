@@ -33,7 +33,12 @@ from prompt_toolkit.layout import CompletionsMenu, Float, FloatContainer, Layout
 from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, SearchBufferControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.layout.processors import AppendAutoSuggestion, ConditionalProcessor, ReverseSearchProcessor
+from prompt_toolkit.layout.processors import (
+    AppendAutoSuggestion,
+    ConditionalProcessor,
+    ReverseSearchProcessor,
+    TabsProcessor,
+)
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.shortcuts import CompleteStyle, choice
 from prompt_toolkit.utils import get_cwidth
@@ -49,6 +54,7 @@ from .terminal_safety import sanitize_terminal_text
 
 
 ACTIVE_STATUS_REFRESH_SECONDS = 1.0
+TABSTOP = 4
 
 
 @dataclass
@@ -112,6 +118,11 @@ class _ContextualCommandCompleter(Completer):
 
 def _text_width(value: str) -> int:
     return sum(get_cwidth(char) for char in value)
+
+
+def _tab_span(display_position: int, *, tabstop: int = TABSTOP) -> int:
+    stop = max(1, int(tabstop))
+    return stop - (max(0, int(display_position)) % stop)
 
 
 def _clip_toolbar(value: str, width: int) -> str:
@@ -329,19 +340,27 @@ class _TranscriptLine:
         else:
             rows = [[]]
             used = 0
+            display_position = 0
             for style, text in self.fragments:
-                segment_start = 0
-                for index, char in enumerate(text):
+                for char in text:
+                    if char == "\t":
+                        span = _tab_span(display_position)
+                        display_position += span
+                        for _ in range(span):
+                            if used > 0 and used + 1 > width:
+                                rows.append([])
+                                used = 0
+                            self._append_row_fragment(rows[-1], style, " ")
+                            used += 1
+                        continue
+
                     char_width = max(0, get_cwidth(char))
                     if used > 0 and char_width > 0 and used + char_width > width:
-                        self._append_row_fragment(
-                            rows[-1], style, text[segment_start:index]
-                        )
                         rows.append([])
                         used = 0
-                        segment_start = index
+                    self._append_row_fragment(rows[-1], style, char)
                     used += char_width
-                self._append_row_fragment(rows[-1], style, text[segment_start:])
+                    display_position += 1
         self._wrapped_width = width
         self._wrapped_rows = tuple(tuple(row) for row in rows)
         return self._wrapped_rows
@@ -794,10 +813,11 @@ class InteractiveSession:
             buffer=default_buffer,
             search_buffer_control=search_control,
             input_processors=[
+                TabsProcessor(tabstop=TABSTOP, char1=" ", char2=" "),
                 ConditionalProcessor(
                     AppendAutoSuggestion(),
                     has_focus(default_buffer) & ~is_done,
-                )
+                ),
             ],
             include_default_input_processors=True,
             preview_search=True,
@@ -950,15 +970,30 @@ class InteractiveSession:
         col = 0
         capacity = max(1, width - prompt_width)
         positions: list[tuple[int, int]] = [(row, col)]
+        display_position = 0
         for char in text:
             if char == "\n":
                 row += 1
                 col = 0
                 capacity = width
+                display_position = 0
+                positions.append((row, col))
+                continue
+
+            if char == "\t":
+                span = _tab_span(display_position)
+                display_position += span
+                for _ in range(span):
+                    col += 1
+                    while col >= capacity:
+                        col -= capacity
+                        row += 1
+                        capacity = width
                 positions.append((row, col))
                 continue
 
             char_width = max(0, get_cwidth(char))
+            display_position += 1
             if char_width > 0 and col + char_width > capacity:
                 row += 1
                 col = 0
