@@ -37,8 +37,9 @@ HOME=/tmp/gptty-test-home PYTHONPATH=src python -m pytest -q
 After CWA changes, reinstall the local pair used for live testing:
 
 ```bash
-uv tool install --force ../chatgpt-web-adapter
-uv tool install --force . --with ../chatgpt-web-adapter
+uv tool install --force --python 3.10 --editable ../chatgpt-web-adapter
+uv tool install --force --python 3.10 --editable . --with-editable ../chatgpt-web-adapter \
+  --with-editable ../../betabit/betabit-playground/chatgpt-exporter
 ```
 
 Then run a real `gptty send --new ...` smoke before considering browser-facing changes done.
