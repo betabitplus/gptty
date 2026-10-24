@@ -20,3 +20,6 @@ e75a484 pr8-export-conversations
 1392935 pr9-image-prompts-sdk
 # local branches
 57a06ad feature/wkwebview-authority-e2e
+
+# second cleanup 2026-10-24: our branch turned into a tag, then deleted
+ee516e2 archive/wk-promotion-release-staging-20260912 -> tag archive/wk-promotion-release-staging-20260912
