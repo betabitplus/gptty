@@ -1,0 +1,22 @@
+# gptty remote (origin) branches deleted 2026-10-24, all fully in main at 57a06ad; restore: git push origin <sha>:refs/heads/<name>
+57a06ad feature/wkwebview-authority-e2e
+2fcb0d3 pr0-project-identity-packaging-skeleton
+a1f8237 pr1-sdk-client-boundary
+77ddd0c pr10-auth-ux-polish
+1c8662e pr11-release-readiness-v0-1
+5e4d0f8 pr12-required-action-output
+fad8ca8 pr13-release-0-1-1
+11cb5f3 pr14-profile-aware-config-paths
+1355268 pr14-profiles-locks-roadmap
+41f7a1c pr15-conversation-locks
+8df30c9 pr16-run-observer-live-status
+e4e3906 pr2-gptty-ask
+936dc4b pr3-stdin-pipe-support
+db5a5cd pr4-gptty-chat-migration
+6c7f83b pr5-attach-messages-status
+5fd7d19 pr6-send-to-conversation
+1b8a115 pr7-output-modes
+e75a484 pr8-export-conversations
+1392935 pr9-image-prompts-sdk
+# local branches
+57a06ad feature/wkwebview-authority-e2e
