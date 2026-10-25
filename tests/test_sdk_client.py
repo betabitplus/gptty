@@ -181,6 +181,4 @@ def test_real_adapter_runtime_has_what_gptty_calls() -> None:
             target = getattr(target, name, None)
         if not callable(target):
             missing.append(path)
-    # Known gap: the runtime's conversation reader has no get_required_action, so gptty's
-    # required-action notice never fires with the real adapter. Fixing it changes this line.
-    assert missing == ["canonical.get_required_action"]
+    assert missing == []
