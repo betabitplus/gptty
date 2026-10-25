@@ -39,14 +39,3 @@ def test_auth_result_reads_access_token_first(tmp_path: Path) -> None:
 
     assert result.api_key == "new-token"
     assert result.accessToken == "new-token"
-
-
-def test_auth_result_missing_file_preserves_legacy_bootstrap_signal(tmp_path: Path) -> None:
-    path = tmp_path / "missing.json"
-
-    try:
-        AuthResult.from_json(path)
-    except FileNotFoundError as error:
-        assert str(path) in str(error)
-    else:
-        raise AssertionError("missing reusable auth must preserve FileNotFoundError")

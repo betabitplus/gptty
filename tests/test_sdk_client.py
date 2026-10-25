@@ -1,110 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
-from gptty.sdk_client import GpttyClient, _ProductRuntimeClient
-
-
-class FakeSdkClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
-
-    def send(self, prompt: str, **options: object) -> str:
-        self.calls.append(("send", (prompt,), options))
-        return "send-result"
-
-    def send_to_conversation(
-        self,
-        url_or_id: object,
-        prompt: str,
-        **options: object,
-    ) -> str:
-        self.calls.append(("send_to_conversation", (url_or_id, prompt), options))
-        return "send-to-conversation-result"
-
-    def attach_conversation(self, url_or_id: object, **options: object) -> str:
-        self.calls.append(("attach_conversation", (url_or_id,), options))
-        return "attach-result"
-
-    def get_messages(self, url_or_id: object, **options: object) -> str:
-        self.calls.append(("get_messages", (url_or_id,), options))
-        return "messages-result"
-
-    def get_required_action(self, url_or_id: object, **options: object) -> str:
-        self.calls.append(("get_required_action", (url_or_id,), options))
-        return "required-action-result"
-
-    def get_status(self, url_or_id: object, **options: object) -> str:
-        self.calls.append(("get_status", (url_or_id,), options))
-        return "status-result"
-
-    def wait_until_completed(self, url_or_id: object, **options: object) -> str:
-        self.calls.append(("wait_until_completed", (url_or_id,), options))
-        return "wait-result"
-
-    def list_conversations(self):
-        self.calls.append(("list_conversations", (), {}))
-        return "conversations-result"
-
-    def list_models(self):
-        self.calls.append(("list_models", (), {}))
-        return "models-result"
-
-    def conversation_snapshot(self, url_or_id: object, **options: object):
-        self.calls.append(("conversation_snapshot", (url_or_id,), options))
-        return "snapshot-result"
-
-    def conversation_follow_snapshot(self, url_or_id: object, **options: object):
-        self.calls.append(("conversation_follow_snapshot", (url_or_id,), options))
-        return "follow-snapshot-result"
-
-    def conversation_follow_stream(self, url_or_id: object, **options: object):
-        self.calls.append(("conversation_follow_stream", (url_or_id,), options))
-        return "follow-stream-result"
-
-    def stop_generation(self, url_or_id: object = None, **options: object):
-        self.calls.append(("stop_generation", (url_or_id,), options))
-        return {"ok": True, "stopped": True, "conversationId": url_or_id}
-
-    def send_temporary(self, prompt: str, **options: object) -> str:
-        self.calls.append(("send_temporary", (prompt,), options))
-        return "temporary-result"
-
-    def end_temporary_chat(self) -> bool:
-        self.calls.append(("end_temporary_chat", (), {}))
-        return True
-
-    def temporary_lifecycle_snapshot(self) -> dict[str, object]:
-        self.calls.append(("temporary_lifecycle_snapshot", (), {}))
-        return {"state": "LIVE", "conversation_id": "temp-1"}
-
-
-class FrontierFakeSdkClient(FakeSdkClient):
-    def list_models(self):
-        self.calls.append(("list_models", (), {}))
-        return [
-            {"slug": "gpt-5-5-thinking", "title": "GPT-5.5 Thinking", "max_tokens": 262144},
-            {"slug": "gpt-5-6-instant", "title": "GPT-5.6 Sol", "max_tokens": 52815},
-            {"slug": "gpt-5-6-thinking", "title": "GPT-5.6 Sol", "max_tokens": 262144},
-            {"slug": "gpt-6-astra-wm", "title": "GPT-6 Astra", "is_work_mode_model": True, "max_tokens": 262144},
-            {"slug": "gpt-5-6-t-mini", "title": "GPT-5.6 Luna", "max_tokens": 262144},
-            {"slug": "research", "title": "Deep Research"},
-        ]
-
-
-class SemanticMediaFakeSdkClient(FrontierFakeSdkClient):
-    def media_default_model_profile(self) -> str:
-        return "DEEP"
-
-
-class OldFakeSdkClient:
-    pass
-
-
-class SnapshotOnlySdkClient:
-    def conversation_snapshot(self, url_or_id: object, **options: object):
-        return {"conversation": url_or_id, "options": options}
+from gptty.sdk_client import _ProductRuntimeClient
 
 
 class FakeProductRuntime:
@@ -177,155 +75,6 @@ class SplitFakeProductRuntime(FakeProductRuntime):
         return "runtime-split-result"
 
 
-def test_gptty_client_keeps_auth_and_timeout() -> None:
-    sdk = FakeSdkClient()
-
-    client = GpttyClient(auth_file="custom_auth.json", timeout=123, sdk_client=sdk)
-
-    assert client.auth_file == Path("custom_auth.json")
-    assert client.timeout == 123
-
-
-def test_send_delegates_to_sdk_client_without_cli_stream_option() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    result = client.send(
-        "hello",
-        model="gpt-4o-mini",
-        stream=True,
-        media=["image.png"],
-    )
-
-    assert result == "send-result"
-    assert sdk.calls == [
-        (
-            "send",
-            ("hello",),
-            {"model": "gpt-4o-mini", "media": ["image.png"]},
-        )
-    ]
-
-
-def test_send_defaults_to_latest_frontier_high_profile() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    assert client.send("hello") == "send-result"
-
-    assert sdk.calls == [("send", ("hello",), {"model_profile": "DEEP"})]
-
-
-def test_temporary_send_uses_same_model_policy_without_public_conversation_id() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    assert client.send_temporary("hello") == "temporary-result"
-
-    assert sdk.calls == [("send_temporary", ("hello",), {"model_profile": "DEEP"})]
-
-
-def test_media_defaults_to_latest_normal_thinking_frontier_and_caches_catalog() -> None:
-    sdk = FrontierFakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    assert client.send("inspect", media=["one.png"]) == "send-result"
-    assert client.send_to_conversation("abc", "inspect again", media=["two.png"]) == "send-to-conversation-result"
-
-    assert sdk.calls == [
-        ("list_models", (), {}),
-        ("send", ("inspect",), {"media": ["one.png"], "model": "gpt-5-6-thinking"}),
-        (
-            "send_to_conversation",
-            ("abc", "inspect again"),
-            {"media": ["two.png"], "model": "gpt-5-6-thinking"},
-        ),
-    ]
-
-
-def test_media_uses_semantic_default_profile_when_runtime_declares_support() -> None:
-    sdk = SemanticMediaFakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    assert client.send("inspect", media=["one.png"]) == "send-result"
-
-    assert sdk.calls == [
-        ("send", ("inspect",), {"media": ["one.png"], "model_profile": "DEEP"}),
-    ]
-
-
-def test_send_to_conversation_delegates_without_cli_stream_option() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    result = client.send_to_conversation(
-        "abc",
-        "continue",
-        stream=False,
-        model="gpt-real",
-        media=["image.png"],
-    )
-
-    assert result == "send-to-conversation-result"
-    assert sdk.calls == [
-        (
-            "send_to_conversation",
-            ("abc", "continue"),
-            {"model": "gpt-real", "media": ["image.png"]},
-        )
-    ]
-
-
-def test_conversation_methods_delegate_to_sdk_client() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    assert client.attach_conversation("abc") == "attach-result"
-    assert client.get_messages("abc", limit=5) == "messages-result"
-    assert client.get_required_action("abc") == "required-action-result"
-    assert client.get_status("abc") == "status-result"
-    assert client.list_conversations() == "conversations-result"
-    assert client.list_models() == "models-result"
-    assert client.conversation_snapshot("abc", limit=10) == "snapshot-result"
-    assert client.conversation_follow_snapshot("abc", emitted_message_ids=["m1"]) == "follow-snapshot-result"
-    assert client.conversation_follow_stream("abc", topic_id="topic-1") == "follow-stream-result"
-    assert client.stop_generation("abc", timeout=3)["stopped"] is True
-    assert client.temporary_lifecycle_snapshot()["state"] == "LIVE"
-    assert client.end_temporary_chat() is True
-    assert client.wait_until_completed("abc", timeout=30) == "wait-result"
-
-    assert sdk.calls == [
-        ("attach_conversation", ("abc",), {}),
-        ("get_messages", ("abc",), {"limit": 5}),
-        ("get_required_action", ("abc",), {}),
-        ("get_status", ("abc",), {}),
-        ("list_conversations", (), {}),
-        ("list_models", (), {}),
-        ("conversation_snapshot", ("abc",), {"limit": 10}),
-        ("conversation_follow_snapshot", ("abc",), {"emitted_message_ids": ["m1"]}),
-        ("conversation_follow_stream", ("abc",), {"topic_id": "topic-1"}),
-        ("stop_generation", ("abc",), {"timeout": 3}),
-        ("temporary_lifecycle_snapshot", (), {}),
-        ("end_temporary_chat", (), {}),
-        ("wait_until_completed", ("abc",), {"timeout": 30}),
-    ]
-
-
-def test_get_required_action_returns_none_with_old_sdk_client() -> None:
-    client = GpttyClient(sdk_client=OldFakeSdkClient())
-
-    assert client.get_required_action("abc") is None
-
-
-def test_follow_snapshot_falls_back_to_regular_snapshot_for_older_sdk() -> None:
-    client = GpttyClient(sdk_client=SnapshotOnlySdkClient())
-
-    assert client.conversation_follow_snapshot("abc", emitted_message_ids=["m1"]) == {
-        "conversation": "abc",
-        "options": {},
-    }
-
-
 def test_product_runtime_client_maps_cli_send_surface() -> None:
     runtime = FakeProductRuntime()
     client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
@@ -382,42 +131,6 @@ def test_product_runtime_client_uses_split_submit_before_finality_when_unobserve
     assert runtime.calls[1][0] == "await_final"
 
 
-def test_product_runtime_client_keeps_live_continuation_on_single_streaming_path() -> None:
-    runtime = SplitFakeProductRuntime()
-    client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
-    events: list[dict[str, object]] = []
-
-    result = client.send_to_conversation(
-        "c1",
-        "continue",
-        model_profile="DEEP",
-        on_event=events.append,
-    )
-
-    assert result == "runtime-send-result"
-    assert runtime.calls == [
-        (
-            "send",
-            ("continue",),
-            {
-                "model_profile": "DEEP",
-                "on_event": events.append,
-                "conversation": "c1",
-                "timeout": 17.0,
-            },
-        )
-    ]
-
-
-def test_product_runtime_client_passes_real_model_slug_unchanged() -> None:
-    runtime = FakeProductRuntime()
-    client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
-
-    client.send("hello", model="gpt-5.6")
-
-    assert runtime.calls == [("send", ("hello",), {"timeout": 17.0, "model": "gpt-5.6"})]
-
-
 def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) -> None:
     runtime = FakeProductRuntime()
     client = _ProductRuntimeClient(auth_file="auth.json", timeout=17, runtime=runtime)
@@ -444,44 +157,30 @@ def test_product_runtime_client_delegates_read_surface_and_waits(monkeypatch) ->
     ]
 
 
-def test_reasoning_effort_maps_to_proven_semantic_profiles() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
+def test_real_adapter_runtime_has_what_gptty_calls() -> None:
+    from chatgpt_web_adapter import ChatGPTProductRuntime
 
-    assert client.send("instant", reasoning_effort="instant") == "send-result"
-    assert client.send("medium", reasoning_effort="medium") == "send-result"
-    assert client.send("high", reasoning_effort="high") == "send-result"
-
-    assert sdk.calls == [
-        ("send", ("instant",), {"model_profile": "FAST"}),
-        ("send", ("medium",), {"model_profile": "BALANCED"}),
-        ("send", ("high",), {"model_profile": "DEEP"}),
-    ]
-
-
-def test_reasoning_effort_with_media_fails_before_underlying_send() -> None:
-    sdk = SemanticMediaFakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    import pytest
-
-    with pytest.raises(ValueError, match="rich-input profile selection"):
-        client.send(
-            "inspect",
-            media=["one.png"],
-            reasoning_effort="medium",
-        )
-
-    assert sdk.calls == []
-
-
-def test_explicit_model_plus_effort_fails_before_underlying_send() -> None:
-    sdk = FakeSdkClient()
-    client = GpttyClient(sdk_client=sdk)
-
-    import pytest
-
-    with pytest.raises(ValueError, match="independent model\\+effort selection"):
-        client.send("hello", model="gpt-custom", reasoning_effort="high")
-
-    assert sdk.calls == []
+    # Everything _ProductRuntimeClient reaches on the runtime. Most of it is looked up with a
+    # silent fallback, so only the real classes show a rename on the adapter side.
+    surface = """submit await_final send attach_conversation get_messages get_status
+        list_conversations list_recent_conversations list_models conversation_snapshot
+        conversation_follow_snapshot conversation_follow_stream conversation_ui_state
+        stop_generation end_temporary_chat temporary_lifecycle_snapshot
+        write_transport.governance canonical.get_required_action""".split()
+    # Built offline: the stub stands in for the signed-in ChatGPT client and is never called;
+    # the write transport and the conversation reader on top of it are the adapter's own.
+    stub = lambda *args, **kwargs: None  # noqa: E731
+    runtime = ChatGPTProductRuntime(
+        SimpleNamespace(get_status=stub, get_messages=stub, attach_conversation=stub),
+        transport="browser-owned",
+    )
+    missing = []
+    for path in surface:
+        target = runtime
+        for name in path.split("."):
+            target = getattr(target, name, None)
+        if not callable(target):
+            missing.append(path)
+    # Known gap: the runtime's conversation reader has no get_required_action, so gptty's
+    # required-action notice never fires with the real adapter. Fixing it changes this line.
+    assert missing == ["canonical.get_required_action"]

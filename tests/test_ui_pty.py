@@ -79,7 +79,7 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
     )
     os.close(slave)
     try:
-        startup = _read_until(master, "❯ ".encode(), timeout=5.0)
+        startup = _read_until(master, "❯".encode(), timeout=5.0)
         startup += _read_for(master, duration=0.2)
         assert b"ChatGPT" in startup
         assert b"\x1b[?1049h" in startup
@@ -105,7 +105,8 @@ def test_real_pty_action_menu_and_exit(tmp_path) -> None:
         # Command completion is an in-place overlay: typing slash must not leave
         # the alternate screen or restart the application.
         os.write(master, b"/")
-        menu = _read_until(master, b"/exit", timeout=5.0)
+        # /exit is below the visible part of the menu; /image is the last entry checked.
+        menu = _read_until(master, b"/image", timeout=5.0)
         assert b"/new" in menu
         assert b"/resume" in menu
         assert b"/detach" in menu

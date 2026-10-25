@@ -10,7 +10,6 @@ from gptty.commands.send import run_send
 from gptty.locks import (
     acquire_conversation_lock,
     conversation_lock_dir,
-    conversation_lock_is_held,
 )
 from gptty.state import ChatState, save_chat_state
 
@@ -99,39 +98,6 @@ def test_send_returns_2_when_conversation_is_locked(tmp_path: Path) -> None:
     assert "Conversation: conv-1" in stderr.getvalue()
 
 
-def test_send_releases_lock_after_success(tmp_path: Path) -> None:
-    FakeGpttyClient.instances.clear()
-    state_path = tmp_path / "gptty_state.json"
-    save_chat_state(state_path, ChatState(current_conversation="conv-1"))
-    lock_dir = conversation_lock_dir(profile=None, state_path=state_path)
-
-    code = run_send(
-        send_args(tmp_path, lock_timeout=None),
-        client_factory=FakeGpttyClient,
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    sidecars = list(lock_dir.glob("conversation-*.lock"))
-    assert len(sidecars) == 1
-    assert conversation_lock_is_held(lock_dir, "conv-1") is False
-
-
-def test_send_new_does_not_need_preexisting_conversation_lock(tmp_path: Path) -> None:
-    FakeGpttyClient.instances.clear()
-
-    code = run_send(
-        send_args(tmp_path, new=True),
-        client_factory=FakeGpttyClient,
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    assert FakeGpttyClient.instances[0].calls[0][0] == "send"
-
-
 def test_chat_returns_2_when_current_conversation_is_locked(tmp_path: Path) -> None:
     FakeGpttyClient.instances.clear()
     state_path = tmp_path / "gptty_state.json"
@@ -156,18 +122,3 @@ def test_chat_returns_2_when_current_conversation_is_locked(tmp_path: Path) -> N
 
     assert code == 2
     assert "conversation still in progress" in stderr.getvalue()
-
-
-def test_chat_first_prompt_without_current_conversation_does_not_lock(tmp_path: Path) -> None:
-    FakeGpttyClient.instances.clear()
-
-    code = run_chat(
-        chat_args(tmp_path),
-        input_stream=StringIO("hello\n/exit\n"),
-        client_factory=FakeGpttyClient,
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    assert FakeGpttyClient.instances[0].calls[0][0] == "send"

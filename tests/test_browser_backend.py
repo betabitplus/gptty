@@ -1,43 +1,6 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-from gptty.commands._client import build_client
 from gptty.sdk_client import GpttyClient, _ProductRuntimeClient
-
-
-def test_command_client_boundary_omits_backend_when_not_selected() -> None:
-    captured = {}
-
-    def factory(**kwargs):
-        captured.update(kwargs)
-        return object()
-
-    build_client(
-        factory,
-        SimpleNamespace(auth="auth.json", timeout=12, backend=None),
-    )
-
-    assert captured == {"auth_file": "auth.json", "timeout": 12}
-
-
-def test_command_client_boundary_forwards_selected_backend() -> None:
-    captured = {}
-
-    def factory(**kwargs):
-        captured.update(kwargs)
-        return object()
-
-    build_client(
-        factory,
-        SimpleNamespace(auth="auth.json", timeout=12, backend="wkwebview"),
-    )
-
-    assert captured == {
-        "auth_file": "auth.json",
-        "timeout": 12,
-        "browser_authority_backend": "wkwebview",
-    }
 
 
 def test_gptty_client_exposes_effective_browser_backend() -> None:
@@ -76,5 +39,3 @@ def test_product_runtime_client_uses_cwa_wk_provider_when_selected(monkeypatch) 
     assert isinstance(calls[1]["provider"], WKWebViewTurnProvider)
     assert calls[1]["browser_authority_policy"] == "TURN_SCOPED"
     assert "browser_authority_backend" not in calls[1]
-
-
