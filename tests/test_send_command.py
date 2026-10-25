@@ -3,7 +3,7 @@ from __future__ import annotations
 from argparse import Namespace
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from gptty.commands.send import run_send
 from gptty.runs import read_run_events, read_run_summary
@@ -20,7 +20,7 @@ class Response:
 
 
 class FakeGpttyClient:
-    instances: list[FakeGpttyClient] = []
+    instances: ClassVar[list[FakeGpttyClient]] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.auth_file = auth_file

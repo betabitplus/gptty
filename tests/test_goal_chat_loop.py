@@ -4,6 +4,7 @@ import asyncio
 import time
 from io import StringIO
 from types import SimpleNamespace
+from typing import ClassVar
 
 from gptty.commands.chat import run_chat
 from gptty.goal_store import GoalStore
@@ -32,7 +33,7 @@ def _load_session_goal(state_path):
 
 
 class _GoalLoopClient:
-    instances: list[_GoalLoopClient] = []
+    instances: ClassVar[list[_GoalLoopClient]] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
@@ -97,7 +98,7 @@ class _FakeSession:
 
 
 class _FakeRenderer:
-    instances: list[_FakeRenderer] = []
+    instances: ClassVar[list[_FakeRenderer]] = []
 
     def __init__(self, stdout, settings) -> None:
         self.events: list[tuple[str, object]] = []
@@ -246,7 +247,7 @@ def test_goal_post_submit_ambiguity_never_auto_resends(tmp_path, monkeypatch) ->
     )
 
     class AmbiguousWriteClient:
-        instances: list[AmbiguousWriteClient] = []
+        instances: ClassVar[list[AmbiguousWriteClient]] = []
 
         def __init__(
             self, auth_file: str = "auth_data.json", timeout: int = 90
