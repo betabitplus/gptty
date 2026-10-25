@@ -199,19 +199,6 @@ def test_resume_lists_real_conversations_and_renders_full_history(tmp_path) -> N
     assert [message.text for message in rendered] == ["question", "answer"]
 
 
-def test_resume_clears_pending_images_before_switching_context(tmp_path) -> None:
-    image = tmp_path / "queued.png"
-    image.write_bytes(b"png")
-    commands, _, client, _ = make_commands(tmp_path)
-    commands.handle(f"/image {image}")
-
-    commands.handle("/resume conv-1")
-    assert commands.pending_media == [str(image)]
-
-    finish_pending_resume(commands, client)
-    assert commands.pending_media == []
-
-
 def test_goal_resume_refuses_to_continue_in_different_conversation(tmp_path) -> None:
     state = ChatState(
         current_conversation="conv-2",

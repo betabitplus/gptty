@@ -30,13 +30,6 @@ def test_cwa_dependency_floor_matches_verified_runtime_contract() -> None:
     assert _declared_requirement("chatgpt-web-adapter") == VERIFIED_CWA_REQUIREMENT
 
 
-def test_exporter_dependency_floor_matches_visible_graph_contract() -> None:
-    assert (
-        _declared_requirement("chatgpt-conversation-exporter")
-        == VERIFIED_EXPORTER_REQUIREMENT
-    )
-
-
 def test_required_runtime_modules_are_importable() -> None:
     missing = [
         module

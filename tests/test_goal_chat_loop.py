@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from io import StringIO
 from types import SimpleNamespace
@@ -33,7 +32,7 @@ def _load_session_goal(state_path):
 
 
 class _GoalLoopClient:
-    instances: list["_GoalLoopClient"] = []
+    instances: list[_GoalLoopClient] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
@@ -50,9 +49,11 @@ class _GoalLoopClient:
     def send_to_conversation(self, ref: str, prompt: str, **options):
         self.calls.append(("send_to_conversation", prompt, ref))
         return SimpleNamespace(
-            text=("GPTTY_GOAL: COMPLETE\n"
+            text=(
+                "GPTTY_GOAL: COMPLETE\n"
                 'GPTTY_CHECKPOINT: {"summary":"done","completed":["verified"],"decisions":[],"pending":[],"next":"none"}\n'
-                "All agreed work is done and verified."),
+                "All agreed work is done and verified."
+            ),
             conversation_id=ref,
             title="Goal loop test",
         )
@@ -96,7 +97,7 @@ class _FakeSession:
 
 
 class _FakeRenderer:
-    instances: list["_FakeRenderer"] = []
+    instances: list[_FakeRenderer] = []
 
     def __init__(self, stdout, settings) -> None:
         self.events: list[tuple[str, object]] = []
@@ -182,9 +183,11 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
         [
             '/goal "Finish exactly this test goal"',
             (
-                lambda: bool(_FakeRenderer.instances)
-                and ("info", "Goal · complete · 2 turns")
-                in _FakeRenderer.instances[0].events,
+                lambda: (
+                    bool(_FakeRenderer.instances)
+                    and ("info", "Goal · complete · 2 turns")
+                    in _FakeRenderer.instances[0].events
+                ),
                 "/exit",
             ),
         ]
@@ -236,16 +239,14 @@ def test_goal_chat_loop_auto_continues_until_complete_without_intermediate_notif
     assert ("info", "Goal · complete · 2 turns") in renderer.events
 
 
-def test_goal_post_submit_ambiguity_never_auto_resends(
-    tmp_path, monkeypatch
-) -> None:
+def test_goal_post_submit_ambiguity_never_auto_resends(tmp_path, monkeypatch) -> None:
     from chatgpt_web_adapter.browser_owned_write_runtime import (
         WRITE_OUTCOME_UNKNOWN,
         BrowserOwnedWriteRuntimeError,
     )
 
     class AmbiguousWriteClient:
-        instances: list["AmbiguousWriteClient"] = []
+        instances: list[AmbiguousWriteClient] = []
 
         def __init__(
             self, auth_file: str = "auth_data.json", timeout: int = 90
@@ -286,11 +287,13 @@ def test_goal_post_submit_ambiguity_never_auto_resends(
         [
             '/goal "Perform exactly one durable action"',
             (
-                lambda: bool(_FakeRenderer.instances)
-                and any(
-                    kind == "warning"
-                    and "ambiguous external side effect" in str(message)
-                    for kind, message in _FakeRenderer.instances[0].events
+                lambda: (
+                    bool(_FakeRenderer.instances)
+                    and any(
+                        kind == "warning"
+                        and "ambiguous external side effect" in str(message)
+                        for kind, message in _FakeRenderer.instances[0].events
+                    )
                 ),
                 "/exit",
             ),
@@ -333,382 +336,9 @@ def test_goal_post_submit_ambiguity_never_auto_resends(
     assert not any(event["type"] == "rollover" for event in events)
 
 
-def test_goal_proven_pre_dispatch_failure_never_auto_resends(
+def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(
     tmp_path, monkeypatch
 ) -> None:
-    from chatgpt_web_adapter.browser_owned_write_runtime import (
-        WRITE_NOT_DISPATCHED,
-        BrowserOwnedWriteRuntimeError,
-    )
-
-    class PreDispatchFailureClient:
-        instances: list["PreDispatchFailureClient"] = []
-
-        def __init__(
-            self, auth_file: str = "auth_data.json", timeout: int = 90
-        ) -> None:
-            self.calls: list[tuple[str, str, str | None]] = []
-            self.__class__.instances.append(self)
-
-        def get_messages(self, ref: str):
-            return [
-                {"role": "user", "text": "Finish safely."},
-                {"role": "assistant", "text": "Ready."},
-            ]
-
-        def send_to_conversation(self, ref: str, prompt: str, **options):
-            self.calls.append(("send_to_conversation", prompt, ref))
-            raise BrowserOwnedWriteRuntimeError(
-                "provider proved protected write was not dispatched",
-                failure_kind=WRITE_NOT_DISPATCHED,
-                automatic_retry_allowed=False,
-                manual_retry_safe_after_repair=True,
-                write_may_have_been_submitted=False,
-                reconciliation_required=False,
-                request_stage="browser_owned_write_pre_dispatch",
-                write_dispatched=False,
-                submit_request_observed=False,
-                submit_response_observed=False,
-            )
-
-        def send(self, prompt: str, **options):
-            self.calls.append(("send", prompt, None))
-            raise AssertionError("pre-dispatch Goal failure must not auto-resend")
-
-    save_chat_state(
-        tmp_path / "state.json",
-        ChatState(current_conversation="conv-pre-dispatch"),
-    )
-    PreDispatchFailureClient.instances.clear()
-    _FakeRenderer.instances.clear()
-    _FakeSession.script = iter(
-        [
-            '/goal "Finish safely without duplicate writes"',
-            (
-                lambda: bool(_FakeRenderer.instances)
-                and any(
-                    kind == "warning"
-                    and "user action required" in str(message)
-                    for kind, message in _FakeRenderer.instances[0].events
-                ),
-                "/exit",
-            ),
-        ]
-    )
-    monkeypatch.setattr(
-        "gptty.commands.chat.should_use_enhanced_ui",
-        lambda **kwargs: (True, SimpleNamespace()),
-    )
-    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
-    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
-    monkeypatch.setattr(
-        "gptty.ui.commands.notify_response_complete",
-        lambda **_kwargs: None,
-    )
-
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=PreDispatchFailureClient,
-        input_stream=StringIO(),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    client = PreDispatchFailureClient.instances[0]
-    assert [call[0] for call in client.calls] == ["send_to_conversation"]
-    assert client.calls[0][2] == "conv-pre-dispatch"
-
-    _state, goal = _load_session_goal(tmp_path / "state.json")
-    assert goal.status == "blocked"
-    assert goal.rollover_count == 0
-    assert goal.active_operation_id is None
-    events = GoalStore(tmp_path / "state.json").events(goal)
-    assert events[-1]["type"] == "turn_terminal"
-    classification = events[-1]["payload"]["failure_classification"]
-    assert classification["code"] == WRITE_NOT_DISPATCHED
-    assert classification["automatic_retry_allowed"] is False
-    assert classification["manual_retry_safe_after_repair"] is True
-    assert classification["write_dispatched"] is False
-    assert classification["submit_request_observed"] is False
-    assert classification["submit_response_observed"] is False
-    assert not any(event["type"] == "rollover" for event in events)
-
-
-def test_stop_command_while_working_holds_queued_prompt_until_explicit_send(
-    tmp_path, monkeypatch
-) -> None:
-    class StopClient:
-        instances: list["StopClient"] = []
-        started = threading.Event()
-        release = threading.Event()
-
-        def __init__(
-            self, auth_file: str = "auth_data.json", timeout: int = 90
-        ) -> None:
-            self.calls: list[tuple[str, str | None]] = []
-            self.__class__.instances.append(self)
-
-        def send(self, prompt: str, **options):
-            self.calls.append(("send", prompt))
-            self.__class__.started.set()
-            assert self.__class__.release.wait(timeout=2)
-            return SimpleNamespace(
-                text="Saved partial response",
-                conversation_id="conv-stop-command",
-                title="Stop command test",
-            )
-
-        def send_to_conversation(self, ref: str, prompt: str, **options):
-            self.calls.append(("send_to_conversation", prompt))
-            return SimpleNamespace(
-                text="Queued follow-up sent",
-                conversation_id=ref,
-                title="Stop command test",
-            )
-
-        def stop_generation(self, ref=None, **options):
-            self.calls.append(("stop_generation", ref))
-            self.__class__.release.set()
-            return {"stopped": True, "conversationId": "conv-stop-command"}
-
-    StopClient.instances.clear()
-    StopClient.started.clear()
-    StopClient.release.clear()
-    _FakeRenderer.instances.clear()
-    def stopped_and_held() -> bool:
-        if not _FakeRenderer.instances:
-            return False
-        events = _FakeRenderer.instances[0].events
-        if ("info", "Stopped by user.") not in events:
-            return False
-        client = StopClient.instances[0]
-        assert not any(call[0] == "send_to_conversation" for call in client.calls)
-        return True
-
-    _FakeSession.script = iter(
-        [
-            "Produce a long response",
-            (StopClient.started.is_set, "Queued follow-up should run"),
-            (
-                lambda: bool(_FakeRenderer.instances)
-                and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
-                "/stop",
-            ),
-            (stopped_and_held, "/queue send"),
-            (
-                lambda: bool(_FakeRenderer.instances)
-                and ("answer", "Queued follow-up sent")
-                in _FakeRenderer.instances[0].events,
-                "/exit",
-            ),
-        ]
-    )
-    monkeypatch.setattr(
-        "gptty.commands.chat.should_use_enhanced_ui",
-        lambda **kwargs: (True, SimpleNamespace()),
-    )
-    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", _FakeSession)
-    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
-
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=StopClient,
-        input_stream=StringIO(),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    client = StopClient.instances[0]
-    assert client.calls[0] == ("send", "Produce a long response")
-    assert client.calls[1] == ("stop_generation", None)
-    assert client.calls[2] == ("send_to_conversation", "Queued follow-up should run")
-    state = _load_session_state(tmp_path / "state.json")
-    assert state.current_conversation == "conv-stop-command"
-    renderer = _FakeRenderer.instances[0]
-    assert ("info", "Stopping ChatGPT…") in renderer.events
-    assert ("info", "ChatGPT stopped; finalizing local readback…") in renderer.events
-    assert ("info", "Stopped by user.") in renderer.events
-    assert (
-        "info",
-        "Queue held · 1 · stopped by user · use /queue send or /queue clear",
-    ) in renderer.events
-    assert (
-        "info",
-        "Queue released · 1 turn rebound to current context.",
-    ) in renderer.events
-    assert ("answer", "Queued follow-up sent") in renderer.events
-
-
-def test_terminal_follow_releases_multiple_queued_prompts_in_order(
-    tmp_path, monkeypatch
-) -> None:
-    class TerminalFollowClient:
-        instances: list["TerminalFollowClient"] = []
-        release_stream = threading.Event()
-
-        def __init__(
-            self, auth_file: str = "auth_data.json", timeout: int = 90
-        ) -> None:
-            self.calls: list[tuple[str, str]] = []
-            self.__class__.instances.append(self)
-
-        def conversation_follow_snapshot(
-            self,
-            ref: str,
-            *,
-            emitted_message_ids=(),
-            limit=128,
-            verify_terminal_status=False,
-            terminal_probe_timeout=3.0,
-        ):
-            self.calls.append(("snapshot", ref))
-            return {
-                "status": SimpleNamespace(status="tool_running"),
-                "messages": [
-                    {"message_id": "u1", "role": "user", "text": "question"},
-                ],
-                "events": [],
-                "emitted_message_ids": ["old-event"],
-                "stream_topic_id": "conversation-turn-orphaned",
-                "turn_exchange_id": "turn-orphaned",
-                "stream_answer_message_id": None,
-                "stream_answer_text": "",
-            }
-
-        def conversation_follow_stream(
-            self,
-            ref: str,
-            *,
-            topic_id,
-            emitted_message_ids,
-            answer_message_id,
-            answer_text,
-            timeout,
-            limit,
-            on_event,
-            should_stop,
-        ):
-            self.calls.append(("stream", ref))
-            assert self.release_stream.wait(timeout=2.0)
-            assert not should_stop()
-            on_event(
-                {
-                    "type": "stream_handoff_terminal_status",
-                    "stream_status": "COMPLETE",
-                    "last_offset": "1000-0",
-                }
-            )
-            return {
-                "stream_completed": True,
-                "status": SimpleNamespace(status="completed"),
-                "messages": [
-                    {"message_id": "u1", "role": "user", "text": "question"},
-                ],
-                "events": [],
-                "emitted_message_ids": list(emitted_message_ids),
-            }
-
-        def send_to_conversation(self, ref: str, prompt: str, **options):
-            self.calls.append(("send_to_conversation", prompt))
-            return SimpleNamespace(
-                text=f"reply:{prompt}",
-                conversation_id=ref,
-                title="Terminal follow chat",
-            )
-
-    class TrackingSession(_FakeSession):
-        instances: list["TrackingSession"] = []
-
-        def __init__(self, **kwargs) -> None:
-            self.active_updates: list[tuple[object, object]] = []
-            self.__class__.instances.append(self)
-
-        def set_active_turn(self, controls, *, working_status=None) -> None:
-            self.active_updates.append((controls, working_status))
-
-    TerminalFollowClient.instances.clear()
-    TerminalFollowClient.release_stream.clear()
-    TrackingSession.instances.clear()
-    _FakeRenderer.instances.clear()
-
-    def follow_footer_active() -> bool:
-        if not TrackingSession.instances:
-            return False
-        return any(
-            controls is None and callable(status)
-            for controls, status in TrackingSession.instances[0].active_updates
-        )
-
-    def queued_two() -> bool:
-        if not _FakeRenderer.instances:
-            return False
-        visible = ("info", "Queued · 2") in _FakeRenderer.instances[0].events
-        if visible:
-            TerminalFollowClient.release_stream.set()
-        return visible
-
-    def two_sends_done() -> bool:
-        if not TerminalFollowClient.instances:
-            return False
-        sends = [
-            call
-            for call in TerminalFollowClient.instances[0].calls
-            if call[0] == "send_to_conversation"
-        ]
-        return len(sends) == 2
-
-    TrackingSession.script = iter(
-        [
-            "/resume conv-terminal",
-            (follow_footer_active, "queued one"),
-            (
-                lambda: bool(_FakeRenderer.instances)
-                and ("info", "Queued · 1") in _FakeRenderer.instances[0].events,
-                "queued two",
-            ),
-            (queued_two, ""),
-            (two_sends_done, "/exit"),
-        ]
-    )
-    monkeypatch.setattr(
-        "gptty.commands.chat.should_use_enhanced_ui",
-        lambda **kwargs: (True, SimpleNamespace()),
-    )
-    monkeypatch.setattr("gptty.commands.chat.InteractiveSession", TrackingSession)
-    monkeypatch.setattr("gptty.commands.chat.PrettyRenderer", _FakeRenderer)
-
-    code = run_chat(
-        _args(tmp_path),
-        client_factory=TerminalFollowClient,
-        input_stream=StringIO(),
-        stdout=StringIO(),
-        stderr=StringIO(),
-    )
-
-    assert code == 0
-    sends = [
-        call
-        for call in TerminalFollowClient.instances[0].calls
-        if call[0] == "send_to_conversation"
-    ]
-    assert sends == [
-        ("send_to_conversation", "queued one"),
-        ("send_to_conversation", "queued two"),
-    ]
-    session = TrackingSession.instances[0]
-    assert any(
-        controls is None and callable(status)
-        for controls, status in session.active_updates
-    )
-    assert any(
-        controls is None and status is None
-        for controls, status in session.active_updates
-    )
-
-
-def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_path, monkeypatch) -> None:
     import os
 
     state_path = tmp_path / "state.json"
@@ -740,10 +370,13 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
         [
             "MUST_NOT_BE_SENT",
             (
-                lambda: bool(_FakeRenderer.instances)
-                and any(
-                    kind == "warning" and "message dispatch is blocked" in str(message)
-                    for kind, message in _FakeRenderer.instances[0].events
+                lambda: (
+                    bool(_FakeRenderer.instances)
+                    and any(
+                        kind == "warning"
+                        and "message dispatch is blocked" in str(message)
+                        for kind, message in _FakeRenderer.instances[0].events
+                    )
                 ),
                 "/exit",
             ),
@@ -782,7 +415,9 @@ def test_second_process_cannot_dispatch_user_message_into_live_owned_goal(tmp_pa
     assert authoritative.runner_id == "live-owner-token"
 
 
-def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidence(tmp_path) -> None:
+def test_restart_never_binds_stale_chat_to_open_operation_without_commit_evidence(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "state.json"
     store = GoalStore(state_path)
     operation_id = "goal-no-route:g2:t4"

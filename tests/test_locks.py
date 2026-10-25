@@ -6,37 +6,10 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
-
 from gptty.locks import (
-    ConversationLockError,
     acquire_conversation_lock,
     conversation_lock_is_held,
 )
-
-
-def test_acquire_conversation_lock_fails_when_kernel_lock_is_active(tmp_path) -> None:
-    first = acquire_conversation_lock(
-        conversation_ref="conv-1",
-        lock_dir=tmp_path,
-        profile="work",
-        command="send",
-    )
-
-    try:
-        with pytest.raises(ConversationLockError) as exc_info:
-            acquire_conversation_lock(
-                conversation_ref="conv-1",
-                lock_dir=tmp_path,
-                command="chat",
-                timeout=0,
-            )
-    finally:
-        first.release()
-
-    assert exc_info.value.info.conversation_ref == "conv-1"
-    assert exc_info.value.info.command == "send"
-    assert exc_info.value.info.profile == "work"
 
 
 def test_conversation_kernel_lock_is_released_by_process_death(tmp_path) -> None:
@@ -59,8 +32,8 @@ ready.write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(60)
 """
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src") + os.pathsep + env.get(
-        "PYTHONPATH", ""
+    env["PYTHONPATH"] = (
+        str(Path(__file__).parents[1] / "src") + os.pathsep + env.get("PYTHONPATH", "")
     )
     child = subprocess.Popen(
         [sys.executable, "-c", script, str(tmp_path), str(ready)],

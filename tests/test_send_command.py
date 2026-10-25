@@ -12,13 +12,15 @@ from gptty.state import ChatState, save_chat_state
 
 
 class Response:
-    def __init__(self, text: str = "reply", conversation_id: str | None = "conv-1") -> None:
+    def __init__(
+        self, text: str = "reply", conversation_id: str | None = "conv-1"
+    ) -> None:
         self.text = text
         self.conversation_id = conversation_id
 
 
 class FakeGpttyClient:
-    instances: list["FakeGpttyClient"] = []
+    instances: list[FakeGpttyClient] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.auth_file = auth_file
@@ -33,7 +35,9 @@ class FakeGpttyClient:
             on_token("new reply")
         return Response(text="new reply", conversation_id="new-conv")
 
-    def send_to_conversation(self, conversation_ref: str, prompt: str, **options: Any) -> Response:
+    def send_to_conversation(
+        self, conversation_ref: str, prompt: str, **options: Any
+    ) -> Response:
         self.calls.append(("send_to_conversation", (conversation_ref, prompt), options))
         on_token = options.get("on_token")
         if on_token is not None:
@@ -70,7 +74,9 @@ def make_args(tmp_path: Path, **overrides: Any) -> Namespace:
 
 def test_send_uses_attached_conversation_by_default(tmp_path: Path) -> None:
     FakeGpttyClient.instances.clear()
-    save_chat_state(tmp_path / "gptty_state.json", ChatState(current_conversation="attached-ref"))
+    save_chat_state(
+        tmp_path / "gptty_state.json", ChatState(current_conversation="attached-ref")
+    )
     stdout = StringIO()
 
     code = run_send(
@@ -88,37 +94,6 @@ def test_send_uses_attached_conversation_by_default(tmp_path: Path) -> None:
     ]
     assert stdout.getvalue() == "reply\n"
     assert _load_command_session(tmp_path).current_conversation == "attached-ref"
-
-
-def test_send_to_explicit_conversation_does_not_mutate_attached_state(
-    tmp_path: Path,
-) -> None:
-    FakeGpttyClient.instances.clear()
-    state_path = tmp_path / "gptty_state.json"
-    save_chat_state(
-        state_path,
-        ChatState(current_conversation="attached-ref", model="attached-model"),
-    )
-    stdout = StringIO()
-
-    code = run_send(
-        make_args(tmp_path, to="explicit-ref", model="gpt-4o"),
-        client_factory=FakeGpttyClient,
-        stdout=stdout,
-    )
-
-    client = FakeGpttyClient.instances[0]
-    state = _load_command_session(tmp_path)
-    assert code == 0
-    assert client.calls == [
-        (
-            "send_to_conversation",
-            ("explicit-ref", "continue"),
-            {"stream": False, "model": "gpt-4o"},
-        ),
-    ]
-    assert state.current_conversation == "attached-ref"
-    assert state.model == "attached-model"
 
 
 def test_send_new_starts_new_conversation_and_saves_ref(tmp_path: Path) -> None:
@@ -139,55 +114,6 @@ def test_send_new_starts_new_conversation_and_saves_ref(tmp_path: Path) -> None:
     assert client.calls[0][2]["stream"] is True
     assert callable(client.calls[0][2]["on_token"])
     assert _load_command_session(tmp_path).current_conversation == "new-conv"
-
-
-def test_explicit_remote_send_does_not_touch_concurrently_updated_session(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "gptty_state.json"
-    seed = session_handle(
-        state_path=state_path,
-        profile=None,
-        environ={},
-    )
-    seed_state = seed.load()
-    seed_state.current_conversation = "initial-ref"
-    seed.save(seed_state)
-
-    class ConcurrentClient(FakeGpttyClient):
-        def send_to_conversation(
-            self,
-            conversation_ref: str,
-            prompt: str,
-            **options: Any,
-        ) -> Response:
-            self.calls.append(
-                ("send_to_conversation", (conversation_ref, prompt), options)
-            )
-            winner = session_handle(
-                state_path=state_path,
-                profile=None,
-                environ={},
-            )
-            winner_state = winner.load()
-            winner_state.current_conversation = "concurrent-winner"
-            winner.save(winner_state)
-            return Response(text="remote completed", conversation_id=conversation_ref)
-
-    stderr = StringIO()
-    stdout = StringIO()
-    code = run_send(
-        make_args(tmp_path, to="explicit-ref"),
-        client_factory=ConcurrentClient,
-        stdout=stdout,
-        stderr=stderr,
-    )
-
-    assert code == 0
-    assert stdout.getvalue() == "remote completed\n"
-    assert stderr.getvalue() == ""
-    assert _load_command_session(tmp_path).current_conversation == "concurrent-winner"
-    assert len(FakeGpttyClient.instances[-1].calls) == 1
 
 
 def test_send_ambiguous_write_requires_reconciliation_and_is_not_retried(

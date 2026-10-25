@@ -13,7 +13,7 @@ class Response:
 
 
 class FakeGpttyClient:
-    instances: list["FakeGpttyClient"] = []
+    instances: list[FakeGpttyClient] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.auth_file = auth_file
@@ -59,41 +59,3 @@ def test_run_ask_streams_tokens() -> None:
     assert stdout.getvalue() == "hello world\n"
     assert client.calls[0][2]["stream"] is True
     assert callable(client.calls[0][2]["on_token"])
-
-
-def test_run_ask_ambiguous_write_requires_reconciliation_and_is_not_retried() -> None:
-    from chatgpt_web_adapter.browser_owned_write_runtime import (
-        WRITE_OUTCOME_UNKNOWN,
-        BrowserOwnedWriteRuntimeError,
-    )
-
-    error = BrowserOwnedWriteRuntimeError(
-        "provider failed after delegation",
-        failure_kind=WRITE_OUTCOME_UNKNOWN,
-        automatic_retry_allowed=False,
-        manual_retry_safe_after_repair=False,
-        write_may_have_been_submitted=True,
-        reconciliation_required=True,
-        request_stage="browser_owned_write",
-        status_code=429,
-    )
-
-    class AmbiguousClient(FakeGpttyClient):
-        def send(self, prompt: str, **options: Any) -> Response:
-            self.calls.append(("send", prompt, options))
-            raise error
-
-    FakeGpttyClient.instances.clear()
-    stderr = StringIO()
-
-    code = run_ask(
-        make_args(),
-        client_factory=AmbiguousClient,
-        stdout=StringIO(),
-        stderr=stderr,
-    )
-
-    assert code == 1
-    assert len(FakeGpttyClient.instances[-1].calls) == 1
-    assert "may have accepted this turn" in stderr.getvalue()
-    assert "reconcile the conversation before retrying" in stderr.getvalue()

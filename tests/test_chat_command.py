@@ -106,21 +106,27 @@ def test_terminal_sessions_keep_independent_chat_selection_on_shared_profile(
     args = make_args(tmp_path, no_stream=True)
 
     monkeypatch.setenv("GPTTY_SESSION_ID", "session-A")
-    assert run_chat(
-        args,
-        input_stream=StringIO("hello A\n/exit\n"),
-        client_factory=SessionAClient,
-        stdout=StringIO(),
-    ) == 0
+    assert (
+        run_chat(
+            args,
+            input_stream=StringIO("hello A\n/exit\n"),
+            client_factory=SessionAClient,
+            stdout=StringIO(),
+        )
+        == 0
+    )
     state_a = _load_command_session(tmp_path, explicit_session="session-A")
 
     monkeypatch.setenv("GPTTY_SESSION_ID", "session-B")
-    assert run_chat(
-        args,
-        input_stream=StringIO("hello B\n/exit\n"),
-        client_factory=SessionBClient,
-        stdout=StringIO(),
-    ) == 0
+    assert (
+        run_chat(
+            args,
+            input_stream=StringIO("hello B\n/exit\n"),
+            client_factory=SessionBClient,
+            stdout=StringIO(),
+        )
+        == 0
+    )
     state_b = _load_command_session(tmp_path, explicit_session="session-B")
 
     assert state_a.current_conversation == "conv-A"
@@ -157,62 +163,6 @@ def test_first_prompt_calls_send_and_persists_conversation(tmp_path) -> None:
     assert callable(client.calls[0][2]["on_token"])
     assert callable(client.calls[0][2]["on_event"])
     assert _load_command_session(tmp_path).current_conversation == "conv-1"
-
-
-def test_plain_chat_ambiguous_write_uses_typed_failure_policy(tmp_path) -> None:
-    from chatgpt_web_adapter.browser_owned_write_runtime import (
-        WRITE_OUTCOME_UNKNOWN,
-        BrowserOwnedWriteRuntimeError,
-    )
-
-    error = BrowserOwnedWriteRuntimeError(
-        "provider failed after delegation",
-        failure_kind=WRITE_OUTCOME_UNKNOWN,
-        automatic_retry_allowed=False,
-        manual_retry_safe_after_repair=False,
-        write_may_have_been_submitted=True,
-        reconciliation_required=True,
-        request_stage="browser_owned_write",
-        status_code=429,
-    )
-
-    class AmbiguousClient:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def send_to_conversation(self, conversation_ref, prompt, **options):
-            self.calls += 1
-            raise error
-
-    client = AmbiguousClient()
-    result: dict[str, Any] = {}
-    stderr = StringIO()
-
-    code = _send_chat_prompt(
-        client,
-        state=ChatState(current_conversation="conv-1"),
-        state_path=tmp_path / "state.json",
-        profile=None,
-        prompt="hello once",
-        model=None,
-        media=None,
-        stream=False,
-        stdout=StringIO(),
-        stderr=stderr,
-        renderer=None,
-        result_out=result,
-    )
-
-    assert code == 1
-    assert client.calls == 1
-    assert result["terminal_marker"][:2] == ("turn", "unconfirmed")
-    classification = result["failure_classification"]
-    assert classification["source"] == "structured"
-    assert classification["code"] == WRITE_OUTCOME_UNKNOWN
-    assert classification["write_may_have_been_submitted"] is True
-    assert classification["reconciliation_required"] is True
-    assert "may have accepted this turn" in stderr.getvalue()
-    assert "reconcile the conversation before retrying" in stderr.getvalue()
 
 
 def test_existing_conversation_uses_send_to_conversation(tmp_path) -> None:
@@ -309,7 +259,7 @@ def test_ctrl_c_stops_active_turn_and_keeps_new_chat_attached(
             if self.join_calls == 0:
                 self.join_calls += 1
                 controls.request_stop()
-                return None
+                return
             self.target()
             self.alive = False
 

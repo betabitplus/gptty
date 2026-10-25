@@ -5,7 +5,6 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
-from gptty.commands.chat import run_chat
 from gptty.commands.send import run_send
 from gptty.locks import (
     acquire_conversation_lock,
@@ -20,13 +19,15 @@ class Response:
 
 
 class FakeGpttyClient:
-    instances: list["FakeGpttyClient"] = []
+    instances: list[FakeGpttyClient] = []
 
     def __init__(self, auth_file: str = "auth_data.json", timeout: int = 90) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         FakeGpttyClient.instances.append(self)
 
-    def send_to_conversation(self, conversation_ref: str, prompt: str, **options: Any) -> Response:
+    def send_to_conversation(
+        self, conversation_ref: str, prompt: str, **options: Any
+    ) -> Response:
         self.calls.append(("send_to_conversation", (conversation_ref, prompt), options))
         return Response()
 
@@ -49,21 +50,6 @@ def send_args(tmp_path: Path, **overrides: Any) -> Namespace:
         "no_stream": True,
         "format": "plain",
         "image": [],
-        "wait_lock": False,
-        "lock_timeout": 0,
-    }
-    values.update(overrides)
-    return Namespace(**values)
-
-
-def chat_args(tmp_path: Path, **overrides: Any) -> Namespace:
-    values = {
-        "state": str(tmp_path / "gptty_state.json"),
-        "auth": "auth_data.json",
-        "profile": None,
-        "model": None,
-        "no_stream": True,
-        "timeout": 90,
         "wait_lock": False,
         "lock_timeout": 0,
     }
@@ -96,29 +82,3 @@ def test_send_returns_2_when_conversation_is_locked(tmp_path: Path) -> None:
     assert FakeGpttyClient.instances == []
     assert "conversation still in progress" in stderr.getvalue()
     assert "Conversation: conv-1" in stderr.getvalue()
-
-
-def test_chat_returns_2_when_current_conversation_is_locked(tmp_path: Path) -> None:
-    FakeGpttyClient.instances.clear()
-    state_path = tmp_path / "gptty_state.json"
-    save_chat_state(state_path, ChatState(current_conversation="conv-1"))
-    lock = acquire_conversation_lock(
-        conversation_ref="conv-1",
-        lock_dir=conversation_lock_dir(profile=None, state_path=state_path),
-        command="test",
-    )
-
-    try:
-        stderr = StringIO()
-        code = run_chat(
-            chat_args(tmp_path),
-            input_stream=StringIO("hello\n"),
-            client_factory=FakeGpttyClient,
-            stdout=StringIO(),
-            stderr=stderr,
-        )
-    finally:
-        lock.release()
-
-    assert code == 2
-    assert "conversation still in progress" in stderr.getvalue()

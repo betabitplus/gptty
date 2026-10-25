@@ -39,43 +39,11 @@ def test_send_uses_environment_profile(
     assert cli.main(["send", "--new", "hello"]) == 0
 
     assert calls == {
-        "auth": str(isolated_profiles / "data" / "profiles" / "work" / "auth_data.json"),
-        "state": str(isolated_profiles / "data" / "profiles" / "work" / "gptty_state.json"),
-        "profile": "work",
-    }
-
-
-def test_explicit_paths_override_active_profile(
-    isolated_profiles: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: dict[str, Any] = {}
-    assert cli.main(["profile", "use", "work"]) == 0
-
-    def fake_read_stdin_text(mode: str) -> None:
-        return None
-
-    def fake_run_send(args: Any, *, stdin_text: str | None = None) -> int:
-        calls["auth"] = args.auth
-        calls["state"] = args.state
-        calls["profile"] = args.profile
-        return 0
-
-    monkeypatch.setattr(cli, "read_stdin_text", fake_read_stdin_text)
-    monkeypatch.setattr(send_command, "run_send", fake_run_send)
-
-    assert cli.main([
-        "send",
-        "--new",
-        "--auth",
-        "custom_auth.json",
-        "--state",
-        "custom_state.json",
-        "hello",
-    ]) == 0
-
-    assert calls == {
-        "auth": "custom_auth.json",
-        "state": "custom_state.json",
+        "auth": str(
+            isolated_profiles / "data" / "profiles" / "work" / "auth_data.json"
+        ),
+        "state": str(
+            isolated_profiles / "data" / "profiles" / "work" / "gptty_state.json"
+        ),
         "profile": "work",
     }

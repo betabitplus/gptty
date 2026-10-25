@@ -13,7 +13,9 @@ import time
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="PTY smoke requires a Unix pseudo-terminal")
+pytestmark = pytest.mark.skipif(
+    sys.platform.startswith("win"), reason="PTY smoke requires a Unix pseudo-terminal"
+)
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
