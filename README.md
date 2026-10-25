@@ -25,7 +25,7 @@ CLI = gptty
 ```bash
 gptty chat
 gptty auth status
-gptty auth refresh --mode wait
+gptty auth sign-in
 gptty ask "explain this error"
 gptty ask --image screenshot.png "describe this UI"
 { printf 'Review this patch:\n\n'; git diff; } | gptty ask
@@ -103,6 +103,26 @@ python -m pip install -e ".[auth,test]"
 ```
 
 ## Reusable ChatGPT authorization
+
+On macOS the ChatGPT sign-in lives in one place: gptty's own ChatGPT browser (the WKWebView backend).
+`auth_data.json` is only its copy, and gptty refreshes that copy from the browser before a chat, so
+the token, the cookies and the account always match the browser.
+
+Sign in, or switch accounts — a window with chatgpt.com opens; sign in (or sign out there and into
+another account) and close the window:
+
+```bash
+gptty auth sign-in
+```
+
+Copy the browser's sign-in by hand (gptty does it itself before a chat):
+
+```bash
+gptty auth refresh
+```
+
+All profiles share the one browser, so on macOS one account is signed in at a time.
+The Chrome capture below (`--mode auto|wait`) is for systems without the WKWebView backend.
 
 Check the current reusable auth state without opening a browser:
 
@@ -382,10 +402,10 @@ A plain `gptty chat` starts a fresh local runtime session so simultaneous termin
 
 - `curl` not found
   Install system `curl.exe` and make sure `curl --version` works.
-- `auth_data.json` is missing
-  Run `gptty auth refresh --mode wait`, complete login in the browser, then send any message in the chat window.
+- `auth_data.json` is missing, or gptty says the ChatGPT browser is not signed in
+  On macOS run `gptty auth sign-in`. Elsewhere run `gptty auth refresh --mode wait`, complete login in the browser, then send any message in the chat window.
 - Auth may be expired
-  Run `gptty auth status`. If it reports `expired`, run `gptty auth refresh --mode wait`.
+  Run `gptty auth status`. If it reports `expired`, run `gptty auth refresh` (macOS) or `gptty auth refresh --mode wait`.
 - `gptty auth refresh` says auth dependencies are missing
   Reinstall auth dependencies with `python -m pip install -e ".[auth]"` from checkout, or `python -m pip install "gptty-web[auth]"` from an installed package.
 - `gptty send`, `gptty messages`, `gptty status`, or `gptty export` says there is no attached conversation
@@ -394,8 +414,8 @@ A plain `gptty chat` starts a fresh local runtime session so simultaneous termin
   Check the local path, or pass an `http(s)` URL instead.
 - `ImportError: cannot import name 'nodriver'`
   Reinstall auth dependencies with `python -m pip install -e ".[auth]"`. Recent `g4f` releases use `zendriver` instead of the older `nodriver` package name.
-- The wrong account opens in auth refresh
-  The browser profile already contains another session. Log out there first, or use the wait mode and sign in to the intended account.
+- The wrong account is used
+  On macOS run `gptty auth sign-in`, sign out in the window and into the intended account. Elsewhere the Chrome profile already contains another session: log out there first, or use the wait mode and sign in to the intended account.
 - Requests start failing after working before
   Your session cookies or `api_key/accessToken` may have expired. Regenerate `auth_data.json` with `gptty auth refresh --mode wait`.
 - `gptty chat` starts but cannot answer

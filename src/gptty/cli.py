@@ -280,14 +280,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     auth_refresh_parser = auth_subparsers.add_parser(
         "refresh",
-        help="Refresh auth_data.json through the browser auth capture flow.",
+        help="Copy the ChatGPT browser's sign-in into auth_data.json (gptty does this itself before a chat).",
     )
     _add_auth_file_option(auth_refresh_parser)
     auth_refresh_parser.add_argument(
         "--mode",
-        choices=("auto", "wait"),
-        default="auto",
-        help="auto sends a probe prompt; wait lets you log in and send a message manually.",
+        choices=("browser", "auto", "wait"),
+        default="browser",
+        help="browser copies the sign-in of gptty's ChatGPT browser (WKWebView, macOS); "
+        "auto and wait capture it through a separate Chrome instead (without WKWebView).",
     )
     auth_refresh_parser.add_argument(
         "--timeout",
@@ -307,6 +308,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Prompt text to send once in auto mode to trigger auth capture.",
     )
     auth_refresh_parser.add_argument(
+        "--credential-store",
+        choices=("auto", "keyring", "file"),
+        default="auto",
+        help="Reusable auth backend; auto prefers the OS credential store.",
+    )
+
+    auth_sign_in_parser = auth_subparsers.add_parser(
+        "sign-in",
+        help="Open gptty's ChatGPT browser window: sign in, or sign out and into another account, then close it.",
+    )
+    _add_auth_file_option(auth_sign_in_parser)
+    auth_sign_in_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=900.0,
+        help="Seconds to keep the window open at most.",
+    )
+    auth_sign_in_parser.add_argument(
         "--credential-store",
         choices=("auto", "keyring", "file"),
         default="auto",
@@ -657,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
             run_auth_logout,
             run_auth_migrate,
             run_auth_refresh,
+            run_auth_sign_in,
             run_auth_status,
         )
 
@@ -668,6 +688,10 @@ def main(argv: list[str] | None = None) -> int:
             if not _apply_auth_path(args):
                 return 2
             return run_auth_refresh(args)
+        if args.auth_command == "sign-in":
+            if not _apply_auth_path(args):
+                return 2
+            return run_auth_sign_in(args)
         if args.auth_command == "migrate":
             if not _apply_auth_path(args):
                 return 2

@@ -42,6 +42,8 @@ def run_auth_refresh(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
+    if auth_runner is None and getattr(args, "mode", "browser") == "browser":
+        return _run_browser_auth(args, sign_in=False, stdout=stdout, stderr=stderr)
     runner = auth_runner
     if runner is None:
         try:
@@ -87,6 +89,36 @@ def run_auth_refresh(
         return 1
 
     print(f"gptty: auth data refreshed at {output_file}", file=stdout)
+    return 0
+
+
+def run_auth_sign_in(
+    args: Any,
+    *,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    print("gptty: sign in to ChatGPT in the window that opened (or sign out there and into another "
+          "account), then close the window", file=stdout, flush=True)
+    return _run_browser_auth(args, sign_in=True, stdout=stdout, stderr=stderr)
+
+
+def _run_browser_auth(args: Any, *, sign_in: bool, stdout: TextIO, stderr: TextIO) -> int:
+    """The ChatGPT browser (WKWebView) holds the one sign-in; auth_data.json is its copy."""
+    from chatgpt_web_adapter.wkwebview_session import sign_in_to_browser, sync_auth_from_browser
+
+    auth_file = Path(getattr(args, "auth", "auth_data.json"))
+    store = getattr(args, "credential_store", "auto")
+    try:
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        if sign_in:
+            account = sign_in_to_browser(auth_file, credential_store=store, timeout=getattr(args, "timeout", 900.0))
+        else:
+            account = sync_auth_from_browser(auth_file, credential_store=store)
+    except Exception as exc:  # noqa: BLE001 - command boundary maps auth failures.
+        print(f"gptty: {redact_diagnostic_text(str(exc))}", file=stderr)
+        return 1
+    print(f"gptty: signed in as {account}; auth data saved at {auth_file}", file=stdout)
     return 0
 
 

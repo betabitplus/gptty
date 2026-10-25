@@ -2,6 +2,9 @@
 
 Profiles let `gptty` keep separate auth and state files for different ChatGPT accounts or workflows.
 
+On macOS with the WKWebView backend every profile copies its sign-in from the one ChatGPT browser, so
+there one account is signed in at a time: switch accounts with `gptty auth sign-in`.
+
 A profile stores its own:
 
 ```text
